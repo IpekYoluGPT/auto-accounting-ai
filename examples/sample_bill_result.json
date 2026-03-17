@@ -1,0 +1,23 @@
+{
+  "company_name": "ABC Market",
+  "tax_number": "9876543210",
+  "tax_office": "Beşiktaş",
+  "document_number": "FIS-2024-001",
+  "invoice_number": null,
+  "receipt_number": "FIS-2024-001",
+  "document_date": "2024-03-10",
+  "document_time": "10:15",
+  "currency": "TRY",
+  "subtotal": 84.75,
+  "vat_rate": 18.0,
+  "vat_amount": 15.25,
+  "total_amount": 100.00,
+  "payment_method": "Nakit",
+  "expense_category": "Yemek",
+  "description": "Market alışverişi — kahvaltılık ürünler",
+  "notes": "Fiş üzerinde QR kodu mevcut",
+  "source_message_id": "wamid.HBgLNTM1XXXXXXXXXX",
+  "source_filename": "receipt_20240310.jpg",
+  "source_type": "image",
+  "confidence": 0.91
+}

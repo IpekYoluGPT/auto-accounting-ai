@@ -1,0 +1,4 @@
+Firma Adı,Vergi Numarası,Vergi Dairesi,Belge Numarası,Fatura Numarası,Fiş Numarası,Tarih,Saat,Para Birimi,Ara Toplam,KDV Oranı,KDV Tutarı,Genel Toplam,Ödeme Yöntemi,Gider Kategorisi,Açıklama,Notlar,Kaynak Mesaj ID,Kaynak Dosya Adı,Kaynak Türü,Güven Skoru
+ABC Market,9876543210,Beşiktaş,FIS-2024-001,,FIS-2024-001,2024-03-10,10:15,TRY,84.75,18.0,15.25,100.0,Nakit,Yemek,Market alışverişi — kahvaltılık ürünler,Fiş üzerinde QR kodu mevcut,wamid.HBgLNTM1XXXXXXXXXX,receipt_20240310.jpg,image,0.91
+Akaryakıt A.Ş.,1234567890,Şişli,FTR-2024-042,FTR-2024-042,,2024-03-11,08:45,TRY,423.73,18.0,76.27,500.0,Kredi Kartı,Ulaşım,Benzin alımı,,wamid.HBgLNTM1YYYYYYYYYY,fatura_20240311.jpg,image,0.95
+Cloud Services Ltd.,0000000001,,INV-20240312,INV-20240312,,2024-03-12,,USD,49.99,,,49.99,Banka Transferi,Yazılım,Bulut depolama aboneliği,,wamid.HBgLNTM1ZZZZZZZZZZ,invoice_cloud.pdf,document,0.88
