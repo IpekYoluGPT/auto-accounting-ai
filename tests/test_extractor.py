@@ -1,0 +1,167 @@
+"""
+Tests for the Gemini extractor service.
+"""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from app.models.schemas import BillRecord
+from app.services.gemini_extractor import _normalize_record, _parse_tr_number, extract_bill
+
+
+class TestParseTrNumber:
+    def test_turkish_format(self):
+        assert _parse_tr_number("1.234,56") == 1234.56
+
+    def test_plain_float_string(self):
+        assert _parse_tr_number("150.00") == 150.0
+
+    def test_integer_string(self):
+        assert _parse_tr_number("250") == 250.0
+
+    def test_none_returns_none(self):
+        assert _parse_tr_number(None) is None
+
+    def test_invalid_returns_none(self):
+        assert _parse_tr_number("not-a-number") is None
+
+    def test_large_turkish_number(self):
+        result = _parse_tr_number("12.345,67")
+        assert result == pytest.approx(12345.67)
+
+
+class TestNormalizeRecord:
+    def _raw(self, **overrides) -> dict:
+        base = {
+            "company_name": "Test Şirketi A.Ş.",
+            "tax_number": "1234567890",
+            "tax_office": "Kadıköy",
+            "document_number": "DOC-001",
+            "invoice_number": "FTR-2024-001",
+            "receipt_number": None,
+            "document_date": "2024-01-15",
+            "document_time": "14:30",
+            "currency": "TRY",
+            "subtotal": 100.0,
+            "vat_rate": 18.0,
+            "vat_amount": 18.0,
+            "total_amount": 118.0,
+            "payment_method": "Kredi Kartı",
+            "expense_category": "Ofis",
+            "description": "Ofis malzemeleri",
+            "notes": None,
+            "confidence": 0.95,
+        }
+        base.update(overrides)
+        return base
+
+    def test_basic_normalization(self):
+        record = _normalize_record(self._raw())
+        assert record.company_name == "Test Şirketi A.Ş."
+        assert record.total_amount == 118.0
+        assert record.confidence == 0.95
+
+    def test_currency_uppercased(self):
+        record = _normalize_record(self._raw(currency="try"))
+        assert record.currency == "TRY"
+
+    def test_invalid_currency_defaults_to_try(self):
+        record = _normalize_record(self._raw(currency="GBP"))
+        assert record.currency == "TRY"
+
+    def test_date_normalized_from_dotted(self):
+        record = _normalize_record(self._raw(document_date="15.01.2024"))
+        assert record.document_date == "2024-01-15"
+
+    def test_date_normalized_from_slash(self):
+        record = _normalize_record(self._raw(document_date="15/01/2024"))
+        assert record.document_date == "2024-01-15"
+
+    def test_none_fields_handled(self):
+        record = _normalize_record(self._raw(company_name=None, total_amount=None))
+        assert record.company_name is None
+        assert record.total_amount is None
+
+    def test_turkish_number_float_converted(self):
+        record = _normalize_record(self._raw(total_amount="1.234,56"))
+        assert record.total_amount == pytest.approx(1234.56)
+
+    def test_returns_bill_record(self):
+        record = _normalize_record(self._raw())
+        assert isinstance(record, BillRecord)
+
+    def test_empty_string_becomes_none(self):
+        record = _normalize_record(self._raw(company_name=""))
+        assert record.company_name is None
+
+
+class TestExtractBill:
+    def test_no_api_key_raises(self, monkeypatch):
+        monkeypatch.setattr("app.services.gemini_extractor.settings.gemini_api_key", "")
+        with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
+            extract_bill(b"fake", mime_type="image/jpeg")
+
+    def test_successful_extraction(self, monkeypatch):
+        monkeypatch.setattr("app.services.gemini_extractor.settings.gemini_api_key", "fake_key")
+
+        gemini_json = """{
+            "company_name": "ABC Market",
+            "tax_number": "9876543210",
+            "tax_office": "Beşiktaş",
+            "document_number": "FIS-001",
+            "invoice_number": null,
+            "receipt_number": "FIS-001",
+            "document_date": "2024-03-10",
+            "document_time": "10:15",
+            "currency": "TRY",
+            "subtotal": 84.75,
+            "vat_rate": 18.0,
+            "vat_amount": 15.25,
+            "total_amount": 100.00,
+            "payment_method": "Nakit",
+            "expense_category": "Yemek",
+            "description": "Market alışverişi",
+            "notes": null,
+            "confidence": 0.91
+        }"""
+
+        mock_response = MagicMock()
+        mock_response.text = gemini_json
+
+        mock_model = MagicMock()
+        mock_model.generate_content.return_value = mock_response
+
+        with patch("app.services.gemini_extractor.genai.GenerativeModel", return_value=mock_model):
+            with patch("app.services.gemini_extractor.genai.configure"):
+                record = extract_bill(
+                    b"fake_image",
+                    mime_type="image/jpeg",
+                    source_message_id="msg_123",
+                    source_filename="receipt.jpg",
+                    source_type="image",
+                )
+
+        assert isinstance(record, BillRecord)
+        assert record.company_name == "ABC Market"
+        assert record.total_amount == 100.0
+        assert record.expense_category == "Yemek"
+        assert record.source_message_id == "msg_123"
+        assert record.confidence == pytest.approx(0.91)
+
+    def test_code_fence_stripped(self, monkeypatch):
+        monkeypatch.setattr("app.services.gemini_extractor.settings.gemini_api_key", "fake_key")
+
+        raw = '```json\n{"company_name": "Test", "total_amount": 50.0, "currency": "TRY", "confidence": 0.8}\n```'
+        mock_response = MagicMock()
+        mock_response.text = raw
+
+        mock_model = MagicMock()
+        mock_model.generate_content.return_value = mock_response
+
+        with patch("app.services.gemini_extractor.genai.GenerativeModel", return_value=mock_model):
+            with patch("app.services.gemini_extractor.genai.configure"):
+                record = extract_bill(b"fake_image")
+
+        assert record.company_name == "Test"
+        assert record.total_amount == 50.0
