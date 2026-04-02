@@ -21,7 +21,7 @@ def _auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {settings.whatsapp_access_token}"}
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10), reraise=True)
 def get_media_url(media_id: str) -> str:
     """Resolve a WhatsApp media ID to a download URL."""
     url = f"{_GRAPH_BASE}/{media_id}"
@@ -34,7 +34,7 @@ def get_media_url(media_id: str) -> str:
         return download_url
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10), reraise=True)
 def download_media(download_url: str) -> bytes:
     """Download raw bytes from a WhatsApp media URL."""
     with httpx.Client(timeout=60) as client:
@@ -50,6 +50,7 @@ def fetch_media(media_id: str) -> bytes:
     return download_media(url)
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10), reraise=True)
 def send_text_message(to: str, text: str) -> None:
     """Send a plain-text WhatsApp message to *to*."""
     if not settings.whatsapp_access_token or not settings.whatsapp_phone_number_id:
@@ -65,7 +66,5 @@ def send_text_message(to: str, text: str) -> None:
     url = f"{_GRAPH_BASE}/{settings.whatsapp_phone_number_id}/messages"
     with httpx.Client(timeout=15) as client:
         resp = client.post(url, json=payload, headers=_auth_headers())
-        if resp.is_error:
-            logger.error("Failed to send message to %s: %s", to, resp.text)
-        else:
-            logger.debug("Sent message to %s", to)
+        resp.raise_for_status()
+        logger.debug("Sent message to %s", to)

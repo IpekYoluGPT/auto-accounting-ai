@@ -7,56 +7,24 @@ JSON response conforming to the BillRecord schema.
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Optional
 
-import google.generativeai as genai
-from tenacity import retry, stop_after_attempt, wait_exponential
-
 from app.config import settings
-from app.models.schemas import BillRecord
+from app.models.schemas import AIExtractionResult, BillRecord
+from app.services import gemini_client
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-_EXTRACTION_PROMPT = """You are an expert accounting data extractor for a Turkish small-business accounting system.
+_EXTRACTION_PROMPT = """Extract bookkeeping fields from this Turkish invoice, receipt, or payment document.
 
-Analyze the provided bill / invoice / receipt image and extract every available field.
-Return ONLY a single valid JSON object — no markdown, no extra text.
+Return only the requested schema.
+Use null for missing values.
+Normalize dates to YYYY-MM-DD, times to HH:MM, and Turkish decimal numbers to standard decimals.
+Default currency to TRY when it is not shown."""
 
-JSON schema (use null for missing fields):
-{
-  "company_name": "string or null",
-  "tax_number": "string or null",
-  "tax_office": "string or null",
-  "document_number": "string or null",
-  "invoice_number": "string or null",
-  "receipt_number": "string or null",
-  "document_date": "YYYY-MM-DD or null",
-  "document_time": "HH:MM or null",
-  "currency": "TRY | EUR | USD or null",
-  "subtotal": number or null,
-  "vat_rate": number or null,
-  "vat_amount": number or null,
-  "total_amount": number or null,
-  "payment_method": "Nakit | Kredi Kartı | Banka Transferi | Diğer or null",
-  "expense_category": "Yemek | Ulaşım | Konaklama | Ofis | Yazılım | Donanım | Abonelik | Kargo | Vergi | Diğer or null",
-  "description": "brief description of goods/services or null",
-  "notes": "any additional useful information or null",
-  "confidence": 0.0 to 1.0
-}
-
-Rules:
-- Normalize all dates to YYYY-MM-DD format.
-- Normalize all times to HH:MM (24-hour) format.
-- Turkish decimal separator is comma (,) — convert to dot (.) for numbers.
-- currency must be one of: TRY, EUR, USD.  Default to TRY if not shown.
-- confidence reflects how clearly the document is readable (0 = unreadable, 1 = perfect).
-- Do NOT include any text outside the JSON object.
-"""
-
-# Turkish number format: 1.234,56 → 1234.56
+# Turkish number format: 1.234,56 -> 1234.56
 _TR_NUMBER_RE = re.compile(r"(\d{1,3}(?:\.\d{3})*),(\d{2})")
 
 
@@ -88,19 +56,25 @@ def _normalize_record(raw: dict) -> BillRecord:
         s = str(v).strip()
         return s if s else None
 
-    # Currency normalisation
     currency_raw = _safe_str(raw.get("currency"))
     if currency_raw:
         currency_raw = currency_raw.upper()
         if currency_raw not in ("TRY", "EUR", "USD"):
             currency_raw = "TRY"
+    else:
+        currency_raw = "TRY"
 
-    # Date normalisation: accept D.M.YYYY or D/M/YYYY → YYYY-MM-DD
     doc_date = _safe_str(raw.get("document_date"))
     if doc_date:
-        m = re.match(r"^(\d{1,2})[./](\d{1,2})[./](\d{4})$", doc_date)
-        if m:
-            doc_date = f"{m.group(3)}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}"
+        match = re.match(r"^(\d{1,2})[./](\d{1,2})[./](\d{4})$", doc_date)
+        if match:
+            doc_date = f"{match.group(3)}-{match.group(2).zfill(2)}-{match.group(1).zfill(2)}"
+
+    doc_time = _safe_str(raw.get("document_time"))
+    if doc_time:
+        match = re.match(r"^(\d{1,2})[:.](\d{2})(?::\d{2})?$", doc_time)
+        if match:
+            doc_time = f"{match.group(1).zfill(2)}:{match.group(2)}"
 
     return BillRecord(
         company_name=_safe_str(raw.get("company_name")),
@@ -110,7 +84,7 @@ def _normalize_record(raw: dict) -> BillRecord:
         invoice_number=_safe_str(raw.get("invoice_number")),
         receipt_number=_safe_str(raw.get("receipt_number")),
         document_date=doc_date,
-        document_time=_safe_str(raw.get("document_time")),
+        document_time=doc_time,
         currency=currency_raw,
         subtotal=_safe_float(raw.get("subtotal")),
         vat_rate=_safe_float(raw.get("vat_rate")),
@@ -125,20 +99,6 @@ def _normalize_record(raw: dict) -> BillRecord:
         source_type=_safe_str(raw.get("source_type")),
         confidence=_safe_float(raw.get("confidence")),
     )
-
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=20))
-def _call_gemini(image_bytes: bytes, mime_type: str) -> str:
-    """Internal: call Gemini and return raw text. Retried on transient errors."""
-    genai.configure(api_key=settings.gemini_api_key)
-    model = genai.GenerativeModel("gemini-1.5-pro")
-    response = model.generate_content(
-        [
-            _EXTRACTION_PROMPT,
-            {"mime_type": mime_type, "data": image_bytes},
-        ]
-    )
-    return response.text.strip()
 
 
 def extract_bill(
@@ -157,20 +117,23 @@ def extract_bill(
     if not settings.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured.")
 
-    logger.info("Sending image (%d bytes, %s) to Gemini for extraction…", len(image_bytes), mime_type)
+    logger.info(
+        "Sending image (%d bytes, %s) to Gemini model %s for extraction",
+        len(image_bytes),
+        mime_type,
+        settings.gemini_extractor_model,
+    )
 
-    raw_text = _call_gemini(image_bytes, mime_type)
+    extracted = gemini_client.generate_structured_content(
+        model=settings.gemini_extractor_model,
+        prompt=_EXTRACTION_PROMPT,
+        response_schema=AIExtractionResult,
+        thinking_level="low",
+        media_bytes=image_bytes,
+        mime_type=mime_type,
+    )
 
-    # Strip optional markdown code fences
-    if raw_text.startswith("```"):
-        raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text)
-        raw_text = re.sub(r"\n?```$", "", raw_text)
-
-    logger.debug("Gemini raw response: %s", raw_text[:500])
-
-    raw_dict = json.loads(raw_text)
-
-    record = _normalize_record(raw_dict)
+    record = _normalize_record(extracted.model_dump())
     record.source_message_id = source_message_id
     record.source_filename = source_filename
     record.source_type = source_type

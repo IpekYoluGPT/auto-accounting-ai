@@ -35,7 +35,7 @@ Meta Cloud API  ──────►  POST /webhook
                     └─────────┬──────────┘
                      is_bill? │
                     ┌─────────▼──────────┐
-                    │  Gemini Extractor  │  ← gemini-1.5-pro, structured JSON
+                    │  Gemini Extractor  │  ← Gemini 3 Flash, structured JSON
                     └─────────┬──────────┘
                               │
                     ┌─────────▼──────────┐
@@ -43,7 +43,7 @@ Meta Cloud API  ──────►  POST /webhook
                     └─────────┬──────────┘
                               │
                     ┌─────────▼──────────┐
-                    │  Exporter          │  ← CSV / XLSX, Turkish column names
+                    │  Record Store      │  ← claim check + CSV + dedup state
                     └────────────────────┘
 ```
 
@@ -63,8 +63,10 @@ auto-accounting-ai/
 │   ├── services/
 │   │   ├── whatsapp.py           # WhatsApp Cloud API client
 │   │   ├── bill_classifier.py    # Keyword + Gemini classification
+│   │   ├── gemini_client.py      # Shared Gemini structured-output helper
 │   │   ├── gemini_extractor.py   # AI extraction + normalisation
-│   │   └── exporter.py           # CSV / XLSX export
+│   │   ├── record_store.py       # CSV persistence + message claims/dedup
+│   │   └── exporter.py           # CSV / XLSX export helpers
 │   ├── models/
 │   │   └── schemas.py            # Pydantic models
 │   └── utils/
@@ -79,8 +81,12 @@ auto-accounting-ai/
 │   └── sample_accounting_rows.csv
 ├── tests/
 │   ├── test_classifier.py
-│   └── test_extractor.py
+│   ├── test_config.py
+│   ├── test_extractor.py
+│   ├── test_record_store.py
+│   └── test_webhooks.py
 ├── .env.example
+├── pytest.ini
 ├── requirements.txt
 └── README.md
 ```
@@ -122,7 +128,9 @@ uvicorn app.main:app --reload --port 8000
 | `WHATSAPP_ACCESS_TOKEN` | Meta permanent access token | *(required)* |
 | `WHATSAPP_PHONE_NUMBER_ID` | Meta phone number ID | *(required)* |
 | `GEMINI_API_KEY` | Google Gemini API key | *(required)* |
-| `STORAGE_DIR` | Directory for temp files and exports | `./storage` |
+| `GEMINI_CLASSIFIER_MODEL` | Gemini model used for media classification | `gemini-3-flash-preview` |
+| `GEMINI_EXTRACTOR_MODEL` | Gemini model used for field extraction | `gemini-3-flash-preview` |
+| `STORAGE_DIR` | Directory for temp files, exports, and processed-message state | `./storage` |
 | `LOG_LEVEL` | `DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` |
 
 ---
@@ -139,15 +147,17 @@ FastAPI route  →  parse payload  →  background task per message
                               ┌───────────┴───────────┐
                               │ text message?          │ image/doc?
                               │                        │
-                         keyword classify          download media
+                         keyword classify        claim message id
                               │                        │
-                         is_bill=True?           Gemini classify
+                         is_bill=True?           download media
                               │                        │
-                         prompt user             Gemini extract
+                         prompt user             Gemini classify
                          to send photo               │
-                                               append to CSV
+                                               Gemini extract
                                                     │
-                                            reply in Turkish ✅
+                                            append to CSV once
+                                                    │
+                                       mark handled + reply ✅
 ```
 
 ### Sample Turkish User Messages
@@ -163,13 +173,14 @@ FastAPI route  →  parse payload  →  background task per message
 
 ## Gemini Extraction Flow
 
-1. Image bytes + MIME type sent to `gemini-1.5-pro` with a strict JSON extraction prompt.
-2. Response is parsed and normalised:
+1. The message ID is claimed before expensive AI work so duplicate deliveries do not fan out across workers.
+2. Image bytes + MIME type are sent to `gemini-3-flash-preview` via the `google-genai` SDK with structured JSON output.
+3. Response is parsed and normalised:
    - Turkish date formats (`DD.MM.YYYY`) → ISO 8601 (`YYYY-MM-DD`)
    - Turkish numbers (`1.234,56`) → float (`1234.56`)
    - Currency defaults to `TRY`
-3. A `BillRecord` Pydantic model validates all fields.
-4. Record is appended to `storage/exports/records_YYYY-MM-DD.csv`.
+4. A `BillRecord` Pydantic model validates all fields.
+5. The record is appended to `storage/exports/records_YYYY-MM-DD.csv`, and the message is marked complete so later duplicates are skipped.
 
 ---
 
@@ -219,7 +230,7 @@ uvicorn app.main:app --host 0.0.0.0 --port $PORT
 ## Running Tests
 
 ```bash
-pytest tests/ -v
+python -m pytest -q
 ```
 
 ---
@@ -236,7 +247,6 @@ Gemini suggests one of the following Turkish categories for each document:
 
 - [ ] Google Sheets integration (append rows via Sheets API)
 - [ ] PostgreSQL / Supabase persistence
-- [ ] Deduplication by `source_message_id`
 - [ ] `/export` HTTP endpoint returning XLSX on demand
 - [ ] Multi-group / multi-tenant support
 - [ ] Dashboard (read-only, separate service)

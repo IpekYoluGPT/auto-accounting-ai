@@ -2,39 +2,34 @@
 WhatsApp webhook router.
 
 Handles:
-- GET  /webhook  → Meta verification challenge
-- POST /webhook  → Incoming message events
+- GET  /webhook  -> Meta verification challenge
+- POST /webhook  -> Incoming message events
 """
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response
 
 from app.config import settings
 from app.models.schemas import WhatsAppWebhookPayload
-from app.services import bill_classifier, gemini_extractor, whatsapp
-from app.utils.file_storage import cleanup_file, save_temp_file
+from app.services import bill_classifier, gemini_extractor, record_store, whatsapp
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/webhook", tags=["webhook"])
 
-# ─── Turkish user-facing messages ────────────────────────────────────────────
-
 MSG_ACCEPTED = (
-    "✅ Belgeniz alındı ve muhasebe kaydına eklendi.\n"
+    "\u2705 Belgeniz al\u0131nd\u0131 ve muhasebe kayd\u0131na eklendi.\n"
     "Firma: {company}\nToplam: {total} {currency}"
 )
-MSG_IGNORED = "ℹ️ Bu mesaj fatura/fiş içermiyor, atlandı."
-MSG_ERROR = (
-    "⚠️ Belgeniz işlenirken bir hata oluştu. Lütfen daha sonra tekrar deneyin."
+MSG_TEXT_NEEDS_PHOTO = (
+    "\U0001F4C4 Fatura/fi\u015f metin olarak alg\u0131land\u0131. "
+    "L\u00fctfen belge foto\u011fraf\u0131n\u0131 g\u00f6nderin."
 )
-
-# ─── Verification ─────────────────────────────────────────────────────────────
+MSG_ERROR = "\u26a0\ufe0f Belgeniz i\u015flenirken bir hata olu\u015ftu. L\u00fctfen daha sonra tekrar deneyin."
 
 
 @router.get("")
@@ -51,22 +46,17 @@ async def verify_webhook(
     raise HTTPException(status_code=403, detail="Forbidden")
 
 
-# ─── Incoming events ──────────────────────────────────────────────────────────
-
-
 @router.post("")
 async def receive_webhook(
     request: Request, background_tasks: BackgroundTasks
 ) -> dict[str, str]:
     """Receive and enqueue incoming WhatsApp message events."""
-    body: dict[str, Any] = await request.json()
-    logger.debug("Received webhook payload: %s", str(body)[:400])
-
     try:
+        body: dict[str, Any] = await request.json()
+        logger.debug("Received webhook payload: %s", str(body)[:400])
         payload = WhatsAppWebhookPayload.model_validate(body)
     except Exception as exc:
-        logger.error("Invalid webhook payload: %s", exc)
-        # Always return 200 to prevent Meta from retrying indefinitely
+        logger.error("Ignoring malformed webhook payload: %s", exc)
         return {"status": "ignored"}
 
     for entry in payload.entry:
@@ -78,9 +68,6 @@ async def receive_webhook(
     return {"status": "ok"}
 
 
-# ─── Background processing ────────────────────────────────────────────────────
-
-
 def _process_message(message) -> None:
     """Process a single WhatsApp message in the background."""
     sender = message.from_
@@ -89,35 +76,41 @@ def _process_message(message) -> None:
 
     logger.info("Processing message id=%s type=%s from=%s", msg_id, msg_type, sender)
 
+    if not record_store.claim_message_processing(msg_id):
+        logger.info("Message id=%s already completed or in-flight; skipping duplicate.", msg_id)
+        return
+
     try:
         if msg_type == "text":
-            _handle_text(message, sender)
+            outcome = _handle_text(message, sender)
+            record_store.mark_message_handled(msg_id, outcome=outcome)
         elif msg_type in ("image", "document"):
-            _handle_media(message, sender)
+            outcome = _handle_media(message, sender)
+            if outcome != "exported":
+                record_store.mark_message_handled(msg_id, outcome=outcome)
         else:
             logger.info("Unsupported message type '%s'; skipping.", msg_type)
+            record_store.mark_message_handled(msg_id, outcome="unsupported_message_type")
     except Exception as exc:
         logger.error("Unhandled error processing message %s: %s", msg_id, exc, exc_info=True)
-        whatsapp.send_text_message(sender, MSG_ERROR)
+        record_store.release_message_processing(msg_id)
+        _safe_send_text_message(sender, MSG_ERROR, context="fatal processing error")
 
 
-def _handle_text(message, sender: str) -> None:
+def _handle_text(message, sender: str) -> str:
     text = message.text.body if message.text else ""
     result = bill_classifier.classify_text(text)
     logger.info("Text classification: is_bill=%s confidence=%.2f", result.is_bill, result.confidence)
 
     if not result.is_bill:
         logger.info("Text message is not a bill; ignoring.")
-        return
+        return "ignored_non_bill_text"
 
-    # Text-only messages are unlikely to contain extractable bill images; inform user
-    whatsapp.send_text_message(
-        sender,
-        "📄 Fatura/fiş metin olarak algılandı. Lütfen belge fotoğrafını gönderin.",
-    )
+    _safe_send_text_message(sender, MSG_TEXT_NEEDS_PHOTO, context="text needs photo prompt")
+    return "prompted_for_photo"
 
 
-def _handle_media(message, sender: str) -> None:
+def _handle_media(message, sender: str) -> str:
     """Download, classify, extract, and reply for image/document messages."""
     if message.type == "image" and message.image:
         media = message.image
@@ -131,16 +124,11 @@ def _handle_media(message, sender: str) -> None:
         source_type = "document"
     else:
         logger.warning("Media message has no media payload; skipping.")
-        return
-
-    extension = mime_type.split("/")[-1].replace("jpeg", "jpg")
-    temp_path: Path | None = None
+        return "missing_media_payload"
 
     try:
         raw_bytes = whatsapp.fetch_media(media.id)
-        temp_path = save_temp_file(raw_bytes, extension=extension)
 
-        # Classify before running expensive extraction
         classification = bill_classifier.classify_image(raw_bytes, mime_type=mime_type)
         logger.info(
             "Image classification: is_bill=%s confidence=%.2f reason=%s",
@@ -151,7 +139,7 @@ def _handle_media(message, sender: str) -> None:
 
         if not classification.is_bill:
             logger.info("Image is not a bill; ignoring.")
-            return
+            return "ignored_non_bill_media"
 
         record = gemini_extractor.extract_bill(
             image_bytes=raw_bytes,
@@ -161,39 +149,26 @@ def _handle_media(message, sender: str) -> None:
             source_type=source_type,
         )
 
-        # Persist the extracted record
-        _persist_record(record)
+        persisted = record_store.persist_record_once(record)
+        if not persisted:
+            return "already_exported"
 
         reply = MSG_ACCEPTED.format(
             company=record.company_name or "Bilinmiyor",
             total=record.total_amount or "?",
             currency=record.currency or "TRY",
         )
-        whatsapp.send_text_message(sender, reply)
+        _safe_send_text_message(sender, reply, context="success confirmation")
+        return "exported"
 
     except Exception as exc:
         logger.error("Media processing failed for message %s: %s", message.id, exc, exc_info=True)
-        whatsapp.send_text_message(sender, MSG_ERROR)
-    finally:
-        if temp_path:
-            cleanup_file(temp_path)
+        raise RuntimeError("media processing failed") from exc
 
 
-def _persist_record(record) -> None:
-    """Append the record to the daily CSV export file."""
-    from datetime import date
-
-    from app.services.exporter import TURKISH_HEADERS, record_to_row
-    import csv
-
-    exports_dir = Path(settings.storage_dir) / "exports"
-    exports_dir.mkdir(parents=True, exist_ok=True)
-    filepath = exports_dir / f"records_{date.today().isoformat()}.csv"
-
-    write_header = not filepath.exists()
-    with filepath.open("a", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=TURKISH_HEADERS)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(record_to_row(record))
-    logger.info("Record appended to %s", filepath)
+def _safe_send_text_message(to: str, text: str, *, context: str) -> None:
+    """Send a WhatsApp text message and log failures without crashing the worker."""
+    try:
+        whatsapp.send_text_message(to, text)
+    except Exception as exc:
+        logger.error("Failed to send %s to %s: %s", context, to, exc, exc_info=True)

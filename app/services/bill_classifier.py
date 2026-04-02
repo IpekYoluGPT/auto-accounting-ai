@@ -1,52 +1,40 @@
 """
 Lightweight bill classifier.
 
-For text messages  → rule-based keyword heuristics.
-For image/document → delegates to Gemini with a classification-only prompt.
+For text messages -> rule-based keyword heuristics.
+For image/document -> delegates to Gemini with a classification-only prompt.
 """
 
 from __future__ import annotations
 
 import re
 
-import google.generativeai as genai
-
 from app.config import settings
 from app.models.schemas import ClassificationResult
+from app.services import gemini_client
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 # Keywords that strongly suggest a bill / invoice / receipt
 _BILL_KEYWORDS = re.compile(
-    r"fatura|fiş|makbuz|toplam|kdv|vergi|ödeme|tutar|fiyat|tl|₺|eur|usd|"
+    r"fatura|fi\u015f|makbuz|toplam|kdv|vergi|\u00f6deme|tutar|fiyat|tl|\u20ba|eur|usd|"
     r"invoice|receipt|total|tax|amount|payment",
     re.IGNORECASE,
 )
 
 # Keywords that clearly indicate junk / chat
 _JUNK_KEYWORDS = re.compile(
-    r"merhaba|selam|nasılsın|iyi akşamlar|günaydın|teşekkür|tamam|ok|👍|😂|❤️|🙏",
+    r"merhaba|selam|nas\u0131ls\u0131n|iyi ak\u015famlar|g\u00fcnayd\u0131n|te\u015fekk\u00fcr|tamam|ok|"
+    r"\U0001F44D|\U0001F602|\u2764\ufe0f|\U0001F64F",
     re.IGNORECASE,
 )
 
-_CLASSIFIER_PROMPT = """You are a document classifier for an accounting system.
-Your ONLY job is to decide whether the provided image is a financial document:
-fatura (invoice), fiş (cash receipt), or makbuz (payment receipt).
+_CLASSIFIER_PROMPT = """Classify this media for bookkeeping.
 
-Respond with ONLY valid JSON in this exact format:
-{
-  "is_bill": true,
-  "reason": "one-sentence explanation in English",
-  "confidence": 0.95
-}
-
-Rules:
-- is_bill = true  → The image contains a real financial document with amounts, dates, and a business name.
-- is_bill = false → The image is a meme, screenshot, photo, sticker, greeting, or unrelated document.
-- confidence must be a float between 0 and 1.
-- Do NOT include any text outside the JSON object.
-"""
+Accept only real financial documents such as Turkish invoices, receipts, or payment records.
+Reject memes, screenshots, greetings, stickers, casual photos, and unrelated documents.
+Return the schema only."""
 
 
 def classify_text(text: str) -> ClassificationResult:
@@ -66,33 +54,12 @@ def classify_text(text: str) -> ClassificationResult:
 
 def classify_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> ClassificationResult:
     """Use Gemini to classify whether an image is a financial document."""
-    if not settings.gemini_api_key:
-        logger.warning("GEMINI_API_KEY not set; defaulting classify_image to is_bill=True")
-        return ClassificationResult(is_bill=True, reason="api key missing, defaulting to true", confidence=0.5)
-
-    genai.configure(api_key=settings.gemini_api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-
-    import json
-
-    try:
-        response = model.generate_content(
-            [
-                _CLASSIFIER_PROMPT,
-                {"mime_type": mime_type, "data": image_bytes},
-            ]
-        )
-        raw = response.text.strip()
-        # Strip optional markdown code fences
-        if raw.startswith("```"):
-            raw = re.sub(r"^```[a-z]*\n?", "", raw)
-            raw = re.sub(r"\n?```$", "", raw)
-        data = json.loads(raw)
-        return ClassificationResult(
-            is_bill=bool(data.get("is_bill", False)),
-            reason=data.get("reason"),
-            confidence=float(data.get("confidence", 0.5)),
-        )
-    except Exception as exc:
-        logger.error("Image classification failed: %s", exc)
-        return ClassificationResult(is_bill=True, reason=f"classification error: {exc}", confidence=0.4)
+    logger.info("Classifying media with Gemini model %s", settings.gemini_classifier_model)
+    return gemini_client.generate_structured_content(
+        model=settings.gemini_classifier_model,
+        prompt=_CLASSIFIER_PROMPT,
+        response_schema=ClassificationResult,
+        thinking_level="minimal",
+        media_bytes=image_bytes,
+        mime_type=mime_type,
+    )

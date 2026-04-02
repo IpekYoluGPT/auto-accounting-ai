@@ -80,6 +80,8 @@ In your service's **Variables** tab, add all variables from `.env.example`:
 | `WHATSAPP_ACCESS_TOKEN` | Meta permanent access token |
 | `WHATSAPP_PHONE_NUMBER_ID` | Meta phone number ID |
 | `GEMINI_API_KEY` | Google Gemini API key |
+| `GEMINI_CLASSIFIER_MODEL` | Defaults to `gemini-3-flash-preview` |
+| `GEMINI_EXTRACTOR_MODEL` | Defaults to `gemini-3-flash-preview` |
 | `STORAGE_DIR` | `/app/storage` (Railway persistent volume) |
 | `LOG_LEVEL` | `INFO` |
 

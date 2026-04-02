@@ -5,7 +5,7 @@ Pydantic models for WhatsApp webhook payloads and internal bill records.
 from __future__ import annotations
 
 from datetime import date, time
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -122,6 +122,50 @@ class BillRecord(BaseModel):
     confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
 
+class AIExtractionResult(BaseModel):
+    """Structured Gemini extraction output before source metadata is attached."""
+
+    company_name: Optional[str] = None
+    tax_number: Optional[str] = None
+    tax_office: Optional[str] = None
+    document_number: Optional[str] = None
+    invoice_number: Optional[str] = None
+    receipt_number: Optional[str] = None
+    document_date: Optional[str] = None
+    document_time: Optional[str] = None
+    currency: Optional[Literal["TRY", "EUR", "USD"]] = None
+    subtotal: Optional[float] = None
+    vat_rate: Optional[float] = None
+    vat_amount: Optional[float] = None
+    total_amount: Optional[float] = None
+    payment_method: Optional[
+        Literal["Nakit", "Kredi Karti", "Kredi Kartı", "Banka Transferi", "Diger", "Diğer"]
+    ] = None
+    expense_category: Optional[
+        Literal[
+            "Yemek",
+            "Ulasim",
+            "Ulaşım",
+            "Konaklama",
+            "Ofis",
+            "Yazilim",
+            "Yazılım",
+            "Donanim",
+            "Donanım",
+            "Abonelik",
+            "Kargo",
+            "Vergi",
+            "Diger",
+            "Diğer",
+        ]
+    ] = None
+    description: Optional[str] = None
+    notes: Optional[str] = None
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+    model_config = {"extra": "ignore"}
+
+
 # ─── Classification Result ────────────────────────────────────────────────────
 
 
@@ -129,3 +173,5 @@ class ClassificationResult(BaseModel):
     is_bill: bool
     reason: Optional[str] = None
     confidence: float = Field(ge=0.0, le=1.0)
+
+    model_config = {"extra": "ignore"}

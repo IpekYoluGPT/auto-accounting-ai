@@ -2,36 +2,41 @@
 Tests for the bill classifier service.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, patch
 
 import pytest
 
 from app.models.schemas import ClassificationResult
-from app.services.bill_classifier import classify_text, classify_image
+from app.services.bill_classifier import classify_image, classify_text
 
 
 class TestClassifyText:
     def test_bill_text_detected(self):
-        text = "Fatura No: 12345\nKDV: %18\nToplam: 1.234,56 TL\nÖdeme: Kredi Kartı\nVergi No: 123456789"
+        text = (
+            "Fatura No: 12345\n"
+            "KDV: %18\n"
+            "Toplam: 1.234,56 TL\n"
+            "\u00d6deme: Kredi Kart\u0131\n"
+            "Vergi No: 123456789"
+        )
         result = classify_text(text)
         assert result.is_bill is True
         assert result.confidence >= 0.6
 
     def test_junk_text_ignored(self):
-        text = "Merhaba! Nasılsın? 😂 İyi akşamlar herkese 👍"
+        text = "Merhaba! Nas\u0131ls\u0131n? \U0001F602 \u0130yi ak\u015famlar herkese \U0001F44D"
         result = classify_text(text)
         assert result.is_bill is False
         assert result.confidence >= 0.7
 
     def test_greeting_only(self):
-        text = "Selam tamam ok 👍"
+        text = "Selam tamam ok \U0001F44D"
         result = classify_text(text)
         assert result.is_bill is False
 
     def test_partial_bill_keywords(self):
         text = "Tutar: 200 TL"
         result = classify_text(text)
-        # has some bill keywords but fewer than threshold
         assert isinstance(result, ClassificationResult)
 
     def test_empty_text(self):
@@ -50,70 +55,45 @@ class TestClassifyText:
 
 
 class TestClassifyImage:
-    def test_no_api_key_defaults_to_true(self, monkeypatch):
-        monkeypatch.setattr("app.services.bill_classifier.settings.gemini_api_key", "")
-        result = classify_image(b"fake_image_bytes")
-        assert result.is_bill is True
-        assert result.confidence == 0.5
+    def test_no_api_key_raises(self, monkeypatch):
+        monkeypatch.setattr("app.services.gemini_client.settings.gemini_api_key", "")
+        with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
+            classify_image(b"fake_image_bytes")
 
-    def test_gemini_response_parsed_correctly(self, monkeypatch):
-        monkeypatch.setattr("app.services.bill_classifier.settings.gemini_api_key", "fake_key")
+    def test_structured_response_parsed_correctly(self, monkeypatch):
+        monkeypatch.setattr("app.services.gemini_client.settings.gemini_api_key", "fake_key")
+        monkeypatch.setattr(
+            "app.services.bill_classifier.settings.gemini_classifier_model",
+            "gemini-test-classifier",
+        )
+        expected = ClassificationResult(
+            is_bill=True,
+            reason="contains invoice data",
+            confidence=0.92,
+        )
 
-        mock_response = MagicMock()
-        mock_response.text = '{"is_bill": true, "reason": "contains invoice data", "confidence": 0.92}'
+        with patch(
+            "app.services.bill_classifier.gemini_client.generate_structured_content",
+            return_value=expected,
+        ) as mock_generate:
+            result = classify_image(b"fake_image_bytes", mime_type="image/png")
 
-        mock_model = MagicMock()
-        mock_model.generate_content.return_value = mock_response
+        assert result == expected
+        mock_generate.assert_called_once_with(
+            model="gemini-test-classifier",
+            prompt=ANY,
+            response_schema=ClassificationResult,
+            thinking_level="minimal",
+            media_bytes=b"fake_image_bytes",
+            mime_type="image/png",
+        )
 
-        with patch("app.services.bill_classifier.genai.GenerativeModel", return_value=mock_model):
-            with patch("app.services.bill_classifier.genai.configure"):
-                result = classify_image(b"fake_image_bytes")
+    def test_generation_error_propagates(self, monkeypatch):
+        monkeypatch.setattr("app.services.gemini_client.settings.gemini_api_key", "fake_key")
 
-        assert result.is_bill is True
-        assert result.confidence == 0.92
-        assert result.reason == "contains invoice data"
-
-    def test_gemini_not_bill(self, monkeypatch):
-        monkeypatch.setattr("app.services.bill_classifier.settings.gemini_api_key", "fake_key")
-
-        mock_response = MagicMock()
-        mock_response.text = '{"is_bill": false, "reason": "meme image", "confidence": 0.97}'
-
-        mock_model = MagicMock()
-        mock_model.generate_content.return_value = mock_response
-
-        with patch("app.services.bill_classifier.genai.GenerativeModel", return_value=mock_model):
-            with patch("app.services.bill_classifier.genai.configure"):
-                result = classify_image(b"fake_image_bytes")
-
-        assert result.is_bill is False
-
-    def test_gemini_json_with_code_fence(self, monkeypatch):
-        monkeypatch.setattr("app.services.bill_classifier.settings.gemini_api_key", "fake_key")
-
-        mock_response = MagicMock()
-        mock_response.text = '```json\n{"is_bill": true, "reason": "receipt", "confidence": 0.85}\n```'
-
-        mock_model = MagicMock()
-        mock_model.generate_content.return_value = mock_response
-
-        with patch("app.services.bill_classifier.genai.GenerativeModel", return_value=mock_model):
-            with patch("app.services.bill_classifier.genai.configure"):
-                result = classify_image(b"fake_image_bytes")
-
-        assert result.is_bill is True
-        assert result.confidence == 0.85
-
-    def test_gemini_error_returns_default(self, monkeypatch):
-        monkeypatch.setattr("app.services.bill_classifier.settings.gemini_api_key", "fake_key")
-
-        mock_model = MagicMock()
-        mock_model.generate_content.side_effect = RuntimeError("API error")
-
-        with patch("app.services.bill_classifier.genai.GenerativeModel", return_value=mock_model):
-            with patch("app.services.bill_classifier.genai.configure"):
-                result = classify_image(b"fake_image_bytes")
-
-        # On error, defaults to is_bill=True with low confidence
-        assert result.is_bill is True
-        assert result.confidence < 0.5
+        with patch(
+            "app.services.bill_classifier.gemini_client.generate_structured_content",
+            side_effect=RuntimeError("API error"),
+        ):
+            with pytest.raises(RuntimeError, match="API error"):
+                classify_image(b"fake_image_bytes")

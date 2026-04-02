@@ -22,6 +22,8 @@ class Settings(BaseSettings):
 
     # Gemini
     gemini_api_key: str = ""
+    gemini_classifier_model: str = "gemini-3-flash-preview"
+    gemini_extractor_model: str = "gemini-3-flash-preview"
 
     # Storage
     storage_dir: str = "./storage"
