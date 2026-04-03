@@ -9,7 +9,7 @@ from __future__ import annotations
 import csv
 import io
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 from app.models.schemas import BillRecord
 from app.utils.logging import get_logger
@@ -78,12 +78,25 @@ def records_to_xlsx_bytes(records: Sequence[BillRecord]) -> bytes:
 
     Requires openpyxl (already in requirements.txt).
     """
+    rows = [record_to_row(record) for record in records]
+    return tabular_rows_to_xlsx_bytes(rows, TURKISH_HEADERS)
+
+
+def tabular_rows_to_xlsx_bytes(
+    rows: Sequence[Mapping[str, str]], headers: Sequence[str] | None = None
+) -> bytes:
+    """
+    Return an XLSX workbook from already-tabular row data.
+
+    `rows` should be keyed by header name.
+    """
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill
     except ImportError as exc:
         raise ImportError("openpyxl is required for XLSX export.") from exc
 
+    workbook_headers = list(headers or TURKISH_HEADERS)
     wb = Workbook()
     ws = wb.active
     ws.title = "Muhasebe"
@@ -91,14 +104,13 @@ def records_to_xlsx_bytes(records: Sequence[BillRecord]) -> bytes:
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill(fill_type="solid", fgColor="1F4E79")
 
-    for col_idx, header in enumerate(TURKISH_HEADERS, start=1):
+    for col_idx, header in enumerate(workbook_headers, start=1):
         cell = ws.cell(row=1, column=col_idx, value=header)
         cell.font = header_font
         cell.fill = header_fill
 
-    for row_idx, record in enumerate(records, start=2):
-        row = record_to_row(record)
-        for col_idx, header in enumerate(TURKISH_HEADERS, start=1):
+    for row_idx, row in enumerate(rows, start=2):
+        for col_idx, header in enumerate(workbook_headers, start=1):
             ws.cell(row=row_idx, column=col_idx, value=row.get(header, ""))
 
     # Auto-fit column widths (approximate)
