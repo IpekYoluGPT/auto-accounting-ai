@@ -4,6 +4,7 @@ Shared Gemini client helpers built on the modern google-genai SDK.
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import TypeVar
 
 from google import genai
@@ -16,11 +17,17 @@ from app.config import settings
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
 
+@lru_cache(maxsize=4)
+def _build_client(api_key: str) -> genai.Client:
+    """Create and memoize Gemini clients by API key."""
+    return genai.Client(api_key=api_key)
+
+
 def get_client() -> genai.Client:
     """Return a configured Gemini API client."""
     if not settings.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured.")
-    return genai.Client(api_key=settings.gemini_api_key)
+    return _build_client(settings.gemini_api_key)
 
 
 @retry(
@@ -38,6 +45,7 @@ def generate_structured_content(
     mime_type: str | None = None,
 ) -> SchemaT:
     """Generate structured JSON and validate it against a Pydantic schema."""
+    client = get_client()
     contents: list[str | types.Part] = [prompt]
     if media_bytes is not None:
         contents.append(
@@ -47,7 +55,7 @@ def generate_structured_content(
             )
         )
 
-    response = get_client().models.generate_content(
+    response = client.models.generate_content(
         model=model,
         contents=contents,
         config=types.GenerateContentConfig(
