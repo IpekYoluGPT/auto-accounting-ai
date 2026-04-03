@@ -158,15 +158,8 @@ def _handle_media(message, sender: str) -> str:
         )
 
         if not classification.is_bill:
-            if _send_throttled_warning(
-                sender,
-                MSG_UNRELATED_IMAGE,
-                warning_key="unrelated_media",
-                context="unrelated image warning",
-            ):
-                return "warned_non_bill_media"
-            logger.info("Image is not a bill; warning suppressed by throttle.")
-            return "ignored_non_bill_media"
+            _safe_send_text_message(sender, MSG_UNRELATED_IMAGE, context="unrelated image warning")
+            return "warned_non_bill_media"
 
         record = gemini_extractor.extract_bill(
             image_bytes=raw_bytes,

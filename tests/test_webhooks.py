@@ -358,6 +358,29 @@ def test_repeated_non_bill_text_warning_is_throttled():
     send_mock.assert_called_once()
 
 
+def test_repeated_non_bill_images_always_get_terminal_reply():
+    with TemporaryDirectory() as tmpdir:
+        client = TestClient(app)
+        with patch("app.routes.webhooks.settings.storage_dir", tmpdir), patch(
+            "app.services.record_store.settings.storage_dir", tmpdir
+        ), patch("app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"), patch(
+            "app.routes.webhooks.bill_classifier.classify_image",
+            return_value=ClassificationResult(is_bill=False, reason="meme", confidence=0.97),
+        ), patch(
+            "app.routes.webhooks.whatsapp.send_text_message"
+        ) as send_mock:
+            response_one = client.post("/webhook", json=_image_payload("wamid-image-1"))
+            response_two = client.post("/webhook", json=_image_payload("wamid-image-2"))
+
+    assert response_one.status_code == 200
+    assert response_two.status_code == 200
+    assert send_mock.call_count == 4
+    assert "s\u00fcrebilir" in send_mock.call_args_list[0].args[1].lower()
+    assert "muhasebe belgesi olarak alg\u0131lanmad\u0131" in send_mock.call_args_list[1].args[1].lower()
+    assert "s\u00fcrebilir" in send_mock.call_args_list[2].args[1].lower()
+    assert "muhasebe belgesi olarak alg\u0131lanmad\u0131" in send_mock.call_args_list[3].args[1].lower()
+
+
 def test_document_webhook_defaults_pdf_metadata():
     record = BillRecord(
         company_name="PDF Supplier",
