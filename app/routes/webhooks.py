@@ -29,6 +29,10 @@ MSG_TEXT_NEEDS_PHOTO = (
     "\U0001F4C4 Fatura/fi\u015f metin olarak alg\u0131land\u0131. "
     "L\u00fctfen belge foto\u011fraf\u0131n\u0131 g\u00f6nderin."
 )
+MSG_PROCESSING = (
+    "\u23f3 Fatura i\u015fleniyor, bu 5-10 saniye s\u00fcrebilir. "
+    "Bitti\u011finde haber verece\u011fim."
+)
 MSG_ERROR = "\u26a0\ufe0f Belgeniz i\u015flenirken bir hata olu\u015ftu. L\u00fctfen daha sonra tekrar deneyin."
 
 
@@ -127,6 +131,7 @@ def _handle_media(message, sender: str) -> str:
         return "missing_media_payload"
 
     try:
+        _safe_send_text_message(sender, MSG_PROCESSING, context="processing notice")
         raw_bytes = whatsapp.fetch_media(media.id)
 
         classification = bill_classifier.classify_image(raw_bytes, mime_type=mime_type)

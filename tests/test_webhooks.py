@@ -173,7 +173,9 @@ def test_happy_path_image_webhook_writes_csv_and_replies():
         rows = _read_export_rows(tmpdir)
         assert len(rows) == 1
         assert rows[0]["Genel Toplam"] == "100.0"
-        assert send_mock.call_count == 1
+        assert send_mock.call_count == 2
+        assert "s\u00fcrebilir" in send_mock.call_args_list[0].args[1].lower()
+        assert "muhasebe kayd\u0131na eklendi" in send_mock.call_args_list[1].args[1].lower()
 
 
 def test_bill_like_text_prompts_for_photo():
@@ -269,7 +271,7 @@ def test_duplicate_delivery_writes_only_one_export_row():
         assert response_two.status_code == 200
         rows = _read_export_rows(tmpdir)
         assert len(rows) == 1
-        assert send_mock.call_count == 1
+        assert send_mock.call_count == 2
         fetch_mock.assert_called_once()
         classify_mock.assert_called_once()
         extract_mock.assert_called_once()
@@ -290,8 +292,9 @@ def test_classification_failure_sends_error_and_writes_no_row():
 
         assert response.status_code == 200
         assert _read_export_rows(tmpdir) == []
-        send_mock.assert_called_once()
-        assert "hata" in send_mock.call_args.args[1].lower()
+        assert send_mock.call_count == 2
+        assert "s\u00fcrebilir" in send_mock.call_args_list[0].args[1].lower()
+        assert "hata" in send_mock.call_args_list[1].args[1].lower()
 
 
 def test_extraction_failure_sends_error_and_writes_no_row():
@@ -312,8 +315,9 @@ def test_extraction_failure_sends_error_and_writes_no_row():
 
         assert response.status_code == 200
         assert _read_export_rows(tmpdir) == []
-        send_mock.assert_called_once()
-        assert "hata" in send_mock.call_args.args[1].lower()
+        assert send_mock.call_count == 2
+        assert "s\u00fcrebilir" in send_mock.call_args_list[0].args[1].lower()
+        assert "hata" in send_mock.call_args_list[1].args[1].lower()
 
 
 def test_non_bill_image_is_skipped_without_export():
@@ -331,7 +335,8 @@ def test_non_bill_image_is_skipped_without_export():
 
         assert response.status_code == 200
         assert _read_export_rows(tmpdir) == []
-        send_mock.assert_not_called()
+        send_mock.assert_called_once()
+        assert "s\u00fcrebilir" in send_mock.call_args.args[1].lower()
 
 
 def test_document_webhook_defaults_pdf_metadata():
@@ -371,7 +376,8 @@ def test_document_webhook_defaults_pdf_metadata():
             source_filename="media-doc-1.pdf",
             source_type="document",
         )
-        send_mock.assert_called_once()
+        assert send_mock.call_count == 2
+        assert "s\u00fcrebilir" in send_mock.call_args_list[0].args[1].lower()
 
 
 def test_send_failure_does_not_abort_export():
@@ -404,7 +410,7 @@ def test_send_failure_does_not_abort_export():
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
         assert len(_read_export_rows(tmpdir)) == 1
-        send_mock.assert_called_once()
+        assert send_mock.call_count == 2
 
 
 def test_failed_attempt_releases_claim_and_allows_retry():
@@ -439,4 +445,4 @@ def test_failed_attempt_releases_claim_and_allows_retry():
         assert response_two.status_code == 200
         rows = _read_export_rows(tmpdir)
         assert len(rows) == 1
-        assert send_mock.call_count == 2
+        assert send_mock.call_count == 4
