@@ -83,3 +83,19 @@ def test_mark_message_handled_prevents_future_duplicate_processing():
 
         assert record_store.is_message_processed("wamid-1") is True
         assert record_store.claim_message_processing("wamid-1") is False
+
+
+def test_should_send_warning_throttles_repeated_warning_buckets():
+    with TemporaryDirectory() as tmpdir, patch(
+        "app.services.record_store.settings.storage_dir", tmpdir
+    ):
+        assert record_store.should_send_warning("905551112233", "unrelated_text") is True
+        assert record_store.should_send_warning("905551112233", "unrelated_text") is False
+
+
+def test_should_send_warning_is_independent_per_warning_type():
+    with TemporaryDirectory() as tmpdir, patch(
+        "app.services.record_store.settings.storage_dir", tmpdir
+    ):
+        assert record_store.should_send_warning("905551112233", "unrelated_text") is True
+        assert record_store.should_send_warning("905551112233", "unrelated_media") is True

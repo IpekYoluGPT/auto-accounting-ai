@@ -29,6 +29,14 @@ MSG_TEXT_NEEDS_PHOTO = (
     "\U0001F4C4 Fatura/fi\u015f metin olarak alg\u0131land\u0131. "
     "L\u00fctfen belge foto\u011fraf\u0131n\u0131 g\u00f6nderin."
 )
+MSG_UNRELATED_TEXT = (
+    "Bu hat yaln\u0131zca fatura ve fi\u015f i\u015flemleri i\u00e7in kullan\u0131l\u0131r. "
+    "L\u00fctfen belge foto\u011fraf\u0131 g\u00f6nderin."
+)
+MSG_UNRELATED_IMAGE = (
+    "Bu g\u00f6rsel muhasebe belgesi olarak alg\u0131lanmad\u0131. "
+    "L\u00fctfen fatura veya fi\u015f foto\u011fraf\u0131 g\u00f6nderin."
+)
 MSG_PROCESSING = (
     "\u23f3 Fatura i\u015fleniyor, bu 5-10 saniye s\u00fcrebilir. "
     "Bitti\u011finde haber verece\u011fim."
@@ -107,7 +115,14 @@ def _handle_text(message, sender: str) -> str:
     logger.info("Text classification: is_bill=%s confidence=%.2f", result.is_bill, result.confidence)
 
     if not result.is_bill:
-        logger.info("Text message is not a bill; ignoring.")
+        if _send_throttled_warning(
+            sender,
+            MSG_UNRELATED_TEXT,
+            warning_key="unrelated_text",
+            context="unrelated text warning",
+        ):
+            return "warned_non_bill_text"
+        logger.info("Text message is not a bill; warning suppressed by throttle.")
         return "ignored_non_bill_text"
 
     _safe_send_text_message(sender, MSG_TEXT_NEEDS_PHOTO, context="text needs photo prompt")
@@ -143,7 +158,14 @@ def _handle_media(message, sender: str) -> str:
         )
 
         if not classification.is_bill:
-            logger.info("Image is not a bill; ignoring.")
+            if _send_throttled_warning(
+                sender,
+                MSG_UNRELATED_IMAGE,
+                warning_key="unrelated_media",
+                context="unrelated image warning",
+            ):
+                return "warned_non_bill_media"
+            logger.info("Image is not a bill; warning suppressed by throttle.")
             return "ignored_non_bill_media"
 
         record = gemini_extractor.extract_bill(
@@ -177,3 +199,11 @@ def _safe_send_text_message(to: str, text: str, *, context: str) -> None:
         whatsapp.send_text_message(to, text)
     except Exception as exc:
         logger.error("Failed to send %s to %s: %s", context, to, exc, exc_info=True)
+
+
+def _send_throttled_warning(to: str, text: str, *, warning_key: str, context: str) -> bool:
+    """Send a warning unless the same warning was sent recently to the same sender."""
+    if not record_store.should_send_warning(to, warning_key):
+        return False
+    _safe_send_text_message(to, text, context=context)
+    return True

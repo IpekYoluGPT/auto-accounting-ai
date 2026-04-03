@@ -22,6 +22,8 @@ logger = get_logger(__name__)
 
 _PERSIST_LOCK = threading.Lock()
 _MESSAGE_CLAIM_TTL = timedelta(minutes=15)
+_WARNING_THROTTLE_TTL = timedelta(minutes=3)
+_WARNING_STATE_RETENTION = timedelta(days=1)
 
 if os.name == "nt":
     import msvcrt
@@ -47,6 +49,10 @@ def _registry_path() -> Path:
 
 def _inflight_registry_path() -> Path:
     return _state_dir() / "inflight_message_ids.json"
+
+
+def _warning_registry_path() -> Path:
+    return _state_dir() / "warning_throttle.json"
 
 
 def _lock_path() -> Path:
@@ -120,6 +126,35 @@ def _write_inflight_unlocked(inflight: dict[str, str]) -> None:
     )
 
 
+def _load_warning_state_unlocked() -> dict[str, str]:
+    filepath = _warning_registry_path()
+    if not filepath.exists():
+        return {}
+
+    try:
+        payload = json.loads(filepath.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        logger.warning("Warning-throttle registry is invalid JSON; resetting it.")
+        return {}
+
+    if not isinstance(payload, dict):
+        logger.warning("Warning-throttle registry has unexpected shape; resetting it.")
+        return {}
+
+    return {
+        str(bucket): str(sent_at)
+        for bucket, sent_at in payload.items()
+        if str(bucket).strip() and str(sent_at).strip()
+    }
+
+
+def _write_warning_state_unlocked(warning_state: dict[str, str]) -> None:
+    _warning_registry_path().write_text(
+        json.dumps(warning_state, ensure_ascii=True, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
 def _append_processed_id_unlocked(message_id: str) -> None:
     with _registry_path().open("a", encoding="utf-8") as handle:
         handle.write(f"{message_id}\n")
@@ -147,6 +182,25 @@ def _purge_stale_inflight_unlocked(inflight: dict[str, str]) -> dict[str, str]:
 
     if stale_ids:
         logger.warning("Releasing %d stale in-flight message claims.", len(stale_ids))
+
+    return fresh
+
+
+def _purge_stale_warnings_unlocked(warning_state: dict[str, str]) -> dict[str, str]:
+    now = datetime.now(timezone.utc)
+    fresh: dict[str, str] = {}
+
+    for bucket, sent_at_raw in warning_state.items():
+        try:
+            sent_at = datetime.fromisoformat(sent_at_raw)
+        except ValueError:
+            continue
+
+        if sent_at.tzinfo is None:
+            sent_at = sent_at.replace(tzinfo=timezone.utc)
+
+        if now - sent_at <= _WARNING_STATE_RETENTION:
+            fresh[bucket] = sent_at.isoformat()
 
     return fresh
 
@@ -213,6 +267,36 @@ def release_message_processing(message_id: str | None) -> None:
             if inflight.pop(message_id, None) is not None:
                 _write_inflight_unlocked(inflight)
                 logger.info("Released in-flight claim for message id=%s", message_id)
+
+
+def should_send_warning(recipient: str | None, warning_key: str) -> bool:
+    """Throttle repetitive user warnings by recipient and warning type."""
+    if not recipient or not warning_key:
+        return True
+
+    bucket = f"{recipient}:{warning_key}"
+    now = datetime.now(timezone.utc)
+
+    with _PERSIST_LOCK:
+        with _interprocess_lock():
+            warning_state = _purge_stale_warnings_unlocked(_load_warning_state_unlocked())
+            last_sent_raw = warning_state.get(bucket)
+            if last_sent_raw:
+                try:
+                    last_sent = datetime.fromisoformat(last_sent_raw)
+                except ValueError:
+                    last_sent = None
+                else:
+                    if last_sent.tzinfo is None:
+                        last_sent = last_sent.replace(tzinfo=timezone.utc)
+
+                if last_sent is not None and now - last_sent < _WARNING_THROTTLE_TTL:
+                    logger.info("Skipping throttled warning bucket=%s", bucket)
+                    return False
+
+            warning_state[bucket] = now.isoformat()
+            _write_warning_state_unlocked(warning_state)
+            return True
 
 
 def persist_record_once(record: BillRecord) -> bool:

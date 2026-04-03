@@ -208,7 +208,8 @@ def test_non_bill_text_is_ignored_without_reply():
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
-    send_mock.assert_not_called()
+    send_mock.assert_called_once()
+    assert "yaln\u0131zca fatura" in send_mock.call_args.args[1].lower()
 
 
 def test_text_classification_failure_sends_error_message():
@@ -335,8 +336,26 @@ def test_non_bill_image_is_skipped_without_export():
 
         assert response.status_code == 200
         assert _read_export_rows(tmpdir) == []
-        send_mock.assert_called_once()
-        assert "s\u00fcrebilir" in send_mock.call_args.args[1].lower()
+        assert send_mock.call_count == 2
+        assert "s\u00fcrebilir" in send_mock.call_args_list[0].args[1].lower()
+        assert "muhasebe belgesi olarak alg\u0131lanmad\u0131" in send_mock.call_args_list[1].args[1].lower()
+
+
+def test_repeated_non_bill_text_warning_is_throttled():
+    with TemporaryDirectory() as tmpdir:
+        client = TestClient(app)
+        with patch("app.routes.webhooks.settings.storage_dir", tmpdir), patch(
+            "app.services.record_store.settings.storage_dir", tmpdir
+        ), patch(
+            "app.routes.webhooks.bill_classifier.classify_text",
+            return_value=ClassificationResult(is_bill=False, reason="chat", confidence=0.92),
+        ), patch("app.routes.webhooks.whatsapp.send_text_message") as send_mock:
+            response_one = client.post("/webhook", json=_text_payload("Merhaba", "wamid-text-1"))
+            response_two = client.post("/webhook", json=_text_payload("Selam", "wamid-text-2"))
+
+    assert response_one.status_code == 200
+    assert response_two.status_code == 200
+    send_mock.assert_called_once()
 
 
 def test_document_webhook_defaults_pdf_metadata():
