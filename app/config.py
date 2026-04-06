@@ -38,9 +38,11 @@ class Settings(BaseSettings):
     # Google Sheets
     # Base64-encoded service account JSON (from Google Cloud Console)
     google_service_account_json: str = ""
-    # If set, always write to this specific spreadsheet (manual/single-sheet mode).
-    # If empty, a new spreadsheet is auto-created each month and tracked in state/sheets_registry.json.
+    # Current month's spreadsheet ID. Used as seed for this month; auto-creates next month.
     google_sheets_spreadsheet_id: str = ""
+    # Google Drive folder ID owned by user. New monthly sheets are created here.
+    # User must share this folder with the service account (Editor).
+    google_drive_parent_folder_id: str = ""
     # Google account email to share every auto-created spreadsheet with (editor access).
     google_sheets_owner_email: str = "yilmazatakan4423@gmail.com"
 
