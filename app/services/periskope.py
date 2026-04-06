@@ -5,7 +5,7 @@ Periskope API client helpers for webhook-driven integrations and tool actions.
 from __future__ import annotations
 
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -50,6 +50,22 @@ def _absolute_media_url(media_path: str) -> str:
     return urljoin(f"{_media_base_url()}/", media_path.lstrip("/"))
 
 
+def _normalize_media_path(media_path: str) -> str:
+    parsed = urlparse(media_path)
+    if parsed.scheme not in {"http", "https"} or parsed.netloc != "storage.googleapis.com":
+        return media_path
+
+    prefix = "/periskope-attachments/"
+    if not parsed.path.startswith(prefix):
+        return media_path
+
+    object_key = unquote(parsed.path[len(prefix) :]).lstrip("/")
+    if not object_key:
+        return media_path
+
+    return f"/storage/v1/object/public/message-media/{object_key}"
+
+
 def _download_media(media_path: str) -> bytes:
     url = _absolute_media_url(media_path)
     with httpx.Client(timeout=60) as client:
@@ -70,17 +86,27 @@ def _canonical_media_path_from_message(message_id: str) -> str | None:
     if isinstance(media, dict):
         path = media.get("path")
         if isinstance(path, str) and path:
-            return path
+            return _normalize_media_path(path)
     return None
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10), reraise=True)
 def fetch_media(media_path: str, *, message_id: str | None = None) -> bytes:
     """Download bytes from a Periskope media path or absolute media URL."""
+    normalized_path = _normalize_media_path(media_path)
     try:
         return _download_media(media_path)
     except httpx.HTTPStatusError as exc:
         status_code = exc.response.status_code
+        if normalized_path != media_path:
+            logger.warning(
+                "Primary media URL failed for %s with %s; retrying with normalized path %s",
+                message_id or media_path,
+                status_code,
+                normalized_path,
+            )
+            return _download_media(normalized_path)
+
         if status_code not in {401, 403} or not message_id:
             raise
 

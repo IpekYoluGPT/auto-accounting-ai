@@ -300,6 +300,38 @@ def test_fetch_media_falls_back_to_canonical_message_path_after_401():
     ]
 
 
+def test_fetch_media_normalizes_google_storage_urls_before_message_lookup():
+    request = httpx.Request(
+        "GET",
+        "https://storage.googleapis.com/periskope-attachments/org-1%2F905516419175%40c.us%2Fmsg-1%2Ffile.jpeg",
+    )
+    response = httpx.Response(401, request=request)
+    attempts: list[str] = []
+
+    def _download(path: str) -> bytes:
+        attempts.append(path)
+        if path.startswith("https://storage.googleapis.com/"):
+            raise httpx.HTTPStatusError("unauthorized", request=request, response=response)
+        if path == "/storage/v1/object/public/message-media/org-1/905516419175@c.us/msg-1/file.jpeg":
+            return b"image-bytes"
+        raise AssertionError(f"Unexpected path {path}")
+
+    with patch("app.services.periskope._download_media", side_effect=_download), patch(
+        "app.services.periskope.get_message"
+    ) as get_message_mock:
+        raw = periskope_service.fetch_media(
+            "https://storage.googleapis.com/periskope-attachments/org-1%2F905516419175%40c.us%2Fmsg-1%2Ffile.jpeg",
+            message_id="peri-msg-5",
+        )
+
+    assert raw == b"image-bytes"
+    assert attempts == [
+        "https://storage.googleapis.com/periskope-attachments/org-1%2F905516419175%40c.us%2Fmsg-1%2Ffile.jpeg",
+        "/storage/v1/object/public/message-media/org-1/905516419175@c.us/msg-1/file.jpeg",
+    ]
+    get_message_mock.assert_not_called()
+
+
 def test_create_accounting_record_tool_persists_manual_record():
     client = TestClient(app)
     with TemporaryDirectory() as tmpdir:
