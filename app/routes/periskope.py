@@ -173,7 +173,11 @@ def _process_periskope_message(message: PeriskopeMessage) -> None:
             msg_type=message.message_type,
             route=route,
             send_text=_send_periskope_text_message,
-            fetch_media=(lambda: periskope.fetch_media(media.path)) if media and media.path else None,
+            fetch_media=(
+                lambda: periskope.fetch_media(media.path, message_id=message.message_id)
+            )
+            if media and media.path
+            else None,
             mime_type=(media.mimetype if media and media.mimetype else _default_mime_type(message.message_type)),
             filename=(media.filename if media and media.filename else f"{message.message_id}.{_default_extension(message.message_type)}"),
             source_type=message.message_type,

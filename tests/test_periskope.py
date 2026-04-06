@@ -13,10 +13,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import httpx
 from fastapi.testclient import TestClient
 
 from app.main import app
 from app.models.schemas import BillRecord, ClassificationResult
+from app.services import periskope as periskope_service
 
 
 def _periskope_event(data: dict, *, event: str = "message.created") -> dict:
@@ -264,6 +266,38 @@ def test_periskope_webhook_accepts_null_has_media():
         assert len(rows) == 1
         assert rows[0]["Kaynak Mesaj ID"] == "peri-msg-3"
         assert send_mock.call_count == 2
+
+
+def test_fetch_media_falls_back_to_canonical_message_path_after_401():
+    request = httpx.Request("GET", "https://storage.googleapis.com/private-object")
+    response = httpx.Response(401, request=request)
+    attempts: list[str] = []
+
+    def _download(path: str) -> bytes:
+        attempts.append(path)
+        if path == "https://storage.googleapis.com/private-object":
+            raise httpx.HTTPStatusError("unauthorized", request=request, response=response)
+        if path == "/storage/v1/object/public/message-media/org-1/group/receipt-1":
+            return b"image-bytes"
+        raise AssertionError(f"Unexpected path {path}")
+
+    with patch("app.services.periskope._download_media", side_effect=_download), patch(
+        "app.services.periskope.get_message",
+        return_value={
+            "message_id": "peri-msg-4",
+            "media": {"path": "/storage/v1/object/public/message-media/org-1/group/receipt-1"},
+        },
+    ):
+        raw = periskope_service.fetch_media(
+            "https://storage.googleapis.com/private-object",
+            message_id="peri-msg-4",
+        )
+
+    assert raw == b"image-bytes"
+    assert attempts == [
+        "https://storage.googleapis.com/private-object",
+        "/storage/v1/object/public/message-media/org-1/group/receipt-1",
+    ]
 
 
 def test_create_accounting_record_tool_persists_manual_record():

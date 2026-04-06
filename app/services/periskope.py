@@ -50,15 +50,51 @@ def _absolute_media_url(media_path: str) -> str:
     return urljoin(f"{_media_base_url()}/", media_path.lstrip("/"))
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10), reraise=True)
-def fetch_media(media_path: str) -> bytes:
-    """Download bytes from a Periskope media path or absolute media URL."""
+def _download_media(media_path: str) -> bytes:
     url = _absolute_media_url(media_path)
     with httpx.Client(timeout=60) as client:
         resp = client.get(url, headers=_auth_headers())
         resp.raise_for_status()
         logger.debug("Downloaded %d bytes from Periskope media %s", len(resp.content), url)
         return resp.content
+
+
+def _canonical_media_path_from_message(message_id: str) -> str | None:
+    try:
+        payload = get_message(message_id)
+    except Exception as exc:
+        logger.warning("Failed to refresh Periskope message %s for media lookup: %s", message_id, exc)
+        return None
+
+    media = payload.get("media")
+    if isinstance(media, dict):
+        path = media.get("path")
+        if isinstance(path, str) and path:
+            return path
+    return None
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10), reraise=True)
+def fetch_media(media_path: str, *, message_id: str | None = None) -> bytes:
+    """Download bytes from a Periskope media path or absolute media URL."""
+    try:
+        return _download_media(media_path)
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code
+        if status_code not in {401, 403} or not message_id:
+            raise
+
+        fallback_path = _canonical_media_path_from_message(message_id)
+        if not fallback_path or fallback_path == media_path:
+            raise
+
+        logger.warning(
+            "Primary media URL failed for message %s with %s; retrying with canonical path %s",
+            message_id,
+            status_code,
+            fallback_path,
+        )
+        return _download_media(fallback_path)
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10), reraise=True)
