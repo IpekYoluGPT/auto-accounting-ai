@@ -156,6 +156,10 @@ async def assign_to_human_tool(
 def _process_periskope_message(message: PeriskopeMessage) -> None:
     route = _resolve_periskope_route(message)
 
+    if not _is_allowed_periskope_chat(route.chat_id):
+        logger.info("Ignoring Periskope message from non-allowed chat_id=%s", route.chat_id)
+        return
+
     if message.message_type in {"text", "chat"}:
         process_incoming_message(
             message_id=message.message_id,
@@ -208,6 +212,19 @@ def _resolve_periskope_route(message: PeriskopeMessage) -> MessageRoute:
 
 def _send_periskope_text_message(route: MessageRoute, text: str) -> None:
     periskope.send_text_message(route.chat_id, text, reply_to=route.reply_to_message_id)
+
+
+def _is_allowed_periskope_chat(chat_id: str) -> bool:
+    raw_allowlist = settings.periskope_allowed_chat_ids.strip()
+    if not raw_allowlist:
+        return True
+
+    allowed = {
+        item.strip()
+        for item in raw_allowlist.split(",")
+        if item.strip()
+    }
+    return chat_id in allowed
 
 
 def _verify_periskope_signature(raw_body: bytes, signature: str) -> None:

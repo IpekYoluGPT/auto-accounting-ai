@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     periskope_media_base_url: str = "https://api.periskope.app"
     periskope_signing_key: str = ""
     periskope_tool_token: str = ""
+    periskope_allowed_chat_ids: str = ""
 
     # Gemini
     gemini_api_key: str = ""
