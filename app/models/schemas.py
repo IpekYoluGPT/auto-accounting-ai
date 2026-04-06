@@ -113,8 +113,8 @@ class PeriskopeMessage(BaseModel):
     author: Optional[str] = None
     body: Optional[str] = None
     from_: Optional[str] = Field(default=None, alias="from")
-    from_me: bool = False
-    has_media: bool = False
+    from_me: Optional[bool] = False
+    has_media: Optional[bool] = False
     media: Optional[PeriskopeMedia] = None
     sender_phone: Optional[str] = None
     quoted_message_id: Optional[str] = None

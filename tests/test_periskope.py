@@ -220,6 +220,52 @@ def test_periskope_webhook_accepts_event_type_with_current_attributes():
         assert send_mock.call_count == 2
 
 
+def test_periskope_webhook_accepts_null_has_media():
+    payload = _periskope_event_type_payload(
+        _periskope_image_message(message_id="peri-msg-3") | {"has_media": None}
+    )
+    signature = _sign_payload(payload, "periskope-secret")
+    record = BillRecord(
+        company_name="ABC Market",
+        total_amount=88.0,
+        currency="TRY",
+        source_message_id="peri-msg-3",
+        source_filename="receipt-1.jpg",
+        source_type="image",
+        source_sender_id="905456952965@c.us",
+        source_group_id="120363410789660631@g.us",
+        source_chat_type="group",
+        confidence=0.89,
+    )
+
+    with TemporaryDirectory() as tmpdir:
+        client = TestClient(app)
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.routes.periskope.periskope.fetch_media",
+            return_value=b"fake-image",
+        ), patch(
+            "app.services.intake.bill_classifier.classify_image",
+            return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
+        ), patch(
+            "app.services.intake.gemini_extractor.extract_bill",
+            return_value=record,
+        ), patch(
+            "app.routes.periskope.periskope.send_text_message",
+        ) as send_mock:
+            response = client.post(
+                "/integrations/periskope/webhook",
+                json=payload,
+                headers={"x-periskope-signature": signature},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+        rows = _read_export_rows(tmpdir)
+        assert len(rows) == 1
+        assert rows[0]["Kaynak Mesaj ID"] == "peri-msg-3"
+        assert send_mock.call_count == 2
+
+
 def test_create_accounting_record_tool_persists_manual_record():
     client = TestClient(app)
     with TemporaryDirectory() as tmpdir:
