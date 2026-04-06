@@ -37,24 +37,24 @@ _TABS: dict[str, tuple[list[str], dict]] = {
     "🧾 Faturalar": (
         ["#", "Tarih", "Saat", "Firma Adı", "Vergi No", "Vergi Dairesi",
          "Fatura No", "KDVsiz Tutar", "KDV %", "KDV Tutarı", "GENEL TOPLAM",
-         "Ödeme Yöntemi", "Gider Kategorisi", "Açıklama", "Notlar", "Mesaj ID"],
+         "Ödeme Yöntemi", "Gider Kategorisi", "Açıklama", "Notlar", "📎 Belge"],
         {"red": 0.16, "green": 0.38, "blue": 0.74},
     ),
     "💳 Dekontlar": (
         ["#", "Tarih", "Saat", "Banka / Firma", "Referans No",
-         "Gönderen", "Alıcı / Açıklama", "TUTAR", "Para Birimi", "Notlar", "Mesaj ID"],
+         "Gönderen", "Alıcı / Açıklama", "TUTAR", "Para Birimi", "Notlar", "📎 Belge"],
         {"red": 0.13, "green": 0.55, "blue": 0.13},
     ),
     "⛽ Harcama Fişleri": (
         ["#", "Tarih", "Saat", "Firma", "Fiş No", "Vergi No",
          "KDVsiz", "KDV %", "KDV", "TOPLAM", "Ödeme", "Kategori",
-         "Açıklama", "Plaka", "Mesaj ID"],
+         "Açıklama", "Plaka", "📎 Belge"],
         {"red": 0.90, "green": 0.49, "blue": 0.13},
     ),
     "📝 Çekler": (
         ["#", "Çek / Belge No", "Düzenleyen Firma", "Vergi No",
          "Lehdar (Alıcı)", "Vade Tarihi", "TUTAR", "Para Birimi",
-         "Açıklama", "Mesaj ID"],
+         "Açıklama", "📎 Belge"],
         {"red": 0.76, "green": 0.09, "blue": 0.09},
     ),
     "💵 Elden Ödemeler": (
@@ -64,12 +64,12 @@ _TABS: dict[str, tuple[list[str], dict]] = {
     "🏗️ Malzeme": (
         ["#", "Tarih", "Firma", "İrsaliye / Belge No", "Malzeme Cinsi",
          "Miktar", "Birim", "Teslim Yeri", "Plaka", "Tutar",
-         "Açıklama", "Mesaj ID"],
+         "Açıklama", "📎 Belge"],
         {"red": 0.47, "green": 0.27, "blue": 0.08},
     ),
     "↩️ İadeler": (
         ["#", "Tarih", "Belge Türü", "Firma", "Belge No",
-         "TUTAR", "Para Birimi", "Açıklama", "Mesaj ID"],
+         "TUTAR", "Para Birimi", "Açıklama", "📎 Belge"],
         {"red": 0.44, "green": 0.44, "blue": 0.44},
     ),
 }
@@ -148,7 +148,7 @@ _COL_WIDTHS: dict[str, int] = {
     "Lehdar (Alıcı)": 150,
     "Vade Tarihi": 90,
     "Kaydeden": 130,
-    "Mesaj ID": 48,
+    "📎 Belge": 48,
 }
 
 # Columns that should wrap text (long free-text fields)
@@ -165,13 +165,16 @@ _AMOUNT_COLUMNS = {
 
 _lock = threading.Lock()
 _gspread_client = None  # lazy-initialised
+_drive_service = None   # lazy-initialised
+_creds = None           # stored for Drive service reuse
+_drive_folder_cache: dict[str, str] = {}  # month_label → folder_id
 
 
 # ─── Client initialisation ────────────────────────────────────────────────────
 
 
 def _get_client():
-    global _gspread_client
+    global _gspread_client, _creds
     if _gspread_client is not None:
         return _gspread_client
     if not settings.google_service_account_json:
@@ -184,6 +187,7 @@ def _get_client():
         raw_json = base64.b64decode(settings.google_service_account_json).decode("utf-8")
         creds_dict = json.loads(raw_json)
         creds = Credentials.from_service_account_info(creds_dict, scopes=_SCOPES)
+        _creds = creds  # store for Drive service reuse
         _gspread_client = gspread.authorize(creds)
         logger.info(
             "Google Sheets client initialised (service account: %s)",
@@ -192,6 +196,120 @@ def _get_client():
         return _gspread_client
     except Exception as exc:
         logger.error("Failed to initialise Google Sheets client: %s", exc, exc_info=True)
+        return None
+
+
+def _get_drive_service():
+    """Return a Google Drive API v3 service, sharing credentials with gspread."""
+    global _drive_service
+    if _drive_service is not None:
+        return _drive_service
+    _get_client()  # ensure _creds is populated
+    if _creds is None:
+        return None
+    try:
+        from googleapiclient.discovery import build
+        _drive_service = build("drive", "v3", credentials=_creds, cache_discovery=False)
+        logger.debug("Google Drive service initialised.")
+        return _drive_service
+    except Exception as exc:
+        logger.error("Failed to initialise Drive service: %s", exc, exc_info=True)
+        return None
+
+
+def _get_or_create_month_drive_folder() -> Optional[str]:
+    """
+    Return (creating if needed) a monthly subfolder inside GOOGLE_DRIVE_PARENT_FOLDER_ID.
+    E.g. "Belgeler — Nisan 2026" inside the user's Muhasebe folder.
+    """
+    if not settings.google_drive_parent_folder_id:
+        return settings.google_drive_parent_folder_id or None
+
+    label = _month_label()
+    if label in _drive_folder_cache:
+        return _drive_folder_cache[label]
+
+    drive = _get_drive_service()
+    if drive is None:
+        return None
+
+    folder_name = f"Belgeler — {label}"
+    parent = settings.google_drive_parent_folder_id
+
+    try:
+        # Search for existing subfolder
+        q = (
+            f"name='{folder_name}' and "
+            f"'{parent}' in parents and "
+            "mimeType='application/vnd.google-apps.folder' and "
+            "trashed=false"
+        )
+        results = drive.files().list(q=q, fields="files(id)", pageSize=1).execute()
+        files = results.get("files", [])
+        if files:
+            folder_id = files[0]["id"]
+            _drive_folder_cache[label] = folder_id
+            return folder_id
+
+        # Create subfolder
+        meta = {
+            "name": folder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent],
+        }
+        folder = drive.files().create(body=meta, fields="id").execute()
+        folder_id = folder["id"]
+        _drive_folder_cache[label] = folder_id
+        logger.info("Created Drive subfolder '%s' (id=%s)", folder_name, folder_id)
+        return folder_id
+
+    except Exception as exc:
+        logger.warning("Could not get/create Drive folder: %s", exc)
+        return parent  # fallback to root folder
+
+
+def upload_document(
+    file_bytes: bytes,
+    filename: str,
+    mime_type: str,
+) -> Optional[str]:
+    """
+    Upload a document (image or PDF) to Google Drive.
+
+    Returns the web-view link (shareable URL) or None on failure.
+    The file is placed in a monthly subfolder inside GOOGLE_DRIVE_PARENT_FOLDER_ID.
+    """
+    if not settings.google_drive_parent_folder_id:
+        logger.debug("GOOGLE_DRIVE_PARENT_FOLDER_ID not set; skipping Drive upload.")
+        return None
+
+    drive = _get_drive_service()
+    if drive is None:
+        return None
+
+    try:
+        import io
+        from googleapiclient.http import MediaIoBaseUpload
+
+        folder_id = _get_or_create_month_drive_folder()
+
+        file_meta: dict = {"name": filename}
+        if folder_id:
+            file_meta["parents"] = [folder_id]
+
+        media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=False)
+        uploaded = drive.files().create(
+            body=file_meta,
+            media_body=media,
+            fields="id,webViewLink",
+        ).execute()
+
+        link = uploaded.get("webViewLink", "")
+        logger.info("Uploaded '%s' to Drive → %s", filename, link)
+        return link
+
+    except Exception as exc:
+        logger.error("Drive upload failed for '%s': %s", filename, exc, exc_info=True)
         return None
 
 
@@ -596,7 +714,14 @@ def _safe(v) -> str:
     return str(v)
 
 
-def _build_row(record: BillRecord, category: DocumentCategory, seq: int) -> list:
+def _drive_cell(drive_link: Optional[str]) -> str:
+    """Return a HYPERLINK formula if we have a link, otherwise empty string."""
+    if drive_link:
+        return f'=HYPERLINK("{drive_link}","📄 Görüntüle")'
+    return ""
+
+
+def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_link: Optional[str] = None) -> list:
     r = record
 
     if category == DocumentCategory.FATURA:
@@ -609,7 +734,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int) -> list
             _safe(r.total_amount),
             _safe(r.payment_method), _safe(r.expense_category),
             _safe(r.description), _safe(r.notes),
-            _safe(r.source_message_id),
+            _drive_cell(drive_link),
         ]
 
     if category == DocumentCategory.ODEME_DEKONTU:
@@ -623,7 +748,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int) -> list
             _safe(r.total_amount),
             _safe(r.currency or "TRY"),
             _safe(r.notes),
-            _safe(r.source_message_id),
+            _drive_cell(drive_link),
         ]
 
     if category == DocumentCategory.HARCAMA_FISI:
@@ -644,7 +769,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int) -> list
             _safe(r.payment_method), _safe(r.expense_category),
             _safe(r.description),
             plaka,
-            _safe(r.source_message_id),
+            _drive_cell(drive_link),
         ]
 
     if category == DocumentCategory.CEK:
@@ -657,7 +782,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int) -> list
             _safe(r.total_amount),
             _safe(r.currency or "TRY"),
             _safe(r.description),
-            _safe(r.source_message_id),
+            _drive_cell(drive_link),
         ]
 
     if category == DocumentCategory.ELDEN_ODEME:
@@ -682,7 +807,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int) -> list
             "",
             _safe(r.total_amount),
             _safe(r.expense_category),
-            _safe(r.source_message_id),
+            _drive_cell(drive_link),
         ]
 
     if category == DocumentCategory.IADE:
@@ -695,7 +820,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int) -> list
             _safe(r.total_amount),
             _safe(r.currency or "TRY"),
             _safe(r.description),
-            _safe(r.source_message_id),
+            _drive_cell(drive_link),
         ]
 
     # BELIRSIZ → Faturalar fallback
@@ -727,10 +852,13 @@ def append_record(
     record: BillRecord,
     category: DocumentCategory,
     is_return: bool = False,
+    drive_link: Optional[str] = None,
 ) -> None:
     """
     Append *record* to the correct Google Sheets tab for *category*.
 
+    drive_link: Google Drive web-view URL for the original document.
+                Shown as a clickable "📄 Görüntüle" link in the 📎 Belge column.
     If is_return is True, also logs a row in ↩️ İadeler.
     All errors are caught so CSV persistence is never disrupted.
     """
@@ -746,7 +874,7 @@ def append_record(
             tab_name = _CATEGORY_TAB.get(category, "🧾 Faturalar")
             ws = _ensure_tab_exists(sh, tab_name)
             seq = _next_seq(ws)
-            row = _build_row(record, category, seq)
+            row = _build_row(record, category, seq, drive_link=drive_link)
             ws.append_row(row, value_input_option="USER_ENTERED")
             logger.info("Appended row #%d to '%s'.", seq, tab_name)
 
@@ -754,7 +882,7 @@ def append_record(
             if is_return and tab_name != "↩️ İadeler":
                 iade_ws = _ensure_tab_exists(sh, "↩️ İadeler")
                 iade_seq = _next_seq(iade_ws)
-                iade_row = _build_row(record, DocumentCategory.IADE, iade_seq)
+                iade_row = _build_row(record, DocumentCategory.IADE, iade_seq, drive_link=drive_link)
                 iade_ws.append_row(iade_row, value_input_option="USER_ENTERED")
                 logger.info("Also logged iade row #%d.", iade_seq)
 

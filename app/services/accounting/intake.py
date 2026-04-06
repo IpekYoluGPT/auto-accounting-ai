@@ -294,6 +294,13 @@ def _handle_media(
     _safe_send_text_message(route, MSG_PROCESSING, reason="processing notice", send_text=send_text)
     raw_bytes = fetch_media()
 
+    # Upload original file to Google Drive (non-blocking on failure)
+    drive_link = google_sheets.upload_document(
+        file_bytes=raw_bytes,
+        filename=filename,
+        mime_type=mime_type,
+    )
+
     # Step 1: Is this a financial document at all?
     classification = bill_classifier.classify_image(raw_bytes, mime_type=mime_type)
     logger.info(
@@ -327,8 +334,8 @@ def _handle_media(
     if not persisted:
         return "already_exported"
 
-    # Step 5: Write to Google Sheets
-    google_sheets.append_record(record, category, is_return=is_return)
+    # Step 5: Write to Google Sheets (with Drive link)
+    google_sheets.append_record(record, category, is_return=is_return, drive_link=drive_link)
 
     # Confirmation message includes category label
     category_label = _CATEGORY_LABELS.get(category, "Belge")
