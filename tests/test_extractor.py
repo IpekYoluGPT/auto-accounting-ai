@@ -7,7 +7,7 @@ from unittest.mock import ANY, patch
 import pytest
 
 from app.models.schemas import AIExtractionResult, BillRecord
-from app.services.gemini_extractor import _normalize_record, _parse_tr_number, extract_bill
+from app.services.accounting.gemini_extractor import _normalize_record, _parse_tr_number, extract_bill
 
 
 class TestParseTrNumber:
@@ -110,14 +110,14 @@ class TestNormalizeRecord:
 
 class TestExtractBill:
     def test_no_api_key_raises(self, monkeypatch):
-        monkeypatch.setattr("app.services.gemini_extractor.settings.gemini_api_key", "")
+        monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "")
         with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
             extract_bill(b"fake", mime_type="image/jpeg")
 
     def test_successful_extraction(self, monkeypatch):
-        monkeypatch.setattr("app.services.gemini_extractor.settings.gemini_api_key", "fake_key")
+        monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
         monkeypatch.setattr(
-            "app.services.gemini_extractor.settings.gemini_extractor_model",
+            "app.services.accounting.gemini_extractor.settings.gemini_extractor_model",
             "gemini-test-extractor",
         )
         expected = AIExtractionResult(
@@ -140,7 +140,7 @@ class TestExtractBill:
         )
 
         with patch(
-            "app.services.gemini_extractor.gemini_client.generate_structured_content",
+            "app.services.accounting.gemini_extractor.gemini_client.generate_structured_content",
             return_value=expected,
         ) as mock_generate:
             record = extract_bill(
@@ -167,9 +167,9 @@ class TestExtractBill:
         )
 
     def test_generation_error_propagates(self, monkeypatch):
-        monkeypatch.setattr("app.services.gemini_extractor.settings.gemini_api_key", "fake_key")
+        monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
         with patch(
-            "app.services.gemini_extractor.gemini_client.generate_structured_content",
+            "app.services.accounting.gemini_extractor.gemini_client.generate_structured_content",
             side_effect=RuntimeError("Gemini unavailable"),
         ):
             with pytest.raises(RuntimeError, match="Gemini unavailable"):

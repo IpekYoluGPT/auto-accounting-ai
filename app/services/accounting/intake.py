@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Callable, Literal
 
 from app.config import settings
-from app.services import bill_classifier, gemini_extractor, record_store
+from app.services.accounting import bill_classifier, gemini_extractor, record_store
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)

@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.models.schemas import BillRecord, ClassificationResult
-from app.services import periskope as periskope_service
+from app.services.providers import periskope as periskope_service
 
 
 def _periskope_event(data: dict, *, event: str = "message.created") -> dict:
@@ -94,8 +94,8 @@ def _patch_runtime_settings(
     with patch("app.routes.periskope.settings.periskope_signing_key", signing_key), patch(
         "app.routes.periskope.settings.periskope_tool_token", tool_token
     ), patch("app.routes.periskope.settings.storage_dir", tmpdir), patch(
-        "app.services.record_store.settings.storage_dir", tmpdir
-    ), patch("app.services.intake.settings.whatsapp_groups_only", groups_only):
+        "app.services.accounting.record_store.settings.storage_dir", tmpdir
+    ), patch("app.services.accounting.intake.settings.whatsapp_groups_only", groups_only):
         yield
 
 
@@ -121,10 +121,10 @@ def test_periskope_group_image_webhook_exports_and_replies():
             "app.routes.periskope.periskope.fetch_media",
             return_value=b"fake-image",
         ), patch(
-            "app.services.intake.bill_classifier.classify_image",
+            "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.96),
         ), patch(
-            "app.services.intake.gemini_extractor.extract_bill",
+            "app.services.accounting.intake.gemini_extractor.extract_bill",
             return_value=record,
         ), patch(
             "app.routes.periskope.periskope.send_text_message",
@@ -224,10 +224,10 @@ def test_periskope_webhook_accepts_event_type_with_current_attributes():
             "app.routes.periskope.periskope.fetch_media",
             return_value=b"fake-image",
         ), patch(
-            "app.services.intake.bill_classifier.classify_image",
+            "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.96),
         ), patch(
-            "app.services.intake.gemini_extractor.extract_bill",
+            "app.services.accounting.intake.gemini_extractor.extract_bill",
             return_value=record,
         ), patch(
             "app.routes.periskope.periskope.send_text_message",
@@ -270,10 +270,10 @@ def test_periskope_webhook_accepts_null_has_media():
             "app.routes.periskope.periskope.fetch_media",
             return_value=b"fake-image",
         ), patch(
-            "app.services.intake.bill_classifier.classify_image",
+            "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ), patch(
-            "app.services.intake.gemini_extractor.extract_bill",
+            "app.services.accounting.intake.gemini_extractor.extract_bill",
             return_value=record,
         ), patch(
             "app.routes.periskope.periskope.send_text_message",
@@ -305,8 +305,8 @@ def test_fetch_media_falls_back_to_canonical_message_path_after_401():
             return b"image-bytes"
         raise AssertionError(f"Unexpected path {path}")
 
-    with patch("app.services.periskope._download_media", side_effect=_download), patch(
-        "app.services.periskope.get_message",
+    with patch("app.services.providers.periskope._download_media", side_effect=_download), patch(
+        "app.services.providers.periskope.get_message",
         return_value={
             "message_id": "peri-msg-4",
             "media": {"path": "/storage/v1/object/public/message-media/org-1/group/receipt-1"},
@@ -340,8 +340,8 @@ def test_fetch_media_normalizes_google_storage_urls_before_message_lookup():
             return b"image-bytes"
         raise AssertionError(f"Unexpected path {path}")
 
-    with patch("app.services.periskope._download_media", side_effect=_download), patch(
-        "app.services.periskope.get_message"
+    with patch("app.services.providers.periskope._download_media", side_effect=_download), patch(
+        "app.services.providers.periskope.get_message"
     ) as get_message_mock:
         raw = periskope_service.fetch_media(
             "https://storage.googleapis.com/periskope-attachments/org-1%2F905516419175%40c.us%2Fmsg-1%2Ffile.jpeg",
@@ -357,9 +357,9 @@ def test_fetch_media_normalizes_google_storage_urls_before_message_lookup():
 
 
 def test_external_google_storage_urls_do_not_use_periskope_auth_headers():
-    with patch("app.services.periskope.settings.periskope_api_key", "api-key"), patch(
-        "app.services.periskope.settings.periskope_phone", "905516419175"
-    ), patch("app.services.periskope.settings.periskope_api_base_url", "https://api.periskope.app/v1"):
+    with patch("app.services.providers.periskope.settings.periskope_api_key", "api-key"), patch(
+        "app.services.providers.periskope.settings.periskope_phone", "905516419175"
+    ), patch("app.services.providers.periskope.settings.periskope_api_base_url", "https://api.periskope.app/v1"):
         headers = periskope_service._headers_for_media_request(
             "https://storage.googleapis.com/periskope-attachments/file.jpeg",
             "https://storage.googleapis.com/periskope-attachments/file.jpeg",
@@ -369,9 +369,9 @@ def test_external_google_storage_urls_do_not_use_periskope_auth_headers():
 
 
 def test_periskope_api_media_urls_keep_auth_headers():
-    with patch("app.services.periskope.settings.periskope_api_key", "api-key"), patch(
-        "app.services.periskope.settings.periskope_phone", "905516419175"
-    ), patch("app.services.periskope.settings.periskope_api_base_url", "https://api.periskope.app/v1"):
+    with patch("app.services.providers.periskope.settings.periskope_api_key", "api-key"), patch(
+        "app.services.providers.periskope.settings.periskope_phone", "905516419175"
+    ), patch("app.services.providers.periskope.settings.periskope_api_base_url", "https://api.periskope.app/v1"):
         headers = periskope_service._headers_for_media_request(
             "https://api.periskope.app/storage/v1/object/public/message-media/file.jpeg",
             "/storage/v1/object/public/message-media/file.jpeg",

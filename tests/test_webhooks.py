@@ -137,7 +137,7 @@ def _read_export_rows(storage_dir: str) -> list[dict[str, str]]:
 def _patch_runtime_settings(tmpdir: str, *, groups_only: bool = False):
     with patch("app.routes.webhooks.settings.storage_dir", tmpdir), patch(
         "app.routes.webhooks.settings.whatsapp_groups_only", groups_only
-    ), patch("app.services.record_store.settings.storage_dir", tmpdir):
+    ), patch("app.services.accounting.record_store.settings.storage_dir", tmpdir):
         yield
 
 
@@ -189,10 +189,10 @@ def test_happy_path_image_webhook_writes_csv_and_replies():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ), patch(
-            "app.services.intake.bill_classifier.classify_image",
+            "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ), patch(
-            "app.services.intake.gemini_extractor.extract_bill",
+            "app.services.accounting.intake.gemini_extractor.extract_bill",
             return_value=record,
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
@@ -230,10 +230,10 @@ def test_group_image_webhook_replies_to_group_and_exports_group_metadata():
         with _patch_runtime_settings(tmpdir, groups_only=True), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ), patch(
-            "app.services.intake.bill_classifier.classify_image",
+            "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ), patch(
-            "app.services.intake.gemini_extractor.extract_bill",
+            "app.services.accounting.intake.gemini_extractor.extract_bill",
             return_value=record,
         ) as extract_mock, patch(
             "app.routes.webhooks.whatsapp.send_text_message"
@@ -266,7 +266,7 @@ def test_bill_like_text_prompts_for_photo():
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
         with _patch_runtime_settings(tmpdir), patch(
-            "app.services.intake.bill_classifier.classify_text",
+            "app.services.accounting.intake.bill_classifier.classify_text",
             return_value=ClassificationResult(is_bill=True, reason="bill text", confidence=0.81),
         ), patch("app.routes.webhooks.whatsapp.send_text_message") as send_mock:
             response = client.post("/webhook", json=_text_payload("Toplam 150 TL, KDV 27 TL"))
@@ -281,7 +281,7 @@ def test_non_bill_text_is_ignored_without_reply():
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
         with _patch_runtime_settings(tmpdir), patch(
-            "app.services.intake.bill_classifier.classify_text",
+            "app.services.accounting.intake.bill_classifier.classify_text",
             return_value=ClassificationResult(is_bill=False, reason="chat", confidence=0.92),
         ), patch("app.routes.webhooks.whatsapp.send_text_message") as send_mock:
             response = client.post("/webhook", json=_text_payload("Merhaba nasilsin"))
@@ -296,7 +296,7 @@ def test_group_non_bill_text_warning_is_throttled_per_group():
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
         with _patch_runtime_settings(tmpdir, groups_only=True), patch(
-            "app.services.intake.bill_classifier.classify_text",
+            "app.services.accounting.intake.bill_classifier.classify_text",
             return_value=ClassificationResult(is_bill=False, reason="chat", confidence=0.92),
         ), patch("app.routes.webhooks.whatsapp.send_text_message") as send_mock:
             response_one = client.post(
@@ -319,7 +319,7 @@ def test_direct_messages_are_blocked_when_groups_only_mode_is_enabled():
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
         with _patch_runtime_settings(tmpdir, groups_only=True), patch(
-            "app.services.intake.bill_classifier.classify_text"
+            "app.services.accounting.intake.bill_classifier.classify_text"
         ) as classify_mock, patch(
             "app.routes.webhooks.whatsapp.send_text_message"
         ) as send_mock:
@@ -337,7 +337,7 @@ def test_text_classification_failure_sends_error_message():
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
         with _patch_runtime_settings(tmpdir), patch(
-            "app.services.intake.bill_classifier.classify_text",
+            "app.services.accounting.intake.bill_classifier.classify_text",
             side_effect=RuntimeError("classifier down"),
         ), patch("app.routes.webhooks.whatsapp.send_text_message") as send_mock:
             response = client.post("/webhook", json=_text_payload("Toplam 150 TL"))
@@ -374,10 +374,10 @@ def test_duplicate_delivery_writes_only_one_export_row():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ) as fetch_mock, patch(
-            "app.services.intake.bill_classifier.classify_image",
+            "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ) as classify_mock, patch(
-            "app.services.intake.gemini_extractor.extract_bill",
+            "app.services.accounting.intake.gemini_extractor.extract_bill",
             return_value=record,
         ) as extract_mock, patch(
             "app.routes.webhooks.whatsapp.send_text_message"
@@ -401,7 +401,7 @@ def test_classification_failure_sends_error_and_writes_no_row():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ), patch(
-            "app.services.intake.bill_classifier.classify_image",
+            "app.services.accounting.intake.bill_classifier.classify_image",
             side_effect=RuntimeError("classifier down"),
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
@@ -421,10 +421,10 @@ def test_extraction_failure_sends_error_and_writes_no_row():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ), patch(
-            "app.services.intake.bill_classifier.classify_image",
+            "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ), patch(
-            "app.services.intake.gemini_extractor.extract_bill",
+            "app.services.accounting.intake.gemini_extractor.extract_bill",
             side_effect=RuntimeError("extractor down"),
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
@@ -444,7 +444,7 @@ def test_non_bill_image_is_skipped_without_export():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ), patch(
-            "app.services.intake.bill_classifier.classify_image",
+            "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=False, reason="meme", confidence=0.97),
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
@@ -462,7 +462,7 @@ def test_repeated_non_bill_text_warning_is_throttled():
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
         with _patch_runtime_settings(tmpdir), patch(
-            "app.services.intake.bill_classifier.classify_text",
+            "app.services.accounting.intake.bill_classifier.classify_text",
             return_value=ClassificationResult(is_bill=False, reason="chat", confidence=0.92),
         ), patch("app.routes.webhooks.whatsapp.send_text_message") as send_mock:
             response_one = client.post("/webhook", json=_text_payload("Merhaba", "wamid-text-1"))
@@ -479,7 +479,7 @@ def test_repeated_non_bill_images_always_get_terminal_reply():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ), patch(
-            "app.services.intake.bill_classifier.classify_image",
+            "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=False, reason="meme", confidence=0.97),
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
@@ -512,10 +512,10 @@ def test_document_webhook_defaults_pdf_metadata():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-pdf"
         ), patch(
-            "app.services.intake.bill_classifier.classify_image",
+            "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="document", confidence=0.94),
         ) as classify_mock, patch(
-            "app.services.intake.gemini_extractor.extract_bill",
+            "app.services.accounting.intake.gemini_extractor.extract_bill",
             return_value=record,
         ) as extract_mock, patch(
             "app.routes.webhooks.whatsapp.send_text_message"
@@ -557,10 +557,10 @@ def test_send_failure_does_not_abort_export():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ), patch(
-            "app.services.intake.bill_classifier.classify_image",
+            "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ), patch(
-            "app.services.intake.gemini_extractor.extract_bill",
+            "app.services.accounting.intake.gemini_extractor.extract_bill",
             return_value=record,
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message",
@@ -590,13 +590,13 @@ def test_failed_attempt_releases_claim_and_allows_retry():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ), patch(
-            "app.services.intake.bill_classifier.classify_image",
+            "app.services.accounting.intake.bill_classifier.classify_image",
             side_effect=[
                 RuntimeError("classifier down"),
                 ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
             ],
         ), patch(
-            "app.services.intake.gemini_extractor.extract_bill",
+            "app.services.accounting.intake.gemini_extractor.extract_bill",
             return_value=record,
         ), patch("app.routes.webhooks.whatsapp.send_text_message") as send_mock:
             response_one = client.post("/webhook", json=_image_payload("wamid-retry-1"))

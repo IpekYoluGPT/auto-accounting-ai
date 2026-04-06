@@ -7,7 +7,7 @@ from unittest.mock import ANY, patch
 import pytest
 
 from app.models.schemas import ClassificationResult
-from app.services.bill_classifier import classify_image, classify_text
+from app.services.accounting.bill_classifier import classify_image, classify_text
 
 
 class TestClassifyText:
@@ -63,7 +63,7 @@ class TestClassifyImage:
     def test_structured_response_parsed_correctly(self, monkeypatch):
         monkeypatch.setattr("app.services.gemini_client.settings.gemini_api_key", "fake_key")
         monkeypatch.setattr(
-            "app.services.bill_classifier.settings.gemini_classifier_model",
+            "app.services.accounting.bill_classifier.settings.gemini_classifier_model",
             "gemini-test-classifier",
         )
         expected = ClassificationResult(
@@ -73,7 +73,7 @@ class TestClassifyImage:
         )
 
         with patch(
-            "app.services.bill_classifier.gemini_client.generate_structured_content",
+            "app.services.accounting.bill_classifier.gemini_client.generate_structured_content",
             return_value=expected,
         ) as mock_generate:
             result = classify_image(b"fake_image_bytes", mime_type="image/png")
@@ -92,7 +92,7 @@ class TestClassifyImage:
         monkeypatch.setattr("app.services.gemini_client.settings.gemini_api_key", "fake_key")
 
         with patch(
-            "app.services.bill_classifier.gemini_client.generate_structured_content",
+            "app.services.accounting.bill_classifier.gemini_client.generate_structured_content",
             side_effect=RuntimeError("API error"),
         ):
             with pytest.raises(RuntimeError, match="API error"):
@@ -101,7 +101,7 @@ class TestClassifyImage:
     def test_sample_invoice_like_template_is_accepted(self, monkeypatch):
         monkeypatch.setattr("app.services.gemini_client.settings.gemini_api_key", "fake_key")
         with patch(
-            "app.services.bill_classifier.gemini_client.generate_structured_content",
+            "app.services.accounting.bill_classifier.gemini_client.generate_structured_content",
             return_value=ClassificationResult(
                 is_bill=False,
                 reason=(
@@ -125,7 +125,7 @@ class TestClassifyImage:
             confidence=0.98,
         )
         with patch(
-            "app.services.bill_classifier.gemini_client.generate_structured_content",
+            "app.services.accounting.bill_classifier.gemini_client.generate_structured_content",
             return_value=expected,
         ):
             result = classify_image(b"fake_image_bytes")

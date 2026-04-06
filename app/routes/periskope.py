@@ -19,8 +19,9 @@ from app.models.schemas import (
     PeriskopeMessage,
     PeriskopeSubmissionStatusRequest,
 )
-from app.services import periskope, record_store
-from app.services.intake import MessageRoute, process_incoming_message
+from app.services.providers import periskope
+from app.services.accounting import record_store
+from app.services.accounting.intake import MessageRoute, process_incoming_message
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)

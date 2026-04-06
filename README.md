@@ -61,14 +61,16 @@ auto-accounting-ai/
 │   │   ├── periskope.py          # Periskope webhook + tool endpoints
 │   │   └── webhooks.py           # GET/POST /webhook
 │   ├── services/
-│   │   ├── intake.py             # Shared inbound accounting pipeline
-│   │   ├── periskope.py          # Periskope API client
-│   │   ├── whatsapp.py           # WhatsApp Cloud API client
-│   │   ├── bill_classifier.py    # Keyword + Gemini classification
-│   │   ├── gemini_client.py      # Shared Gemini structured-output helper
-│   │   ├── gemini_extractor.py   # AI extraction + normalisation
-│   │   ├── record_store.py       # CSV persistence + message claims/dedup
-│   │   └── exporter.py           # CSV / XLSX export helpers
+│   │   ├── accounting/
+│   │   │   ├── intake.py         # Shared inbound accounting pipeline
+│   │   │   ├── bill_classifier.py# Keyword + Gemini classification
+│   │   │   ├── gemini_extractor.py # AI extraction + normalisation
+│   │   │   ├── record_store.py   # CSV persistence + message claims/dedup
+│   │   │   └── exporter.py       # CSV / XLSX export helpers
+│   │   ├── providers/
+│   │   │   ├── periskope.py      # Periskope API client
+│   │   │   └── whatsapp.py       # WhatsApp Cloud API client
+│   │   └── gemini_client.py      # Shared Gemini structured-output helper
 │   ├── models/
 │   │   └── schemas.py            # Pydantic models
 │   └── utils/

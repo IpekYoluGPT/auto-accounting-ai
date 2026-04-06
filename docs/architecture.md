@@ -38,14 +38,14 @@ Meta Cloud API or Periskope ------> POST /webhook or POST /integrations/periskop
 | `app/config.py` | Settings from env vars |
 | `app/routes/webhooks.py` | HTTP webhook endpoints |
 | `app/routes/periskope.py` | Periskope webhook + custom tool endpoints |
-| `app/services/whatsapp.py` | WhatsApp Cloud API client |
-| `app/services/periskope.py` | Periskope API client |
-| `app/services/intake.py` | Shared inbound accounting pipeline |
-| `app/services/bill_classifier.py` | Keyword + Gemini classification |
+| `app/services/providers/whatsapp.py` | WhatsApp Cloud API client |
+| `app/services/providers/periskope.py` | Periskope API client |
+| `app/services/accounting/intake.py` | Shared inbound accounting pipeline |
+| `app/services/accounting/bill_classifier.py` | Keyword + Gemini classification |
 | `app/services/gemini_client.py` | Shared Gemini 3 client wrapper |
-| `app/services/gemini_extractor.py` | Gemini extraction + normalisation |
-| `app/services/record_store.py` | Message claim lifecycle + CSV persistence + completion registry |
-| `app/services/exporter.py` | CSV / XLSX export |
+| `app/services/accounting/gemini_extractor.py` | Gemini extraction + normalisation |
+| `app/services/accounting/record_store.py` | Message claim lifecycle + CSV persistence + completion registry |
+| `app/services/accounting/exporter.py` | CSV / XLSX export |
 | `app/models/schemas.py` | Pydantic models |
 | `app/utils/logging.py` | Structured logging |
 

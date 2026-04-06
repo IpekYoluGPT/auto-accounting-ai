@@ -9,7 +9,7 @@ from typing import Any
 from fastapi import APIRouter, Query
 
 from app.models.schemas import GroupJoinRequestDecisionRequest, GroupOnboardingRequest
-from app.services import whatsapp
+from app.services.providers import whatsapp
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)

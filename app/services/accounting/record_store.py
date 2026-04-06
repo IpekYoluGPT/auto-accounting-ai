@@ -15,7 +15,7 @@ from typing import Iterator, Mapping
 
 from app.config import settings
 from app.models.schemas import BillRecord
-from app.services.exporter import COLUMN_MAP, TURKISH_HEADERS, record_to_row
+from app.services.accounting.exporter import COLUMN_MAP, TURKISH_HEADERS, record_to_row
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)

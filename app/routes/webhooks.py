@@ -14,8 +14,8 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, R
 
 from app.config import settings
 from app.models.schemas import WhatsAppWebhookPayload
-from app.services import whatsapp
-from app.services.intake import MessageRoute, process_incoming_message
+from app.services.providers import whatsapp
+from app.services.accounting.intake import MessageRoute, process_incoming_message
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)

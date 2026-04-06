@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from app.models.schemas import BillRecord
-from app.services import record_store
+from app.services.accounting import record_store
 
 
 def _record(message_id: str = "wamid-1") -> BillRecord:
@@ -37,7 +37,7 @@ def _read_rows(storage_dir: str) -> list[dict[str, str]]:
 
 def test_persist_record_once_writes_export_and_registry():
     with TemporaryDirectory() as tmpdir, patch(
-        "app.services.record_store.settings.storage_dir", tmpdir
+        "app.services.accounting.record_store.settings.storage_dir", tmpdir
     ):
         persisted = record_store.persist_record_once(_record())
 
@@ -55,7 +55,7 @@ def test_persist_record_once_writes_export_and_registry():
 
 def test_persist_record_once_skips_duplicate_message_ids():
     with TemporaryDirectory() as tmpdir, patch(
-        "app.services.record_store.settings.storage_dir", tmpdir
+        "app.services.accounting.record_store.settings.storage_dir", tmpdir
     ):
         assert record_store.persist_record_once(_record("wamid-1")) is True
         assert record_store.persist_record_once(_record("wamid-1")) is False
@@ -70,7 +70,7 @@ def test_persist_record_once_skips_duplicate_message_ids():
 
 def test_claim_message_processing_blocks_duplicate_claims_until_release():
     with TemporaryDirectory() as tmpdir, patch(
-        "app.services.record_store.settings.storage_dir", tmpdir
+        "app.services.accounting.record_store.settings.storage_dir", tmpdir
     ):
         assert record_store.claim_message_processing("wamid-1") is True
         assert record_store.claim_message_processing("wamid-1") is False
@@ -82,7 +82,7 @@ def test_claim_message_processing_blocks_duplicate_claims_until_release():
 
 def test_mark_message_handled_prevents_future_duplicate_processing():
     with TemporaryDirectory() as tmpdir, patch(
-        "app.services.record_store.settings.storage_dir", tmpdir
+        "app.services.accounting.record_store.settings.storage_dir", tmpdir
     ):
         assert record_store.claim_message_processing("wamid-1") is True
 
@@ -94,7 +94,7 @@ def test_mark_message_handled_prevents_future_duplicate_processing():
 
 def test_should_send_warning_throttles_repeated_warning_buckets():
     with TemporaryDirectory() as tmpdir, patch(
-        "app.services.record_store.settings.storage_dir", tmpdir
+        "app.services.accounting.record_store.settings.storage_dir", tmpdir
     ):
         assert record_store.should_send_warning("905551112233", "unrelated_text") is True
         assert record_store.should_send_warning("905551112233", "unrelated_text") is False
@@ -102,7 +102,7 @@ def test_should_send_warning_throttles_repeated_warning_buckets():
 
 def test_should_send_warning_is_independent_per_warning_type():
     with TemporaryDirectory() as tmpdir, patch(
-        "app.services.record_store.settings.storage_dir", tmpdir
+        "app.services.accounting.record_store.settings.storage_dir", tmpdir
     ):
         assert record_store.should_send_warning("905551112233", "unrelated_text") is True
         assert record_store.should_send_warning("905551112233", "unrelated_media") is True
