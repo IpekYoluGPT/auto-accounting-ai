@@ -14,34 +14,13 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, R
 
 from app.config import settings
 from app.models.schemas import WhatsAppWebhookPayload
-from app.services import bill_classifier, gemini_extractor, record_store, whatsapp
+from app.services import whatsapp
+from app.services.intake import MessageRoute, process_incoming_message
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/webhook", tags=["webhook"])
-
-MSG_ACCEPTED = (
-    "\u2705 Belgeniz al\u0131nd\u0131 ve muhasebe kayd\u0131na eklendi.\n"
-    "Firma: {company}\nToplam: {total} {currency}"
-)
-MSG_TEXT_NEEDS_PHOTO = (
-    "\U0001F4C4 Fatura/fi\u015f metin olarak alg\u0131land\u0131. "
-    "L\u00fctfen belge foto\u011fraf\u0131n\u0131 g\u00f6nderin."
-)
-MSG_UNRELATED_TEXT = (
-    "Bu hat yaln\u0131zca fatura ve fi\u015f i\u015flemleri i\u00e7in kullan\u0131l\u0131r. "
-    "L\u00fctfen belge foto\u011fraf\u0131 g\u00f6nderin."
-)
-MSG_UNRELATED_IMAGE = (
-    "Bu g\u00f6rsel muhasebe belgesi olarak alg\u0131lanmad\u0131. "
-    "L\u00fctfen fatura veya fi\u015f foto\u011fraf\u0131 g\u00f6nderin."
-)
-MSG_PROCESSING = (
-    "\u23f3 Fatura i\u015fleniyor, bu 5-10 saniye s\u00fcrebilir. "
-    "Bitti\u011finde haber verece\u011fim."
-)
-MSG_ERROR = "\u26a0\ufe0f Belgeniz i\u015flenirken bir hata olu\u015ftu. L\u00fctfen daha sonra tekrar deneyin."
 
 
 @router.get("")
@@ -82,121 +61,75 @@ async def receive_webhook(
 
 def _process_message(message) -> None:
     """Process a single WhatsApp message in the background."""
-    sender = message.from_
-    msg_id = message.id
-    msg_type = message.type
-
-    logger.info("Processing message id=%s type=%s from=%s", msg_id, msg_type, sender)
-
-    if not record_store.claim_message_processing(msg_id):
-        logger.info("Message id=%s already completed or in-flight; skipping duplicate.", msg_id)
+    route = _resolve_message_route(message)
+    if message.type == "text":
+        process_incoming_message(
+            message_id=message.id,
+            msg_type="text",
+            route=route,
+            send_text=_send_meta_text_message,
+            text=message.text.body if message.text else "",
+        )
         return
 
-    try:
-        if msg_type == "text":
-            outcome = _handle_text(message, sender)
-            record_store.mark_message_handled(msg_id, outcome=outcome)
-        elif msg_type in ("image", "document"):
-            outcome = _handle_media(message, sender)
-            if outcome != "exported":
-                record_store.mark_message_handled(msg_id, outcome=outcome)
-        else:
-            logger.info("Unsupported message type '%s'; skipping.", msg_type)
-            record_store.mark_message_handled(msg_id, outcome="unsupported_message_type")
-    except Exception as exc:
-        logger.error("Unhandled error processing message %s: %s", msg_id, exc, exc_info=True)
-        record_store.release_message_processing(msg_id)
-        _safe_send_text_message(sender, MSG_ERROR, context="fatal processing error")
-
-
-def _handle_text(message, sender: str) -> str:
-    text = message.text.body if message.text else ""
-    result = bill_classifier.classify_text(text)
-    logger.info("Text classification: is_bill=%s confidence=%.2f", result.is_bill, result.confidence)
-
-    if not result.is_bill:
-        if _send_throttled_warning(
-            sender,
-            MSG_UNRELATED_TEXT,
-            warning_key="unrelated_text",
-            context="unrelated text warning",
-        ):
-            return "warned_non_bill_text"
-        logger.info("Text message is not a bill; warning suppressed by throttle.")
-        return "ignored_non_bill_text"
-
-    _safe_send_text_message(sender, MSG_TEXT_NEEDS_PHOTO, context="text needs photo prompt")
-    return "prompted_for_photo"
-
-
-def _handle_media(message, sender: str) -> str:
-    """Download, classify, extract, and reply for image/document messages."""
     if message.type == "image" and message.image:
-        media = message.image
-        mime_type = media.mime_type or "image/jpeg"
-        filename = f"{media.id}.jpg"
-        source_type = "image"
-    elif message.type == "document" and message.document:
-        media = message.document
-        mime_type = media.mime_type or "application/pdf"
-        filename = media.filename or f"{media.id}.pdf"
-        source_type = "document"
-    else:
-        logger.warning("Media message has no media payload; skipping.")
-        return "missing_media_payload"
+        process_incoming_message(
+            message_id=message.id,
+            msg_type="image",
+            route=route,
+            send_text=_send_meta_text_message,
+            fetch_media=lambda: whatsapp.fetch_media(message.image.id),
+            mime_type=message.image.mime_type or "image/jpeg",
+            filename=f"{message.image.id}.jpg",
+            source_type="image",
+        )
+        return
 
-    try:
-        _safe_send_text_message(sender, MSG_PROCESSING, context="processing notice")
-        raw_bytes = whatsapp.fetch_media(media.id)
+    if message.type == "document" and message.document:
+        process_incoming_message(
+            message_id=message.id,
+            msg_type="document",
+            route=route,
+            send_text=_send_meta_text_message,
+            fetch_media=lambda: whatsapp.fetch_media(message.document.id),
+            mime_type=message.document.mime_type or "application/pdf",
+            filename=message.document.filename or f"{message.document.id}.pdf",
+            source_type="document",
+        )
+        return
 
-        classification = bill_classifier.classify_image(raw_bytes, mime_type=mime_type)
-        logger.info(
-            "Image classification: is_bill=%s confidence=%.2f reason=%s",
-            classification.is_bill,
-            classification.confidence,
-            classification.reason,
+    process_incoming_message(
+        message_id=message.id,
+        msg_type=message.type,
+        route=route,
+        send_text=_send_meta_text_message,
+    )
+
+
+def _resolve_message_route(message) -> MessageRoute:
+    """Map an inbound message to the outbound chat target and export metadata."""
+    group_id = (message.group_id or "").strip() or None
+    if group_id:
+        return MessageRoute(
+            platform="meta_whatsapp",
+            sender_id=message.from_,
+            chat_id=group_id,
+            chat_type="group",
+            recipient_type="group",
+            group_id=group_id,
         )
 
-        if not classification.is_bill:
-            _safe_send_text_message(sender, MSG_UNRELATED_IMAGE, context="unrelated image warning")
-            return "warned_non_bill_media"
+    return MessageRoute(
+        platform="meta_whatsapp",
+        sender_id=message.from_,
+        chat_id=message.from_,
+        chat_type="individual",
+        recipient_type="individual",
+    )
 
-        record = gemini_extractor.extract_bill(
-            image_bytes=raw_bytes,
-            mime_type=mime_type,
-            source_message_id=message.id,
-            source_filename=filename,
-            source_type=source_type,
-        )
-
-        persisted = record_store.persist_record_once(record)
-        if not persisted:
-            return "already_exported"
-
-        reply = MSG_ACCEPTED.format(
-            company=record.company_name or "Bilinmiyor",
-            total=record.total_amount or "?",
-            currency=record.currency or "TRY",
-        )
-        _safe_send_text_message(sender, reply, context="success confirmation")
-        return "exported"
-
-    except Exception as exc:
-        logger.error("Media processing failed for message %s: %s", message.id, exc, exc_info=True)
-        raise RuntimeError("media processing failed") from exc
-
-
-def _safe_send_text_message(to: str, text: str, *, context: str) -> None:
-    """Send a WhatsApp text message and log failures without crashing the worker."""
-    try:
-        whatsapp.send_text_message(to, text)
-    except Exception as exc:
-        logger.error("Failed to send %s to %s: %s", context, to, exc, exc_info=True)
-
-
-def _send_throttled_warning(to: str, text: str, *, warning_key: str, context: str) -> bool:
-    """Send a warning unless the same warning was sent recently to the same sender."""
-    if not record_store.should_send_warning(to, warning_key):
-        return False
-    _safe_send_text_message(to, text, context=context)
-    return True
+def _send_meta_text_message(route: MessageRoute, text: str) -> None:
+    whatsapp.send_text_message(
+        route.chat_id,
+        text,
+        recipient_type=route.recipient_type,
+    )

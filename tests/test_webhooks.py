@@ -5,6 +5,7 @@ Integration tests for the webhook route.
 from __future__ import annotations
 
 import csv
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -15,7 +16,22 @@ from app.main import app
 from app.models.schemas import BillRecord, ClassificationResult
 
 
-def _image_payload(message_id: str = "wamid-1") -> dict:
+def _image_payload(
+    message_id: str = "wamid-1",
+    *,
+    sender: str = "905551112233",
+    group_id: str | None = None,
+) -> dict:
+    message = {
+        "id": message_id,
+        "from": sender,
+        "timestamp": "1710000000",
+        "type": "image",
+        "image": {"id": "media-1", "mime_type": "image/jpeg"},
+    }
+    if group_id:
+        message["group_id"] = group_id
+
     return {
         "object": "whatsapp_business_account",
         "entry": [
@@ -26,15 +42,7 @@ def _image_payload(message_id: str = "wamid-1") -> dict:
                         "field": "messages",
                         "value": {
                             "messaging_product": "whatsapp",
-                            "messages": [
-                                {
-                                    "id": message_id,
-                                    "from": "905551112233",
-                                    "timestamp": "1710000000",
-                                    "type": "image",
-                                    "image": {"id": "media-1", "mime_type": "image/jpeg"},
-                                }
-                            ],
+                            "messages": [message],
                         },
                     }
                 ],
@@ -43,7 +51,22 @@ def _image_payload(message_id: str = "wamid-1") -> dict:
     }
 
 
-def _document_payload(message_id: str = "wamid-doc-1") -> dict:
+def _document_payload(
+    message_id: str = "wamid-doc-1",
+    *,
+    sender: str = "905551112233",
+    group_id: str | None = None,
+) -> dict:
+    message = {
+        "id": message_id,
+        "from": sender,
+        "timestamp": "1710000000",
+        "type": "document",
+        "document": {"id": "media-doc-1"},
+    }
+    if group_id:
+        message["group_id"] = group_id
+
     return {
         "object": "whatsapp_business_account",
         "entry": [
@@ -54,15 +77,7 @@ def _document_payload(message_id: str = "wamid-doc-1") -> dict:
                         "field": "messages",
                         "value": {
                             "messaging_product": "whatsapp",
-                            "messages": [
-                                {
-                                    "id": message_id,
-                                    "from": "905551112233",
-                                    "timestamp": "1710000000",
-                                    "type": "document",
-                                    "document": {"id": "media-doc-1"},
-                                }
-                            ],
+                            "messages": [message],
                         },
                     }
                 ],
@@ -71,7 +86,23 @@ def _document_payload(message_id: str = "wamid-doc-1") -> dict:
     }
 
 
-def _text_payload(text: str, message_id: str = "wamid-text-1") -> dict:
+def _text_payload(
+    text: str,
+    message_id: str = "wamid-text-1",
+    *,
+    sender: str = "905551112233",
+    group_id: str | None = None,
+) -> dict:
+    message = {
+        "id": message_id,
+        "from": sender,
+        "timestamp": "1710000000",
+        "type": "text",
+        "text": {"body": text},
+    }
+    if group_id:
+        message["group_id"] = group_id
+
     return {
         "object": "whatsapp_business_account",
         "entry": [
@@ -82,15 +113,7 @@ def _text_payload(text: str, message_id: str = "wamid-text-1") -> dict:
                         "field": "messages",
                         "value": {
                             "messaging_product": "whatsapp",
-                            "messages": [
-                                {
-                                    "id": message_id,
-                                    "from": "905551112233",
-                                    "timestamp": "1710000000",
-                                    "type": "text",
-                                    "text": {"body": text},
-                                }
-                            ],
+                            "messages": [message],
                         },
                     }
                 ],
@@ -108,6 +131,14 @@ def _read_export_rows(storage_dir: str) -> list[dict[str, str]]:
         return []
     with export_files[0].open("r", encoding="utf-8-sig", newline="") as handle:
         return list(csv.DictReader(handle))
+
+
+@contextmanager
+def _patch_runtime_settings(tmpdir: str, *, groups_only: bool = False):
+    with patch("app.routes.webhooks.settings.storage_dir", tmpdir), patch(
+        "app.routes.webhooks.settings.whatsapp_groups_only", groups_only
+    ), patch("app.services.record_store.settings.storage_dir", tmpdir):
+        yield
 
 
 def test_verify_webhook_success_returns_challenge():
@@ -155,13 +186,13 @@ def test_happy_path_image_webhook_writes_csv_and_replies():
 
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
-        with patch("app.routes.webhooks.settings.storage_dir", tmpdir), patch(
-            "app.services.record_store.settings.storage_dir", tmpdir
-        ), patch("app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"), patch(
-            "app.routes.webhooks.bill_classifier.classify_image",
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
+        ), patch(
+            "app.services.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ), patch(
-            "app.routes.webhooks.gemini_extractor.extract_bill",
+            "app.services.intake.gemini_extractor.extract_bill",
             return_value=record,
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
@@ -174,17 +205,68 @@ def test_happy_path_image_webhook_writes_csv_and_replies():
         assert len(rows) == 1
         assert rows[0]["Genel Toplam"] == "100.0"
         assert send_mock.call_count == 2
+        assert send_mock.call_args_list[0].args[0] == "905551112233"
+        assert send_mock.call_args_list[0].kwargs["recipient_type"] == "individual"
         assert "s\u00fcrebilir" in send_mock.call_args_list[0].args[1].lower()
         assert "muhasebe kayd\u0131na eklendi" in send_mock.call_args_list[1].args[1].lower()
+
+
+def test_group_image_webhook_replies_to_group_and_exports_group_metadata():
+    record = BillRecord(
+        company_name="ABC Market",
+        total_amount=100.0,
+        currency="TRY",
+        source_message_id="wamid-group-1",
+        source_filename="media-1.jpg",
+        source_type="image",
+        source_sender_id="905551112233",
+        source_group_id="group-123",
+        source_chat_type="group",
+        confidence=0.91,
+    )
+
+    with TemporaryDirectory() as tmpdir:
+        client = TestClient(app)
+        with _patch_runtime_settings(tmpdir, groups_only=True), patch(
+            "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
+        ), patch(
+            "app.services.intake.bill_classifier.classify_image",
+            return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
+        ), patch(
+            "app.services.intake.gemini_extractor.extract_bill",
+            return_value=record,
+        ) as extract_mock, patch(
+            "app.routes.webhooks.whatsapp.send_text_message"
+        ) as send_mock:
+            response = client.post("/webhook", json=_image_payload("wamid-group-1", group_id="group-123"))
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+        rows = _read_export_rows(tmpdir)
+        assert len(rows) == 1
+        assert rows[0]["Kaynak Gönderen ID"] == "905551112233"
+        assert rows[0]["Kaynak Grup ID"] == "group-123"
+        assert rows[0]["Sohbet Türü"] == "group"
+        extract_mock.assert_called_once_with(
+            image_bytes=b"fake-image",
+            mime_type="image/jpeg",
+            source_message_id="wamid-group-1",
+            source_filename="media-1.jpg",
+            source_type="image",
+            source_sender_id="905551112233",
+            source_group_id="group-123",
+            source_chat_type="group",
+        )
+        assert send_mock.call_count == 2
+        assert send_mock.call_args_list[0].args[0] == "group-123"
+        assert send_mock.call_args_list[0].kwargs["recipient_type"] == "group"
 
 
 def test_bill_like_text_prompts_for_photo():
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
-        with patch("app.routes.webhooks.settings.storage_dir", tmpdir), patch(
-            "app.services.record_store.settings.storage_dir", tmpdir
-        ), patch(
-            "app.routes.webhooks.bill_classifier.classify_text",
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.services.intake.bill_classifier.classify_text",
             return_value=ClassificationResult(is_bill=True, reason="bill text", confidence=0.81),
         ), patch("app.routes.webhooks.whatsapp.send_text_message") as send_mock:
             response = client.post("/webhook", json=_text_payload("Toplam 150 TL, KDV 27 TL"))
@@ -198,10 +280,8 @@ def test_bill_like_text_prompts_for_photo():
 def test_non_bill_text_is_ignored_without_reply():
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
-        with patch("app.routes.webhooks.settings.storage_dir", tmpdir), patch(
-            "app.services.record_store.settings.storage_dir", tmpdir
-        ), patch(
-            "app.routes.webhooks.bill_classifier.classify_text",
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.services.intake.bill_classifier.classify_text",
             return_value=ClassificationResult(is_bill=False, reason="chat", confidence=0.92),
         ), patch("app.routes.webhooks.whatsapp.send_text_message") as send_mock:
             response = client.post("/webhook", json=_text_payload("Merhaba nasilsin"))
@@ -212,13 +292,52 @@ def test_non_bill_text_is_ignored_without_reply():
     assert "yaln\u0131zca fatura" in send_mock.call_args.args[1].lower()
 
 
+def test_group_non_bill_text_warning_is_throttled_per_group():
+    with TemporaryDirectory() as tmpdir:
+        client = TestClient(app)
+        with _patch_runtime_settings(tmpdir, groups_only=True), patch(
+            "app.services.intake.bill_classifier.classify_text",
+            return_value=ClassificationResult(is_bill=False, reason="chat", confidence=0.92),
+        ), patch("app.routes.webhooks.whatsapp.send_text_message") as send_mock:
+            response_one = client.post(
+                "/webhook",
+                json=_text_payload("Merhaba", "wamid-text-group-1", sender="905551112233", group_id="group-123"),
+            )
+            response_two = client.post(
+                "/webhook",
+                json=_text_payload("Selam", "wamid-text-group-2", sender="905559998877", group_id="group-123"),
+            )
+
+    assert response_one.status_code == 200
+    assert response_two.status_code == 200
+    send_mock.assert_called_once()
+    assert send_mock.call_args.args[0] == "group-123"
+    assert send_mock.call_args.kwargs["recipient_type"] == "group"
+
+
+def test_direct_messages_are_blocked_when_groups_only_mode_is_enabled():
+    with TemporaryDirectory() as tmpdir:
+        client = TestClient(app)
+        with _patch_runtime_settings(tmpdir, groups_only=True), patch(
+            "app.services.intake.bill_classifier.classify_text"
+        ) as classify_mock, patch(
+            "app.routes.webhooks.whatsapp.send_text_message"
+        ) as send_mock:
+            response = client.post("/webhook", json=_text_payload("Toplam 150 TL", "wamid-direct-disabled-1"))
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    classify_mock.assert_not_called()
+    send_mock.assert_called_once()
+    assert "grup" in send_mock.call_args.args[1].lower()
+    assert send_mock.call_args.kwargs["recipient_type"] == "individual"
+
+
 def test_text_classification_failure_sends_error_message():
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
-        with patch("app.routes.webhooks.settings.storage_dir", tmpdir), patch(
-            "app.services.record_store.settings.storage_dir", tmpdir
-        ), patch(
-            "app.routes.webhooks.bill_classifier.classify_text",
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.services.intake.bill_classifier.classify_text",
             side_effect=RuntimeError("classifier down"),
         ), patch("app.routes.webhooks.whatsapp.send_text_message") as send_mock:
             response = client.post("/webhook", json=_text_payload("Toplam 150 TL"))
@@ -252,15 +371,13 @@ def test_duplicate_delivery_writes_only_one_export_row():
 
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
-        with patch("app.routes.webhooks.settings.storage_dir", tmpdir), patch(
-            "app.services.record_store.settings.storage_dir", tmpdir
-        ), patch(
+        with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ) as fetch_mock, patch(
-            "app.routes.webhooks.bill_classifier.classify_image",
+            "app.services.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ) as classify_mock, patch(
-            "app.routes.webhooks.gemini_extractor.extract_bill",
+            "app.services.intake.gemini_extractor.extract_bill",
             return_value=record,
         ) as extract_mock, patch(
             "app.routes.webhooks.whatsapp.send_text_message"
@@ -281,10 +398,10 @@ def test_duplicate_delivery_writes_only_one_export_row():
 def test_classification_failure_sends_error_and_writes_no_row():
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
-        with patch("app.routes.webhooks.settings.storage_dir", tmpdir), patch(
-            "app.services.record_store.settings.storage_dir", tmpdir
-        ), patch("app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"), patch(
-            "app.routes.webhooks.bill_classifier.classify_image",
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
+        ), patch(
+            "app.services.intake.bill_classifier.classify_image",
             side_effect=RuntimeError("classifier down"),
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
@@ -301,13 +418,13 @@ def test_classification_failure_sends_error_and_writes_no_row():
 def test_extraction_failure_sends_error_and_writes_no_row():
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
-        with patch("app.routes.webhooks.settings.storage_dir", tmpdir), patch(
-            "app.services.record_store.settings.storage_dir", tmpdir
-        ), patch("app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"), patch(
-            "app.routes.webhooks.bill_classifier.classify_image",
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
+        ), patch(
+            "app.services.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ), patch(
-            "app.routes.webhooks.gemini_extractor.extract_bill",
+            "app.services.intake.gemini_extractor.extract_bill",
             side_effect=RuntimeError("extractor down"),
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
@@ -324,10 +441,10 @@ def test_extraction_failure_sends_error_and_writes_no_row():
 def test_non_bill_image_is_skipped_without_export():
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
-        with patch("app.routes.webhooks.settings.storage_dir", tmpdir), patch(
-            "app.services.record_store.settings.storage_dir", tmpdir
-        ), patch("app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"), patch(
-            "app.routes.webhooks.bill_classifier.classify_image",
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
+        ), patch(
+            "app.services.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=False, reason="meme", confidence=0.97),
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
@@ -344,10 +461,8 @@ def test_non_bill_image_is_skipped_without_export():
 def test_repeated_non_bill_text_warning_is_throttled():
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
-        with patch("app.routes.webhooks.settings.storage_dir", tmpdir), patch(
-            "app.services.record_store.settings.storage_dir", tmpdir
-        ), patch(
-            "app.routes.webhooks.bill_classifier.classify_text",
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.services.intake.bill_classifier.classify_text",
             return_value=ClassificationResult(is_bill=False, reason="chat", confidence=0.92),
         ), patch("app.routes.webhooks.whatsapp.send_text_message") as send_mock:
             response_one = client.post("/webhook", json=_text_payload("Merhaba", "wamid-text-1"))
@@ -361,10 +476,10 @@ def test_repeated_non_bill_text_warning_is_throttled():
 def test_repeated_non_bill_images_always_get_terminal_reply():
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
-        with patch("app.routes.webhooks.settings.storage_dir", tmpdir), patch(
-            "app.services.record_store.settings.storage_dir", tmpdir
-        ), patch("app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"), patch(
-            "app.routes.webhooks.bill_classifier.classify_image",
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
+        ), patch(
+            "app.services.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=False, reason="meme", confidence=0.97),
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
@@ -394,13 +509,13 @@ def test_document_webhook_defaults_pdf_metadata():
 
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
-        with patch("app.routes.webhooks.settings.storage_dir", tmpdir), patch(
-            "app.services.record_store.settings.storage_dir", tmpdir
-        ), patch("app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-pdf"), patch(
-            "app.routes.webhooks.bill_classifier.classify_image",
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-pdf"
+        ), patch(
+            "app.services.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="document", confidence=0.94),
         ) as classify_mock, patch(
-            "app.routes.webhooks.gemini_extractor.extract_bill",
+            "app.services.intake.gemini_extractor.extract_bill",
             return_value=record,
         ) as extract_mock, patch(
             "app.routes.webhooks.whatsapp.send_text_message"
@@ -417,8 +532,12 @@ def test_document_webhook_defaults_pdf_metadata():
             source_message_id="wamid-doc-1",
             source_filename="media-doc-1.pdf",
             source_type="document",
+            source_sender_id="905551112233",
+            source_group_id=None,
+            source_chat_type="individual",
         )
         assert send_mock.call_count == 2
+        assert send_mock.call_args_list[0].kwargs["recipient_type"] == "individual"
         assert "s\u00fcrebilir" in send_mock.call_args_list[0].args[1].lower()
 
 
@@ -435,13 +554,13 @@ def test_send_failure_does_not_abort_export():
 
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
-        with patch("app.routes.webhooks.settings.storage_dir", tmpdir), patch(
-            "app.services.record_store.settings.storage_dir", tmpdir
-        ), patch("app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"), patch(
-            "app.routes.webhooks.bill_classifier.classify_image",
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
+        ), patch(
+            "app.services.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ), patch(
-            "app.routes.webhooks.gemini_extractor.extract_bill",
+            "app.services.intake.gemini_extractor.extract_bill",
             return_value=record,
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message",
@@ -468,16 +587,16 @@ def test_failed_attempt_releases_claim_and_allows_retry():
 
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
-        with patch("app.routes.webhooks.settings.storage_dir", tmpdir), patch(
-            "app.services.record_store.settings.storage_dir", tmpdir
-        ), patch("app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"), patch(
-            "app.routes.webhooks.bill_classifier.classify_image",
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
+        ), patch(
+            "app.services.intake.bill_classifier.classify_image",
             side_effect=[
                 RuntimeError("classifier down"),
                 ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
             ],
         ), patch(
-            "app.routes.webhooks.gemini_extractor.extract_bill",
+            "app.services.intake.gemini_extractor.extract_bill",
             return_value=record,
         ), patch("app.routes.webhooks.whatsapp.send_text_message") as send_mock:
             response_one = client.post("/webhook", json=_image_payload("wamid-retry-1"))

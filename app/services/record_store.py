@@ -11,11 +11,11 @@ import threading
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Mapping
 
 from app.config import settings
 from app.models.schemas import BillRecord
-from app.services.exporter import TURKISH_HEADERS, record_to_row
+from app.services.exporter import COLUMN_MAP, TURKISH_HEADERS, record_to_row
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -332,3 +332,40 @@ def persist_record_once(record: BillRecord) -> bool:
 
             logger.info("Record appended to %s", filepath)
             return True
+
+
+def find_export_rows(
+    *,
+    source_message_id: str | None = None,
+    chat_id: str | None = None,
+    limit: int = 5,
+) -> list[Mapping[str, str]]:
+    """Return the latest exported rows matching a source message ID or chat."""
+    if not source_message_id and not chat_id:
+        return []
+
+    matches: list[Mapping[str, str]] = []
+    group_column = COLUMN_MAP["source_group_id"]
+    sender_column = COLUMN_MAP["source_sender_id"]
+    message_column = COLUMN_MAP["source_message_id"]
+
+    with _PERSIST_LOCK:
+        export_files = sorted(_exports_dir().glob("records_*.csv"), reverse=True)
+        for filepath in export_files:
+            with filepath.open("r", encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+            for row in reversed(rows):
+                if source_message_id and row.get(message_column) == source_message_id:
+                    matches.append(dict(row))
+                elif chat_id:
+                    is_group_chat = chat_id.endswith("@g.us")
+                    if is_group_chat and row.get(group_column) == chat_id:
+                        matches.append(dict(row))
+                    elif not is_group_chat and row.get(sender_column) == chat_id:
+                        matches.append(dict(row))
+
+                if len(matches) >= limit:
+                    return matches
+
+    return matches

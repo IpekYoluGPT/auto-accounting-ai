@@ -107,6 +107,9 @@ def extract_bill(
     source_message_id: Optional[str] = None,
     source_filename: Optional[str] = None,
     source_type: Optional[str] = None,
+    source_sender_id: Optional[str] = None,
+    source_group_id: Optional[str] = None,
+    source_chat_type: Optional[str] = None,
 ) -> BillRecord:
     """
     Send *image_bytes* to Gemini and return a normalised BillRecord.
@@ -137,6 +140,9 @@ def extract_bill(
     record.source_message_id = source_message_id
     record.source_filename = source_filename
     record.source_type = source_type
+    record.source_sender_id = source_sender_id
+    record.source_group_id = source_group_id
+    record.source_chat_type = source_chat_type
 
     logger.info(
         "Extraction complete: company=%s, total=%s, confidence=%s",

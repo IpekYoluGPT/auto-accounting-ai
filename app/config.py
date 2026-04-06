@@ -19,11 +19,20 @@ class Settings(BaseSettings):
     whatsapp_verify_token: str = "changeme"
     whatsapp_access_token: str = ""
     whatsapp_phone_number_id: str = ""
+    whatsapp_groups_only: bool = True
+
+    # Periskope
+    periskope_api_key: str = ""
+    periskope_phone: str = ""
+    periskope_api_base_url: str = "https://api.periskope.app/v1"
+    periskope_media_base_url: str = "https://api.periskope.app"
+    periskope_signing_key: str = ""
+    periskope_tool_token: str = ""
 
     # Gemini
     gemini_api_key: str = ""
-    gemini_classifier_model: str = "gemini-3-flash-preview"
-    gemini_extractor_model: str = "gemini-3-flash-preview"
+    gemini_classifier_model: str = "gemini-flash-lite-latest"
+    gemini_extractor_model: str = "gemini-flash-lite-latest"
 
     # Storage
     storage_dir: str = "./storage"

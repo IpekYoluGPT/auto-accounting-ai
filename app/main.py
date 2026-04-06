@@ -11,6 +11,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.config import settings
+from app.routes.groups import router as groups_router
+from app.routes.periskope import router as periskope_router
 from app.services.exporter import TURKISH_HEADERS, tabular_rows_to_xlsx_bytes
 from app.routes.webhooks import router as webhook_router
 from app.utils.logging import get_logger
@@ -34,6 +36,8 @@ app = FastAPI(
 )
 
 app.include_router(webhook_router)
+app.include_router(groups_router)
+app.include_router(periskope_router)
 
 
 @app.get("/health", tags=["health"])

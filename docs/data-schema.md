@@ -26,6 +26,9 @@ All extracted invoice/receipt data is stored in a `BillRecord` Pydantic model.
 | `source_message_id` | `str \| null` | WhatsApp message ID |
 | `source_filename` | `str \| null` | Original file name |
 | `source_type` | `str \| null` | `image` or `document` |
+| `source_sender_id` | `str \| null` | WhatsApp sender phone number / participant ID |
+| `source_group_id` | `str \| null` | Official WhatsApp group ID when message came from a group |
+| `source_chat_type` | `individual \| group \| null` | Which chat type the bot processed |
 | `confidence` | `float \| null` | AI confidence score (0–1) |
 
 ## Export: Turkish Column Names
@@ -52,6 +55,9 @@ All extracted invoice/receipt data is stored in a `BillRecord` Pydantic model.
 | `source_message_id` | Kaynak Mesaj ID |
 | `source_filename` | Kaynak Dosya Adı |
 | `source_type` | Kaynak Türü |
+| `source_sender_id` | Kaynak Gönderen ID |
+| `source_group_id` | Kaynak Grup ID |
+| `source_chat_type` | Sohbet Türü |
 | `confidence` | Güven Skoru |
 
 ## Expense Categories (Turkish)
