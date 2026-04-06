@@ -18,7 +18,6 @@ from app.models.schemas import (
     PeriskopeCreateAccountingRecordRequest,
     PeriskopeMessage,
     PeriskopeSubmissionStatusRequest,
-    PeriskopeWebhookEvent,
 )
 from app.services import periskope, record_store
 from app.services.intake import MessageRoute, process_incoming_message
@@ -38,16 +37,26 @@ async def receive_periskope_webhook(
     _verify_periskope_signature(raw_body, signature)
 
     try:
-        event_payload = PeriskopeWebhookEvent.model_validate_json(raw_body)
+        event_name, message_payload = _parse_periskope_webhook(raw_body)
     except Exception as exc:
         logger.error("Ignoring malformed Periskope webhook payload: %s", exc)
         return {"status": "ignored"}
 
-    if event_payload.event != "message.created":
-        logger.info("Ignoring unsupported Periskope event=%s", event_payload.event)
+    if event_name != "message.created":
+        logger.info("Ignoring unsupported Periskope event=%s", event_name)
         return {"status": "ignored"}
 
-    message = PeriskopeMessage.model_validate(event_payload.data)
+    try:
+        message = PeriskopeMessage.model_validate(message_payload)
+    except Exception as exc:
+        logger.error(
+            "Ignoring malformed Periskope message payload for event=%s keys=%s: %s",
+            event_name,
+            sorted(message_payload.keys()),
+            exc,
+        )
+        return {"status": "ignored"}
+
     if message.from_me or message.is_private_note:
         logger.info("Ignoring self-authored/private Periskope message id=%s", message.message_id)
         return {"status": "ignored"}
@@ -217,6 +226,31 @@ def _verify_periskope_signature(raw_body: bytes, signature: str) -> None:
     digest = hmac.new(secret.encode("utf-8"), canonical_payload.encode("utf-8"), hashlib.sha256)
     if not hmac.compare_digest(digest.hexdigest(), signature):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid signature.")
+
+
+def _parse_periskope_webhook(raw_body: bytes) -> tuple[str, dict[str, Any]]:
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Malformed JSON.") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError("Webhook payload must be a JSON object.")
+
+    event_name = payload.get("event") or payload.get("event_type")
+    if not event_name:
+        raise ValueError("Missing event/event_type.")
+
+    message_payload = (
+        payload.get("data")
+        or payload.get("current_attributes")
+        or payload.get("attributes")
+        or payload.get("message")
+    )
+    if not isinstance(message_payload, dict):
+        raise ValueError("Missing message payload under data/current_attributes/attributes.")
+
+    return str(event_name), message_payload
 
 
 def _verify_tool_token(request: Request) -> None:
