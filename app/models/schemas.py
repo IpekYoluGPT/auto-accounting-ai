@@ -4,9 +4,24 @@ Pydantic models for WhatsApp webhook payloads and internal bill records.
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
+
+
+# ─── Document Category ───────────────────────────────────────────────────────
+
+
+class DocumentCategory(str, Enum):
+    FATURA = "fatura"               # Resmi KDV'li fatura, e-fatura
+    ODEME_DEKONTU = "odeme_dekontu" # Banka dekontu, EFT, FAST, havale
+    HARCAMA_FISI = "harcama_fisi"   # Akaryakıt fişi, market fişi, POS fişi
+    CEK = "cek"                     # Banka çeki
+    ELDEN_ODEME = "elden_odeme"     # Nakit / elden ödeme (manager metin girişi)
+    MALZEME = "malzeme"             # İrsaliye, teslim belgesi, veresiye senedi
+    IADE = "iade"                   # İade belgesi (herhangi kategoride)
+    BELIRSIZ = "belirsiz"           # Sınıflandırılamadı
 
 
 # ─── WhatsApp Webhook Models ──────────────────────────────────────────────────
