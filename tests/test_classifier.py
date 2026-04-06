@@ -97,3 +97,37 @@ class TestClassifyImage:
         ):
             with pytest.raises(RuntimeError, match="API error"):
                 classify_image(b"fake_image_bytes")
+
+    def test_sample_invoice_like_template_is_accepted(self, monkeypatch):
+        monkeypatch.setattr("app.services.gemini_client.settings.gemini_api_key", "fake_key")
+        with patch(
+            "app.services.bill_classifier.gemini_client.generate_structured_content",
+            return_value=ClassificationResult(
+                is_bill=False,
+                reason=(
+                    "The document is explicitly labeled 'ORNEK FATURA' "
+                    "and appears to be a sample invoice template."
+                ),
+                confidence=0.95,
+            ),
+        ):
+            result = classify_image(b"fake_image_bytes")
+
+        assert result.is_bill is True
+        assert result.reason == "invoice-like template override"
+        assert result.confidence >= 0.6
+
+    def test_non_document_rejection_is_not_overridden(self, monkeypatch):
+        monkeypatch.setattr("app.services.gemini_client.settings.gemini_api_key", "fake_key")
+        expected = ClassificationResult(
+            is_bill=False,
+            reason="This is a cat photo and not a financial document.",
+            confidence=0.98,
+        )
+        with patch(
+            "app.services.bill_classifier.gemini_client.generate_structured_content",
+            return_value=expected,
+        ):
+            result = classify_image(b"fake_image_bytes")
+
+        assert result == expected
