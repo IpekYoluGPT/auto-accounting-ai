@@ -103,6 +103,66 @@ _SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+# ─── Column width map (pixels) ────────────────────────────────────────────────
+
+_COL_WIDTHS: dict[str, int] = {
+    "#": 38,
+    "Tarih": 90,
+    "Saat": 58,
+    "Firma Adı": 210,
+    "Firma": 210,
+    "Banka / Firma": 210,
+    "Düzenleyen Firma": 210,
+    "Vergi No": 105,
+    "Vergi Dairesi": 120,
+    "Fatura No": 100,
+    "İrsaliye / Belge No": 130,
+    "Çek / Belge No": 120,
+    "Referans No": 120,
+    "Belge No": 100,
+    "Belge Türü": 120,
+    "KDVsiz Tutar": 110,
+    "KDVsiz": 90,
+    "KDV %": 58,
+    "KDV Oranı": 70,
+    "KDV Tutarı": 105,
+    "KDV": 80,
+    "GENEL TOPLAM": 125,
+    "TOPLAM": 110,
+    "TUTAR": 110,
+    "Tutar": 110,
+    "Para Birimi": 78,
+    "Ödeme Yöntemi": 115,
+    "Ödeme": 100,
+    "Gider Kategorisi": 130,
+    "Kategori": 110,
+    "Açıklama": 260,
+    "Alıcı / Açıklama": 240,
+    "Notlar": 200,
+    "Malzeme Cinsi": 220,
+    "Teslim Yeri": 180,
+    "Plaka": 75,
+    "Miktar": 68,
+    "Birim": 58,
+    "Gönderen": 130,
+    "Lehdar (Alıcı)": 150,
+    "Vade Tarihi": 90,
+    "Kaydeden": 130,
+    "Mesaj ID": 48,
+}
+
+# Columns that should wrap text (long free-text fields)
+_WRAP_COLUMNS = {
+    "Açıklama", "Alıcı / Açıklama", "Notlar",
+    "Malzeme Cinsi", "Teslim Yeri",
+}
+
+# Columns that hold monetary amounts (get number formatting)
+_AMOUNT_COLUMNS = {
+    "KDVsiz Tutar", "KDVsiz", "KDV Tutarı", "KDV",
+    "GENEL TOPLAM", "TOPLAM", "TUTAR", "Tutar",
+}
+
 _lock = threading.Lock()
 _gspread_client = None  # lazy-initialised
 
@@ -178,17 +238,32 @@ def _month_label() -> str:
 # ─── Spreadsheet setup ────────────────────────────────────────────────────────
 
 
+def _col_letter(idx: int) -> str:
+    """Convert 0-based column index to spreadsheet letter (A, B, …, Z, AA…)."""
+    result = ""
+    idx += 1
+    while idx:
+        idx, rem = divmod(idx - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
 def _setup_worksheet(ws, tab_name: str) -> None:
-    """Format a data worksheet: freeze row 1, bold + coloured headers."""
+    """Format a data worksheet: freeze row 1, bold + coloured headers,
+    column widths, text-wrap on long fields, number format on amounts."""
     headers, color = _TABS[tab_name]
     if not headers:
         return
 
     col_count = len(headers)
-    last_col_letter = chr(ord("A") + min(col_count - 1, 25))
-    header_range = f"A1:{last_col_letter}1"
+    last_col = _col_letter(col_count - 1)
+    header_range = f"A1:{last_col}1"
+    data_range = f"A2:{last_col}1000"
 
+    # Write headers
     ws.update([headers], "A1", value_input_option="RAW")
+
+    # Bold white text on coloured background
     ws.format(header_range, {
         "backgroundColor": color,
         "textFormat": {
@@ -198,8 +273,99 @@ def _setup_worksheet(ws, tab_name: str) -> None:
         },
         "horizontalAlignment": "CENTER",
         "verticalAlignment": "MIDDLE",
+        "wrapStrategy": "CLIP",
     })
+
+    # Data rows: light alternating background, middle-align, clip by default
+    ws.format(data_range, {
+        "verticalAlignment": "MIDDLE",
+        "wrapStrategy": "CLIP",
+        "textFormat": {"fontSize": 10},
+    })
+
     ws.freeze(rows=1)
+
+    # Build batch requests for column widths, wrap, and number format
+    requests = []
+    sheet_id = ws.id
+
+    for i, header in enumerate(headers):
+        # Column width
+        width = _COL_WIDTHS.get(header, 120)
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": i,
+                    "endIndex": i + 1,
+                },
+                "properties": {"pixelSize": width},
+                "fields": "pixelSize",
+            }
+        })
+
+        # Text wrap for long free-text columns (rows 2+)
+        if header in _WRAP_COLUMNS:
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,
+                        "startColumnIndex": i,
+                        "endColumnIndex": i + 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "wrapStrategy": "WRAP",
+                        }
+                    },
+                    "fields": "userEnteredFormat.wrapStrategy",
+                }
+            })
+
+        # Number format for amount columns
+        if header in _AMOUNT_COLUMNS:
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,
+                        "startColumnIndex": i,
+                        "endColumnIndex": i + 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {
+                                "type": "NUMBER",
+                                "pattern": "#,##0.00",
+                            },
+                            "horizontalAlignment": "RIGHT",
+                        }
+                    },
+                    "fields": "userEnteredFormat(numberFormat,horizontalAlignment)",
+                }
+            })
+
+    # Row height for header
+    requests.append({
+        "updateDimensionProperties": {
+            "range": {
+                "sheetId": sheet_id,
+                "dimension": "ROWS",
+                "startIndex": 0,
+                "endIndex": 1,
+            },
+            "properties": {"pixelSize": 32},
+            "fields": "pixelSize",
+        }
+    })
+
+    try:
+        ws.spreadsheet.batch_update({"requests": requests})
+    except Exception as exc:
+        logger.warning("Column formatting batch update failed for '%s': %s", tab_name, exc)
+
     logger.debug("Worksheet '%s' formatted (%d columns).", tab_name, col_count)
 
 
