@@ -332,6 +332,33 @@ def test_fetch_media_normalizes_google_storage_urls_before_message_lookup():
     get_message_mock.assert_not_called()
 
 
+def test_external_google_storage_urls_do_not_use_periskope_auth_headers():
+    with patch("app.services.periskope.settings.periskope_api_key", "api-key"), patch(
+        "app.services.periskope.settings.periskope_phone", "905516419175"
+    ), patch("app.services.periskope.settings.periskope_api_base_url", "https://api.periskope.app/v1"):
+        headers = periskope_service._headers_for_media_request(
+            "https://storage.googleapis.com/periskope-attachments/file.jpeg",
+            "https://storage.googleapis.com/periskope-attachments/file.jpeg",
+        )
+
+    assert headers == {}
+
+
+def test_periskope_api_media_urls_keep_auth_headers():
+    with patch("app.services.periskope.settings.periskope_api_key", "api-key"), patch(
+        "app.services.periskope.settings.periskope_phone", "905516419175"
+    ), patch("app.services.periskope.settings.periskope_api_base_url", "https://api.periskope.app/v1"):
+        headers = periskope_service._headers_for_media_request(
+            "https://api.periskope.app/storage/v1/object/public/message-media/file.jpeg",
+            "/storage/v1/object/public/message-media/file.jpeg",
+        )
+
+    assert headers == {
+        "Authorization": "Bearer api-key",
+        "x-phone": "905516419175",
+    }
+
+
 def test_create_accounting_record_tool_persists_manual_record():
     client = TestClient(app)
     with TemporaryDirectory() as tmpdir:

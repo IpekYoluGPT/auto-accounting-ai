@@ -50,6 +50,14 @@ def _absolute_media_url(media_path: str) -> str:
     return urljoin(f"{_media_base_url()}/", media_path.lstrip("/"))
 
 
+def _headers_for_media_request(url: str, media_path: str) -> dict[str, str]:
+    parsed = urlparse(url)
+    if media_path.startswith("http://") or media_path.startswith("https://"):
+        if parsed.netloc and parsed.netloc != urlparse(_api_base_url()).netloc:
+            return {}
+    return _auth_headers()
+
+
 def _normalize_media_path(media_path: str) -> str:
     parsed = urlparse(media_path)
     if parsed.scheme not in {"http", "https"} or parsed.netloc != "storage.googleapis.com":
@@ -68,8 +76,9 @@ def _normalize_media_path(media_path: str) -> str:
 
 def _download_media(media_path: str) -> bytes:
     url = _absolute_media_url(media_path)
+    headers = _headers_for_media_request(url, media_path)
     with httpx.Client(timeout=60) as client:
-        resp = client.get(url, headers=_auth_headers())
+        resp = client.get(url, headers=headers)
         resp.raise_for_status()
         logger.debug("Downloaded %d bytes from Periskope media %s", len(resp.content), url)
         return resp.content
