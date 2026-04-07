@@ -13,8 +13,14 @@ from pydantic import BaseModel
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.config import settings
+from app.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
+
+# Fallback model when the primary model returns 503 overload errors.
+_FALLBACK_MODEL = "gemini-2.0-flash"
 
 
 @lru_cache(maxsize=4)
@@ -30,30 +36,15 @@ def get_client() -> genai.Client:
     return _build_client(settings.gemini_api_key)
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=20),
-    reraise=True,
-)
-def generate_structured_content(
+def _call_model(
     *,
     model: str,
-    prompt: str,
+    contents: list,
     response_schema: type[SchemaT],
     thinking_level: str,
-    media_bytes: bytes | None = None,
-    mime_type: str | None = None,
 ) -> SchemaT:
-    """Generate structured JSON and validate it against a Pydantic schema."""
+    """Single attempt to call a model (no retry — caller handles retries)."""
     client = get_client()
-    contents: list[str | types.Part] = [prompt]
-    if media_bytes is not None:
-        contents.append(
-            types.Part.from_bytes(
-                data=media_bytes,
-                mime_type=mime_type or "application/octet-stream",
-            )
-        )
 
     config_kwargs: dict = {
         "response_mime_type": "application/json",
@@ -76,3 +67,60 @@ def generate_structured_content(
         return response.parsed
 
     return response_schema.model_validate(response.parsed)
+
+
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    reraise=True,
+)
+def generate_structured_content(
+    *,
+    model: str,
+    prompt: str,
+    response_schema: type[SchemaT],
+    thinking_level: str,
+    media_bytes: bytes | None = None,
+    mime_type: str | None = None,
+) -> SchemaT:
+    """Generate structured JSON and validate it against a Pydantic schema.
+
+    Retries up to 5 times with exponential backoff.
+    On 503 overload errors, automatically falls back to gemini-2.0-flash.
+    """
+    contents: list[str | types.Part] = [prompt]
+    if media_bytes is not None:
+        contents.append(
+            types.Part.from_bytes(
+                data=media_bytes,
+                mime_type=mime_type or "application/octet-stream",
+            )
+        )
+
+    try:
+        return _call_model(
+            model=model,
+            contents=contents,
+            response_schema=response_schema,
+            thinking_level=thinking_level,
+        )
+    except Exception as exc:
+        error_str = str(exc)
+        # On 503 overload, try fallback model immediately before tenacity retries
+        if "503" in error_str and model != _FALLBACK_MODEL:
+            logger.warning(
+                "Model %s returned 503 overload — trying fallback %s",
+                model,
+                _FALLBACK_MODEL,
+            )
+            try:
+                return _call_model(
+                    model=_FALLBACK_MODEL,
+                    contents=contents,
+                    response_schema=response_schema,
+                    thinking_level=thinking_level,
+                )
+            except Exception as fallback_exc:
+                logger.warning("Fallback model also failed: %s", fallback_exc)
+                raise exc  # re-raise original so tenacity retries primary
+        raise
