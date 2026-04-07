@@ -315,7 +315,7 @@ def _handle_media(
         "Image classification: is_bill=%s confidence=%.2f reason=%s",
         classification.is_bill,
         classification.confidence,
-        classification.reason,
+        (classification.reason or "")[:120],
     )
 
     if not classification.is_bill:

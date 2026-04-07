@@ -125,7 +125,7 @@ def classify_document_type(
             category.value,
             raw.is_return,
             raw.confidence,
-            raw.reason,
+            (raw.reason or "")[:120],
         )
         return category, raw.is_return
 
