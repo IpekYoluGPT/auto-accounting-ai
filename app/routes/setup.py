@@ -20,8 +20,8 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/setup", tags=["setup"])
 
-# In-memory state store (only used during the one-time OAuth flow)
-_oauth_states: dict[str, dict] = {}
+# In-memory store: keeps the Flow object (with code_verifier) between redirect and callback
+_oauth_flows: dict[str, object] = {}
 
 _SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -31,7 +31,6 @@ _SCOPES = [
 
 def _get_redirect_uri(request: Request) -> str:
     """Build the OAuth callback URL from the incoming request."""
-    # Use X-Forwarded headers if behind a reverse proxy (Railway)
     scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
     host = request.headers.get("x-forwarded-host", request.url.netloc)
     return f"{scheme}://{host}/setup/google-auth/callback"
@@ -74,12 +73,12 @@ async def google_auth_start(request: Request):
 
     authorization_url, state = flow.authorization_url(
         access_type="offline",
-        prompt="consent",  # Force consent to always get refresh_token
+        prompt="consent",
         include_granted_scopes="true",
     )
 
-    # Store state for validation
-    _oauth_states[state] = {"redirect_uri": redirect_uri}
+    # Store the ENTIRE flow object — it contains the code_verifier needed for token exchange
+    _oauth_flows[state] = flow
     logger.info("OAuth flow started — redirecting to Google consent screen.")
 
     return RedirectResponse(url=authorization_url)
@@ -93,16 +92,13 @@ async def google_auth_callback(
 ):
     """Receive the OAuth callback, exchange code for tokens, display refresh token."""
 
-    # Retrieve stored state
-    state_data = _oauth_states.pop(state, None)
-    if state_data is None:
+    # Retrieve the stored flow (with code_verifier intact)
+    flow = _oauth_flows.pop(state, None)
+    if flow is None:
         raise HTTPException(
             status_code=400,
             detail="Invalid or expired OAuth state. Please restart the flow at /setup/google-auth",
         )
-
-    redirect_uri = state_data["redirect_uri"]
-    flow = _build_flow(redirect_uri)
 
     try:
         flow.fetch_token(code=code)
