@@ -126,6 +126,7 @@ def process_incoming_message(
     mime_type: str | None = None,
     filename: str | None = None,
     source_type: str | None = None,
+    attachment_url: str | None = None,
 ) -> None:
     """Run the full intake flow for one inbound message."""
     logger.info(
@@ -176,6 +177,7 @@ def process_incoming_message(
                 mime_type=mime_type,
                 filename=filename,
                 source_type=source_type,
+                attachment_url=attachment_url,
             )
             if outcome != "exported":
                 record_store.mark_message_handled(message_id, outcome=outcome)
@@ -290,16 +292,20 @@ def _handle_media(
     mime_type: str,
     filename: str,
     source_type: str,
+    attachment_url: str | None = None,
 ) -> str:
     _safe_send_text_message(route, MSG_PROCESSING, reason="processing notice", send_text=send_text)
     raw_bytes = fetch_media()
 
-    # Upload original file to Google Drive (non-blocking on failure)
+    # Try Google Drive upload first; fall back to Periskope attachment URL
     drive_link = google_sheets.upload_document(
         file_bytes=raw_bytes,
         filename=filename,
         mime_type=mime_type,
     )
+    if not drive_link and attachment_url:
+        drive_link = attachment_url
+        logger.debug("Using Periskope attachment URL as document link: %s", attachment_url)
 
     # Step 1: Is this a financial document at all?
     classification = bill_classifier.classify_image(raw_bytes, mime_type=mime_type)

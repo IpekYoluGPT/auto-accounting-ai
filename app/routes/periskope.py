@@ -186,6 +186,7 @@ def _process_periskope_message(message: PeriskopeMessage) -> None:
             mime_type=(media.mimetype if media and media.mimetype else _default_mime_type(message.message_type)),
             filename=(media.filename if media and media.filename else f"{message.message_id}.{_default_extension(message.message_type)}"),
             source_type=message.message_type,
+            attachment_url=(media.path if media and media.path and media.path.startswith("http") else None),
         )
         return
 
