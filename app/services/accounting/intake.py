@@ -297,15 +297,10 @@ def _handle_media(
     _safe_send_text_message(route, MSG_PROCESSING, reason="processing notice", send_text=send_text)
     raw_bytes = fetch_media()
 
-    # Try Google Drive upload first; fall back to Periskope attachment URL
-    drive_link = google_sheets.upload_document(
-        file_bytes=raw_bytes,
-        filename=filename,
-        mime_type=mime_type,
-    )
-    if not drive_link and attachment_url:
-        drive_link = attachment_url
-        logger.debug("Using Periskope attachment URL as document link: %s", attachment_url)
+    # Use Periskope's GCS attachment URL directly as the document link.
+    # Drive upload is intentionally skipped: service accounts have no storage quota
+    # and concurrent httplib2 calls are not thread-safe (causes segfaults under load).
+    drive_link: str | None = attachment_url
 
     # Step 1: Is this a financial document at all?
     classification = bill_classifier.classify_image(raw_bytes, mime_type=mime_type)
