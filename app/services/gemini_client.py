@@ -55,14 +55,18 @@ def generate_structured_content(
             )
         )
 
+    config_kwargs: dict = {
+        "response_mime_type": "application/json",
+        "response_schema": response_schema,
+    }
+    # Only add thinking_config for models that support it (preview models)
+    if thinking_level and "preview" in model:
+        config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
+
     response = client.models.generate_content(
         model=model,
         contents=contents,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=response_schema,
-            thinking_config=types.ThinkingConfig(thinking_level=thinking_level),
-        ),
+        config=types.GenerateContentConfig(**config_kwargs),
     )
 
     if response.parsed is None:

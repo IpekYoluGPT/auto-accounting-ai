@@ -32,8 +32,8 @@ class Settings(BaseSettings):
 
     # Gemini
     gemini_api_key: str = ""
-    gemini_classifier_model: str = "gemini-2.5-flash-preview-04-17"
-    gemini_extractor_model: str = "gemini-2.5-flash-preview-04-17"
+    gemini_classifier_model: str = "gemini-2.5-flash"
+    gemini_extractor_model: str = "gemini-2.5-flash"
 
     # Google Sheets
     # Base64-encoded service account JSON (from Google Cloud Console)
