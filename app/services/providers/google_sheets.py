@@ -576,7 +576,10 @@ def _create_and_setup_spreadsheet(client, title: str) -> str:
 
     create_kwargs: dict = {}
     if settings.google_drive_parent_folder_id:
-        create_kwargs["folder_id"] = settings.google_drive_parent_folder_id
+        # Place the spreadsheet in the monthly subfolder (e.g. "Belgeler — Nisan 2026")
+        # so each month's files are grouped together.
+        folder_id = _get_or_create_month_drive_folder() or settings.google_drive_parent_folder_id
+        create_kwargs["folder_id"] = folder_id
 
     sh = client.create(title, **create_kwargs)
     sheet_id = sh.id
