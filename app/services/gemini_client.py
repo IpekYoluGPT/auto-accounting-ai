@@ -20,7 +20,8 @@ logger = get_logger(__name__)
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
 # Fallback model when the primary model returns 503 overload errors.
-_FALLBACK_MODEL = "gemini-2.0-flash"
+# gemini-2.0-flash is no longer available to new API key users (returns 404).
+_FALLBACK_MODEL = "gemini-1.5-flash"
 
 
 @lru_cache(maxsize=4)
