@@ -244,7 +244,10 @@ def _get_or_create_month_drive_folder() -> Optional[str]:
             "mimeType='application/vnd.google-apps.folder' and "
             "trashed=false"
         )
-        results = drive.files().list(q=q, fields="files(id)", pageSize=1).execute()
+        results = drive.files().list(
+            q=q, fields="files(id)", pageSize=1,
+            supportsAllDrives=True, includeItemsFromAllDrives=True,
+        ).execute()
         files = results.get("files", [])
         if files:
             folder_id = files[0]["id"]
@@ -257,7 +260,7 @@ def _get_or_create_month_drive_folder() -> Optional[str]:
             "mimeType": "application/vnd.google-apps.folder",
             "parents": [parent],
         }
-        folder = drive.files().create(body=meta, fields="id").execute()
+        folder = drive.files().create(body=meta, fields="id", supportsAllDrives=True).execute()
         folder_id = folder["id"]
         _drive_folder_cache[label] = folder_id
         logger.info("Created Drive subfolder '%s' (id=%s)", folder_name, folder_id)
@@ -302,6 +305,7 @@ def upload_document(
             body=file_meta,
             media_body=media,
             fields="id,webViewLink",
+            supportsAllDrives=True,
         ).execute()
 
         link = uploaded.get("webViewLink", "")
