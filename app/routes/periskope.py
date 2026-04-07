@@ -219,7 +219,14 @@ def _send_periskope_text_message(route: MessageRoute, text: str) -> None:
 def _is_allowed_periskope_chat(chat_id: str) -> bool:
     raw_allowlist = settings.periskope_allowed_chat_ids.strip()
     if not raw_allowlist:
-        return True
+        # Safety: if no allowlist is configured, reject all chats.
+        # This prevents the bot from responding in every group.
+        logger.warning(
+            "PERISKOPE_ALLOWED_CHAT_IDS is empty — rejecting chat_id=%s. "
+            "Set this env var to allow specific chats.",
+            chat_id,
+        )
+        return False
 
     allowed = {
         item.strip()
