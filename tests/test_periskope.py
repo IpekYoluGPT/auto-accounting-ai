@@ -66,6 +66,27 @@ def _periskope_image_message(
     }
 
 
+def _periskope_text_message(
+    *,
+    message_id: str = "peri-text-1",
+    chat_id: str = "120363410789660631@g.us",
+    sender_phone: str = "905456952965@c.us",
+    body: str = "Merhaba",
+) -> dict:
+    return {
+        "message_id": message_id,
+        "org_id": "org-1",
+        "org_phone": "905516419175@c.us",
+        "chat_id": chat_id,
+        "message_type": "text",
+        "body": body,
+        "from_me": False,
+        "has_media": False,
+        "sender_phone": sender_phone,
+        "author": sender_phone,
+    }
+
+
 def _sign_payload(payload: dict, secret: str) -> str:
     canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     digest = hmac.new(secret.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256)
@@ -199,6 +220,30 @@ def test_periskope_webhook_ignores_non_allowed_group_chat():
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
     fetch_mock.assert_not_called()
+    send_mock.assert_not_called()
+
+
+def test_periskope_group_non_bill_text_is_ignored_without_reply():
+    payload = _periskope_event(_periskope_text_message())
+    signature = _sign_payload(payload, "periskope-secret")
+    client = TestClient(app)
+    with _patch_runtime_settings("/tmp/unused"), patch(
+        "app.routes.periskope.settings.periskope_allowed_chat_ids",
+        "120363410789660631@g.us",
+    ), patch(
+        "app.services.accounting.intake.bill_classifier.classify_text",
+        return_value=ClassificationResult(is_bill=False, reason="chat", confidence=0.92),
+    ), patch(
+        "app.routes.periskope.periskope.send_text_message"
+    ) as send_mock:
+        response = client.post(
+            "/integrations/periskope/webhook",
+            json=payload,
+            headers={"x-periskope-signature": signature},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
     send_mock.assert_not_called()
 
 

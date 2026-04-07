@@ -292,7 +292,7 @@ def test_non_bill_text_is_ignored_without_reply():
     assert "yaln\u0131zca fatura" in send_mock.call_args.args[1].lower()
 
 
-def test_group_non_bill_text_warning_is_throttled_per_group():
+def test_group_non_bill_text_is_ignored_without_reply():
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
         with _patch_runtime_settings(tmpdir, groups_only=True), patch(
@@ -310,9 +310,7 @@ def test_group_non_bill_text_warning_is_throttled_per_group():
 
     assert response_one.status_code == 200
     assert response_two.status_code == 200
-    send_mock.assert_called_once()
-    assert send_mock.call_args.args[0] == "group-123"
-    assert send_mock.call_args.kwargs["recipient_type"] == "group"
+    send_mock.assert_not_called()
 
 
 def test_direct_messages_are_blocked_when_groups_only_mode_is_enabled():
