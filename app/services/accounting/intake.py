@@ -40,6 +40,10 @@ MSG_ACCEPTED = (
     "Firma: {company}\n"
     "Toplam: {total} {currency}"
 )
+MSG_MULTI_ACCEPTED = (
+    "✅ {count} adet belge algılandı ve muhasebe kaydına eklendi.\n"
+    "{details}"
+)
 MSG_ELDEN_ODEME_ACCEPTED = (
     "✅ Elden ödeme kaydedildi.\n"
     "Tutar: {total} {currency}\n"
@@ -321,8 +325,8 @@ def _handle_media(
     # Step 2: Which category?
     category, is_return = doc_classifier.classify_document_type(raw_bytes, mime_type=mime_type)
 
-    # Step 3: Extract structured fields
-    record = gemini_extractor.extract_bill(
+    # Step 3: Extract structured fields (may return multiple documents)
+    records = gemini_extractor.extract_bills(
         image_bytes=raw_bytes,
         mime_type=mime_type,
         source_message_id=message_id,
@@ -333,22 +337,42 @@ def _handle_media(
         source_chat_type=route.chat_type,
     )
 
-    # Step 4: Persist to CSV (dedup guard)
-    persisted = record_store.persist_record_once(record)
-    if not persisted:
+    if not records:
+        logger.warning("Gemini returned zero documents for message id=%s", message_id)
+        _safe_send_text_message(route, MSG_UNRELATED_IMAGE, reason="empty extraction", send_text=send_text)
+        return "warned_non_bill_media"
+
+    # Step 4 & 5: Persist and write each record to Sheets
+    persisted_count = 0
+    details_lines: list[str] = []
+    for record in records:
+        persisted = record_store.persist_record_once(record)
+        if not persisted:
+            continue
+        persisted_count += 1
+        google_sheets.append_record(record, category, is_return=is_return, drive_link=drive_link)
+        details_lines.append(
+            f"  • {record.company_name or 'Bilinmiyor'}: "
+            f"{record.total_amount or '?'} {record.currency or 'TRY'}"
+        )
+
+    if persisted_count == 0:
         return "already_exported"
 
-    # Step 5: Write to Google Sheets (with Drive link)
-    google_sheets.append_record(record, category, is_return=is_return, drive_link=drive_link)
-
-    # Confirmation message includes category label
+    # Confirmation message
     category_label = _CATEGORY_LABELS.get(category, "Belge")
-    reply = MSG_ACCEPTED.format(
-        category=category_label,
-        company=record.company_name or "Bilinmiyor",
-        total=record.total_amount or "?",
-        currency=record.currency or "TRY",
-    )
+    if len(records) == 1:
+        reply = MSG_ACCEPTED.format(
+            category=category_label,
+            company=records[0].company_name or "Bilinmiyor",
+            total=records[0].total_amount or "?",
+            currency=records[0].currency or "TRY",
+        )
+    else:
+        reply = MSG_MULTI_ACCEPTED.format(
+            count=persisted_count,
+            details="\n".join(details_lines),
+        )
     _safe_send_text_message(route, reply, reason="success confirmation", send_text=send_text)
     return "exported"
 

@@ -192,8 +192,8 @@ def test_happy_path_image_webhook_writes_csv_and_replies():
             "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ), patch(
-            "app.services.accounting.intake.gemini_extractor.extract_bill",
-            return_value=record,
+            "app.services.accounting.intake.gemini_extractor.extract_bills",
+            return_value=[record],
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
         ) as send_mock:
@@ -233,8 +233,8 @@ def test_group_image_webhook_replies_to_group_and_exports_group_metadata():
             "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ), patch(
-            "app.services.accounting.intake.gemini_extractor.extract_bill",
-            return_value=record,
+            "app.services.accounting.intake.gemini_extractor.extract_bills",
+            return_value=[record],
         ) as extract_mock, patch(
             "app.routes.webhooks.whatsapp.send_text_message"
         ) as send_mock:
@@ -375,8 +375,8 @@ def test_duplicate_delivery_writes_only_one_export_row():
             "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ) as classify_mock, patch(
-            "app.services.accounting.intake.gemini_extractor.extract_bill",
-            return_value=record,
+            "app.services.accounting.intake.gemini_extractor.extract_bills",
+            return_value=[record],
         ) as extract_mock, patch(
             "app.routes.webhooks.whatsapp.send_text_message"
         ) as send_mock:
@@ -422,7 +422,7 @@ def test_extraction_failure_sends_error_and_writes_no_row():
             "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ), patch(
-            "app.services.accounting.intake.gemini_extractor.extract_bill",
+            "app.services.accounting.intake.gemini_extractor.extract_bills",
             side_effect=RuntimeError("extractor down"),
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
@@ -513,8 +513,8 @@ def test_document_webhook_defaults_pdf_metadata():
             "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="document", confidence=0.94),
         ) as classify_mock, patch(
-            "app.services.accounting.intake.gemini_extractor.extract_bill",
-            return_value=record,
+            "app.services.accounting.intake.gemini_extractor.extract_bills",
+            return_value=[record],
         ) as extract_mock, patch(
             "app.routes.webhooks.whatsapp.send_text_message"
         ) as send_mock:
@@ -558,8 +558,8 @@ def test_send_failure_does_not_abort_export():
             "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ), patch(
-            "app.services.accounting.intake.gemini_extractor.extract_bill",
-            return_value=record,
+            "app.services.accounting.intake.gemini_extractor.extract_bills",
+            return_value=[record],
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message",
             side_effect=RuntimeError("send failed"),
@@ -594,8 +594,8 @@ def test_failed_attempt_releases_claim_and_allows_retry():
                 ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
             ],
         ), patch(
-            "app.services.accounting.intake.gemini_extractor.extract_bill",
-            return_value=record,
+            "app.services.accounting.intake.gemini_extractor.extract_bills",
+            return_value=[record],
         ), patch("app.routes.webhooks.whatsapp.send_text_message") as send_mock:
             response_one = client.post("/webhook", json=_image_payload("wamid-retry-1"))
             response_two = client.post("/webhook", json=_image_payload("wamid-retry-1"))

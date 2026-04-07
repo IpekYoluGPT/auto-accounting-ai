@@ -116,7 +116,10 @@ def _patch_runtime_settings(
         "app.routes.periskope.settings.periskope_tool_token", tool_token
     ), patch("app.routes.periskope.settings.storage_dir", tmpdir), patch(
         "app.services.accounting.record_store.settings.storage_dir", tmpdir
-    ), patch("app.services.accounting.intake.settings.whatsapp_groups_only", groups_only):
+    ), patch("app.services.accounting.intake.settings.whatsapp_groups_only", groups_only), patch(
+        "app.routes.periskope.settings.periskope_allowed_chat_ids",
+        "120363410789660631@g.us,120363423064785066@g.us,120363045948478087@g.us",
+    ):
         yield
 
 
@@ -145,8 +148,8 @@ def test_periskope_group_image_webhook_exports_and_replies():
             "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.96),
         ), patch(
-            "app.services.accounting.intake.gemini_extractor.extract_bill",
-            return_value=record,
+            "app.services.accounting.intake.gemini_extractor.extract_bills",
+            return_value=[record],
         ), patch(
             "app.routes.periskope.periskope.send_text_message",
         ) as send_mock:
@@ -272,8 +275,8 @@ def test_periskope_webhook_accepts_event_type_with_current_attributes():
             "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.96),
         ), patch(
-            "app.services.accounting.intake.gemini_extractor.extract_bill",
-            return_value=record,
+            "app.services.accounting.intake.gemini_extractor.extract_bills",
+            return_value=[record],
         ), patch(
             "app.routes.periskope.periskope.send_text_message",
         ) as send_mock:
@@ -318,8 +321,8 @@ def test_periskope_webhook_accepts_null_has_media():
             "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ), patch(
-            "app.services.accounting.intake.gemini_extractor.extract_bill",
-            return_value=record,
+            "app.services.accounting.intake.gemini_extractor.extract_bills",
+            return_value=[record],
         ), patch(
             "app.routes.periskope.periskope.send_text_message",
         ) as send_mock:

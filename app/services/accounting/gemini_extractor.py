@@ -11,13 +11,18 @@ import re
 from typing import Optional
 
 from app.config import settings
-from app.models.schemas import AIExtractionResult, BillRecord
+from app.models.schemas import AIExtractionResult, AIMultiExtractionResult, BillRecord
 from app.services import gemini_client
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 _EXTRACTION_PROMPT = """Extract bookkeeping fields from this Turkish invoice, receipt, or payment document.
+
+IMPORTANT: This image may contain MORE THAN ONE document (e.g. multiple cheques,
+receipts, or invoices side by side, stacked, or overlapping).
+Return one entry per DISTINCT document you can identify.
+If there is only one document, return a list with a single entry.
 
 Return only the requested schema.
 Use null for missing values.
@@ -101,6 +106,75 @@ def _normalize_record(raw: dict) -> BillRecord:
     )
 
 
+def extract_bills(
+    image_bytes: bytes,
+    mime_type: str = "image/jpeg",
+    source_message_id: Optional[str] = None,
+    source_filename: Optional[str] = None,
+    source_type: Optional[str] = None,
+    source_sender_id: Optional[str] = None,
+    source_group_id: Optional[str] = None,
+    source_chat_type: Optional[str] = None,
+) -> list[BillRecord]:
+    """
+    Send *image_bytes* to Gemini and return a list of normalised BillRecords.
+
+    A single photo may contain multiple documents (e.g. 3 cheques side by side).
+    Gemini is asked to detect and extract each one separately.
+
+    Raises RuntimeError immediately if the API key is not configured.
+    Retries transient Gemini API errors up to 5 times.
+    """
+    if not settings.gemini_api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+    logger.info(
+        "Sending image (%d bytes, %s) to Gemini model %s for multi-document extraction",
+        len(image_bytes),
+        mime_type,
+        settings.gemini_extractor_model,
+    )
+
+    multi_result = gemini_client.generate_structured_content(
+        model=settings.gemini_extractor_model,
+        prompt=_EXTRACTION_PROMPT,
+        response_schema=AIMultiExtractionResult,
+        thinking_level="low",
+        media_bytes=image_bytes,
+        mime_type=mime_type,
+    )
+
+    raw_docs = multi_result.documents
+    if not raw_docs:
+        logger.warning("Gemini returned zero documents for image; returning empty list.")
+        return []
+
+    records: list[BillRecord] = []
+    for idx, doc in enumerate(raw_docs):
+        record = _normalize_record(doc.model_dump())
+        # For multi-document images, append a sub-index to the message id
+        # so each record has a unique dedup key.
+        if len(raw_docs) > 1 and source_message_id:
+            record.source_message_id = f"{source_message_id}__doc{idx + 1}"
+        else:
+            record.source_message_id = source_message_id
+        record.source_filename = source_filename
+        record.source_type = source_type
+        record.source_sender_id = source_sender_id
+        record.source_group_id = source_group_id
+        record.source_chat_type = source_chat_type
+        records.append(record)
+
+    logger.info(
+        "Extraction complete: %d document(s) found. [%s]",
+        len(records),
+        ", ".join(
+            f"{r.company_name or '?'}={r.total_amount}" for r in records
+        ),
+    )
+    return records
+
+
 def extract_bill(
     image_bytes: bytes,
     mime_type: str = "image/jpeg",
@@ -112,42 +186,20 @@ def extract_bill(
     source_chat_type: Optional[str] = None,
 ) -> BillRecord:
     """
-    Send *image_bytes* to Gemini and return a normalised BillRecord.
+    Backward-compatible wrapper: returns the first extracted record.
 
-    Raises RuntimeError immediately if the API key is not configured.
-    Retries transient Gemini API errors up to 3 times.
+    Prefer extract_bills() for new code — it handles multi-document images.
     """
-    if not settings.gemini_api_key:
-        raise RuntimeError("GEMINI_API_KEY is not configured.")
-
-    logger.info(
-        "Sending image (%d bytes, %s) to Gemini model %s for extraction",
-        len(image_bytes),
-        mime_type,
-        settings.gemini_extractor_model,
-    )
-
-    extracted = gemini_client.generate_structured_content(
-        model=settings.gemini_extractor_model,
-        prompt=_EXTRACTION_PROMPT,
-        response_schema=AIExtractionResult,
-        thinking_level="low",
-        media_bytes=image_bytes,
+    records = extract_bills(
+        image_bytes=image_bytes,
         mime_type=mime_type,
+        source_message_id=source_message_id,
+        source_filename=source_filename,
+        source_type=source_type,
+        source_sender_id=source_sender_id,
+        source_group_id=source_group_id,
+        source_chat_type=source_chat_type,
     )
-
-    record = _normalize_record(extracted.model_dump())
-    record.source_message_id = source_message_id
-    record.source_filename = source_filename
-    record.source_type = source_type
-    record.source_sender_id = source_sender_id
-    record.source_group_id = source_group_id
-    record.source_chat_type = source_chat_type
-
-    logger.info(
-        "Extraction complete: company=%s, total=%s, confidence=%s",
-        record.company_name,
-        record.total_amount,
-        record.confidence,
-    )
-    return record
+    if not records:
+        raise RuntimeError("Gemini returned no documents from the image.")
+    return records[0]

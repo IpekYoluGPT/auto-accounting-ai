@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import json
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -315,6 +316,30 @@ def _get_oauth_sheets_service():
     except Exception as exc:
         logger.error("Failed to initialise OAuth Sheets service: %s", exc, exc_info=True)
         return None
+
+
+def _retry_on_rate_limit(fn, *, max_retries: int = 5, base_delay: float = 5.0):
+    """Execute *fn()* with exponential backoff on Google API 429 rate-limit errors.
+
+    Retries up to *max_retries* times with delays of 5s, 10s, 20s, 40s, 80s.
+    Any non-429 exception is re-raised immediately.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            exc_str = str(exc)
+            is_rate_limit = "429" in exc_str or "Quota exceeded" in exc_str or "RATE_LIMIT" in exc_str.upper()
+            if not is_rate_limit or attempt >= max_retries:
+                raise
+            delay = base_delay * (2 ** attempt)
+            logger.warning(
+                "Rate limited (429) on attempt %d/%d; retrying in %.0fs …",
+                attempt + 1, max_retries + 1, delay,
+            )
+            time.sleep(delay)
+    # Should not reach here, but just in case
+    return fn()
 
 
 def _get_service_account_email() -> Optional[str]:
@@ -876,6 +901,48 @@ def _ensure_tab_exists(sh, tab_name: str, base_name: str | None = None):
 # ─── Spreadsheet resolution ───────────────────────────────────────────────────
 
 
+def _find_existing_spreadsheet_in_drive(title: str) -> Optional[str]:
+    """Search Drive for an existing spreadsheet with the given title.
+
+    Prevents duplicate creation when a previous attempt succeeded on file creation
+    but failed before the registry was saved.
+    """
+    if not settings.google_drive_parent_folder_id:
+        return None
+
+    oauth_drive = _get_oauth_drive_service()
+    sa_drive = _get_drive_service()
+    drive = oauth_drive or sa_drive
+    if drive is None:
+        return None
+
+    try:
+        # Search in the monthly subfolder first, then in the parent folder
+        for parent_id in [
+            _drive_folder_cache.get(_month_label()),
+            settings.google_drive_parent_folder_id,
+        ]:
+            if not parent_id:
+                continue
+            q = (
+                f"name='{title}' and "
+                f"'{parent_id}' in parents and "
+                "mimeType='application/vnd.google-apps.spreadsheet' and "
+                "trashed=false"
+            )
+            results = drive.files().list(
+                q=q, fields="files(id)", pageSize=1,
+                supportsAllDrives=True, includeItemsFromAllDrives=True,
+            ).execute()
+            files = results.get("files", [])
+            if files:
+                return files[0]["id"]
+    except Exception as exc:
+        logger.warning("Drive search for existing spreadsheet failed: %s", exc)
+
+    return None
+
+
 def _try_create_spreadsheet_in_drive(title: str) -> Optional[str]:
     """
     Attempt to create a Google Sheets file via Drive API.
@@ -971,8 +1038,22 @@ def _get_or_create_spreadsheet(client):
         except Exception as exc:
             logger.error("Cannot open GOOGLE_SHEETS_SPREADSHEET_ID: %s", exc)
 
-    # 3. Auto-create (prefers OAuth user creds, falls back to service account)
+    # 3. Search Drive for an existing spreadsheet with the expected title
+    #    (guards against duplicates from previous half-failed creations)
     title = f"Muhasebe — {_month_label()}"
+    sheet_id = _find_existing_spreadsheet_in_drive(title)
+
+    if sheet_id:
+        logger.info("Found existing spreadsheet '%s' in Drive (id=%s); reusing it.", title, sheet_id)
+        registry[month_key] = sheet_id
+        _save_registry(registry)
+        try:
+            return client.open_by_key(sheet_id)
+        except Exception as exc:
+            logger.warning("Found spreadsheet %s but cannot open it: %s", sheet_id, exc)
+            # Fall through to auto-create
+
+    # 4. Auto-create (prefers OAuth user creds, falls back to service account)
     logger.info("No spreadsheet configured; attempting auto-create: '%s'", title)
     sheet_id = _try_create_spreadsheet_in_drive(title)
 
@@ -1197,7 +1278,9 @@ def append_record(
             ws = _ensure_tab_exists(sh, tab_name)
             seq = _next_seq(ws)
             row = _build_row(record, category, seq, drive_link=drive_link)
-            ws.append_row(row, value_input_option="USER_ENTERED")
+            _retry_on_rate_limit(
+                lambda: ws.append_row(row, value_input_option="USER_ENTERED")
+            )
             logger.info("Appended row #%d to '%s'.", seq, tab_name)
 
             # Also log to ↩️ İadeler if this is a return document
@@ -1205,7 +1288,9 @@ def append_record(
                 iade_ws = _ensure_tab_exists(sh, "↩️ İadeler")
                 iade_seq = _next_seq(iade_ws)
                 iade_row = _build_row(record, DocumentCategory.IADE, iade_seq, drive_link=drive_link)
-                iade_ws.append_row(iade_row, value_input_option="USER_ENTERED")
+                _retry_on_rate_limit(
+                    lambda: iade_ws.append_row(iade_row, value_input_option="USER_ENTERED")
+                )
                 logger.info("Also logged iade row #%d.", iade_seq)
 
         except Exception as exc:

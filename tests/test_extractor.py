@@ -6,8 +6,8 @@ from unittest.mock import ANY, patch
 
 import pytest
 
-from app.models.schemas import AIExtractionResult, BillRecord
-from app.services.accounting.gemini_extractor import _normalize_record, _parse_tr_number, extract_bill
+from app.models.schemas import AIExtractionResult, AIMultiExtractionResult, BillRecord
+from app.services.accounting.gemini_extractor import _normalize_record, _parse_tr_number, extract_bill, extract_bills
 
 
 class TestParseTrNumber:
@@ -120,7 +120,7 @@ class TestExtractBill:
             "app.services.accounting.gemini_extractor.settings.gemini_extractor_model",
             "gemini-test-extractor",
         )
-        expected = AIExtractionResult(
+        single_doc = AIExtractionResult(
             company_name="ABC Market",
             tax_number="9876543210",
             tax_office="Be\u015fikta\u015f",
@@ -138,6 +138,7 @@ class TestExtractBill:
             description="Market al\u0131\u015fveri\u015fi",
             confidence=0.91,
         )
+        expected = AIMultiExtractionResult(documents=[single_doc])
 
         with patch(
             "app.services.accounting.gemini_extractor.gemini_client.generate_structured_content",
@@ -160,11 +161,58 @@ class TestExtractBill:
         mock_generate.assert_called_once_with(
             model="gemini-test-extractor",
             prompt=ANY,
-            response_schema=AIExtractionResult,
+            response_schema=AIMultiExtractionResult,
             thinking_level="low",
             media_bytes=b"fake_image",
             mime_type="application/pdf",
         )
+
+    def test_multi_document_extraction(self, monkeypatch):
+        monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
+        monkeypatch.setattr(
+            "app.services.accounting.gemini_extractor.settings.gemini_extractor_model",
+            "gemini-test-extractor",
+        )
+        doc1 = AIExtractionResult(
+            company_name="Firma A",
+            total_amount=100.0,
+            currency="TRY",
+            confidence=0.9,
+        )
+        doc2 = AIExtractionResult(
+            company_name="Firma B",
+            total_amount=200.0,
+            currency="TRY",
+            confidence=0.88,
+        )
+        doc3 = AIExtractionResult(
+            company_name="Firma C",
+            total_amount=300.0,
+            currency="TRY",
+            confidence=0.85,
+        )
+        expected = AIMultiExtractionResult(documents=[doc1, doc2, doc3])
+
+        with patch(
+            "app.services.accounting.gemini_extractor.gemini_client.generate_structured_content",
+            return_value=expected,
+        ):
+            records = extract_bills(
+                b"fake_image_3_cheques",
+                mime_type="image/jpeg",
+                source_message_id="msg_456",
+                source_filename="cheques.jpg",
+                source_type="image",
+            )
+
+        assert len(records) == 3
+        assert records[0].company_name == "Firma A"
+        assert records[1].company_name == "Firma B"
+        assert records[2].company_name == "Firma C"
+        # Sub-indices for dedup
+        assert records[0].source_message_id == "msg_456__doc1"
+        assert records[1].source_message_id == "msg_456__doc2"
+        assert records[2].source_message_id == "msg_456__doc3"
 
     def test_generation_error_propagates(self, monkeypatch):
         monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")

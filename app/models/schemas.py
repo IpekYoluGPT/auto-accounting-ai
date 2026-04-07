@@ -295,6 +295,18 @@ class AIExtractionResult(BaseModel):
     model_config = {"extra": "ignore"}
 
 
+class AIMultiExtractionResult(BaseModel):
+    """Wrapper for Gemini multi-document extraction.
+
+    A single image may contain multiple financial documents (e.g. 3 cheques
+    side by side).  Gemini returns one entry per document it detects.
+    """
+
+    documents: list[AIExtractionResult]
+
+    model_config = {"extra": "ignore"}
+
+
 # ─── Classification Result ────────────────────────────────────────────────────
 
 
