@@ -574,15 +574,31 @@ def _create_and_setup_spreadsheet(client, title: str) -> str:
     """Create a new spreadsheet with all tabs and return its ID."""
     logger.info("Creating new spreadsheet: '%s'", title)
 
-    create_kwargs: dict = {}
-    if settings.google_drive_parent_folder_id:
-        # Place the spreadsheet in the monthly subfolder (e.g. "Belgeler — Nisan 2026")
-        # so each month's files are grouped together.
-        folder_id = _get_or_create_month_drive_folder() or settings.google_drive_parent_folder_id
-        create_kwargs["folder_id"] = folder_id
-
-    sh = client.create(title, **create_kwargs)
+    # Create without folder_id — gspread's folder_id param is unreliable across
+    # Drive permission models. We move it afterwards using the Drive API.
+    sh = client.create(title)
     sheet_id = sh.id
+
+    # Move to monthly subfolder via Drive API
+    if settings.google_drive_parent_folder_id:
+        folder_id = _get_or_create_month_drive_folder() or settings.google_drive_parent_folder_id
+        drive = _get_drive_service()
+        if drive:
+            try:
+                file_info = drive.files().get(
+                    fileId=sheet_id, fields="parents", supportsAllDrives=True
+                ).execute()
+                current_parents = ",".join(file_info.get("parents", []))
+                drive.files().update(
+                    fileId=sheet_id,
+                    addParents=folder_id,
+                    removeParents=current_parents,
+                    fields="id,parents",
+                    supportsAllDrives=True,
+                ).execute()
+                logger.info("Moved spreadsheet '%s' to Drive folder %s", title, folder_id)
+            except Exception as exc:
+                logger.warning("Could not move spreadsheet to folder: %s", exc)
 
     # Rename default Sheet1 → 📊 Özet
     default_ws = sh.sheet1
