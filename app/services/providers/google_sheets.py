@@ -673,97 +673,104 @@ def _create_and_setup_spreadsheet(client, title: str) -> str:
 # ─── Tab resolution ───────────────────────────────────────────────────────────
 
 
-def _ensure_tab_exists(sh, tab_name: str):
+def _monthly_tab_name(base_name: str) -> str:
+    """Return month-prefixed tab name, e.g. 'Nisan 2026 — 🧾 Faturalar'."""
+    return f"{_month_label()} — {base_name}"
+
+
+def _ensure_tab_exists(sh, tab_name: str, base_name: str | None = None):
     """
     Return the worksheet for tab_name, creating it if missing.
 
+    base_name: the canonical tab name from _TABS used for formatting/headers
+               (e.g. '🧾 Faturalar' when tab_name is 'Nisan 2026 — 🧾 Faturalar').
+               If None, tab_name itself is used as the lookup key.
+
     Also handles backwards-compat: if a plain-name version exists (no emoji),
-    it is automatically renamed to the emoji version.
+    it is automatically renamed to the emoji version (only for non-monthly tabs).
     """
     import gspread
 
-    # 1. Try exact name (emoji version)
+    # 1. Try exact name
     try:
         return sh.worksheet(tab_name)
     except gspread.WorksheetNotFound:
         pass
 
-    # 2. Try plain (no-emoji) version and rename if found
-    plain = tab_name.split(" ", 1)[-1] if " " in tab_name else tab_name
-    if plain != tab_name:
-        try:
-            ws = sh.worksheet(plain)
-            ws.update_title(tab_name)
-            logger.info("Renamed tab '%s' → '%s'", plain, tab_name)
-            return ws
-        except gspread.WorksheetNotFound:
-            pass
+    # 2. Try plain (no-emoji) version and rename — only for non-monthly tabs
+    if base_name is None:
+        plain = tab_name.split(" ", 1)[-1] if " " in tab_name else tab_name
+        if plain != tab_name:
+            try:
+                ws = sh.worksheet(plain)
+                ws.update_title(tab_name)
+                logger.info("Renamed tab '%s' → '%s'", plain, tab_name)
+                return ws
+            except gspread.WorksheetNotFound:
+                pass
 
     # 3. Create new tab
     logger.info("Tab '%s' not found; creating it.", tab_name)
-    headers, _ = _TABS.get(tab_name, ([], {}))
+    lookup = base_name or tab_name
+    headers, _ = _TABS.get(lookup, ([], {}))
     ws = sh.add_worksheet(
         title=tab_name,
         rows=1000,
         cols=max(len(headers) + 2, 10),
     )
 
-    if tab_name == "📊 Özet":
+    if lookup == "📊 Özet":
         _setup_summary_tab(ws, _month_label())
-    else:
-        _setup_worksheet(ws, tab_name)
+    elif lookup in _TABS:
+        _setup_worksheet(ws, lookup)
 
     return ws
 
 
-# ─── Monthly spreadsheet resolution ──────────────────────────────────────────
+# ─── Spreadsheet resolution ───────────────────────────────────────────────────
 
 
 def _get_or_create_spreadsheet(client):
     """
-    Return the gspread Spreadsheet for the current month.
+    Return the gspread Spreadsheet to use.
+
+    Service accounts cannot create new Google Drive/Sheets files (no storage quota).
+    Instead we always use the spreadsheet set via GOOGLE_SHEETS_SPREADSHEET_ID.
+    Monthly separation is achieved through per-month tab names within that spreadsheet.
 
     Priority:
-      1. sheets_registry.json entry for this month (already tracked).
-      2. GOOGLE_SHEETS_SPREADSHEET_ID env var (seed for this month, saves to registry).
-      3. Auto-create in GOOGLE_DRIVE_PARENT_FOLDER_ID.
+      1. sheets_registry.json entry (already resolved this session).
+      2. GOOGLE_SHEETS_SPREADSHEET_ID env var.
     """
-    key = _month_key()
     registry = _load_registry()
+    key = "permanent"  # single key — same spreadsheet used for all months
 
-    # 1. Registry hit
     if key in registry:
         try:
             sh = client.open_by_key(registry[key])
-            logger.debug("Using registered spreadsheet for %s: %s", key, registry[key])
+            logger.debug("Using registered spreadsheet id=%s", registry[key])
             return sh
         except Exception as exc:
-            logger.warning(
-                "Registered spreadsheet for %s inaccessible (%s); will recreate.", key, exc
-            )
+            logger.warning("Registered spreadsheet inaccessible (%s); re-seeding.", exc)
             registry.pop(key, None)
 
-    # 2. Fixed ID from env — seed this month
     if settings.google_sheets_spreadsheet_id:
         try:
             sh = client.open_by_key(settings.google_sheets_spreadsheet_id)
             registry[key] = settings.google_sheets_spreadsheet_id
             _save_registry(registry)
-            logger.info("Seeded registry for %s with env spreadsheet ID.", key)
+            logger.info("Using spreadsheet from env var (id=%s).", settings.google_sheets_spreadsheet_id)
             return sh
         except Exception as exc:
-            logger.error(
-                "Cannot open GOOGLE_SHEETS_SPREADSHEET_ID=%s: %s",
-                settings.google_sheets_spreadsheet_id,
-                exc,
-            )
+            logger.error("Cannot open GOOGLE_SHEETS_SPREADSHEET_ID=%s: %s",
+                         settings.google_sheets_spreadsheet_id, exc)
 
-    # 3. Auto-create
-    title = f"Muhasebe — {_month_label()}"
-    sheet_id = _create_and_setup_spreadsheet(client, title)
-    registry[key] = sheet_id
-    _save_registry(registry)
-    return client.open_by_key(sheet_id)
+    raise RuntimeError(
+        "GOOGLE_SHEETS_SPREADSHEET_ID is not set or inaccessible. "
+        "Create a Google Spreadsheet, share it with the service account "
+        f"({settings.google_service_account_json and 'service account'}) as Editor, "
+        "then set GOOGLE_SHEETS_SPREADSHEET_ID in Railway environment variables."
+    )
 
 
 # ─── Row builders ─────────────────────────────────────────────────────────────
@@ -931,17 +938,20 @@ def append_record(
         try:
             sh = _get_or_create_spreadsheet(client)
 
-            # Primary tab
-            tab_name = _CATEGORY_TAB.get(category, "🧾 Faturalar")
-            ws = _ensure_tab_exists(sh, tab_name)
+            # Monthly tab: e.g. "Nisan 2026 — 🧾 Faturalar"
+            base_tab = _CATEGORY_TAB.get(category, "🧾 Faturalar")
+            tab_name = _monthly_tab_name(base_tab)
+            ws = _ensure_tab_exists(sh, tab_name, base_name=base_tab)
             seq = _next_seq(ws)
             row = _build_row(record, category, seq, drive_link=drive_link)
             ws.append_row(row, value_input_option="USER_ENTERED")
             logger.info("Appended row #%d to '%s'.", seq, tab_name)
 
             # Also log to ↩️ İadeler if this is a return document
-            if is_return and tab_name != "↩️ İadeler":
-                iade_ws = _ensure_tab_exists(sh, "↩️ İadeler")
+            if is_return and base_tab != "↩️ İadeler":
+                iade_base = "↩️ İadeler"
+                iade_tab = _monthly_tab_name(iade_base)
+                iade_ws = _ensure_tab_exists(sh, iade_tab, base_name=iade_base)
                 iade_seq = _next_seq(iade_ws)
                 iade_row = _build_row(record, DocumentCategory.IADE, iade_seq, drive_link=drive_link)
                 iade_ws.append_row(iade_row, value_input_option="USER_ENTERED")
