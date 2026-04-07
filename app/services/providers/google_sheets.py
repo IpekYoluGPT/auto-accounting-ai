@@ -730,47 +730,133 @@ def _ensure_tab_exists(sh, tab_name: str, base_name: str | None = None):
 # ─── Spreadsheet resolution ───────────────────────────────────────────────────
 
 
+def _try_create_spreadsheet_in_drive(title: str) -> Optional[str]:
+    """
+    Attempt to create a Google Sheets file via Drive API with explicit parent folder.
+
+    This avoids the service-account root quota issue by placing the file directly
+    inside a user-owned shared folder at creation time (not move-after-create).
+
+    Returns the spreadsheet ID on success, None on failure.
+    """
+    if not settings.google_drive_parent_folder_id:
+        return None
+
+    drive = _get_drive_service()
+    if drive is None:
+        return None
+
+    folder_id = _get_or_create_month_drive_folder() or settings.google_drive_parent_folder_id
+
+    file_metadata = {
+        "name": title,
+        "mimeType": "application/vnd.google-apps.spreadsheet",
+        "parents": [folder_id],
+    }
+    try:
+        file = drive.files().create(
+            body=file_metadata,
+            fields="id",
+            supportsAllDrives=True,
+        ).execute()
+        sheet_id = file["id"]
+        logger.info("Auto-created spreadsheet '%s' in folder %s (id=%s)", title, folder_id, sheet_id)
+        return sheet_id
+    except Exception as exc:
+        # Log the full HTTP error so we know exactly what Google says
+        logger.error(
+            "Drive API spreadsheet creation failed for folder %s: %s",
+            folder_id, exc, exc_info=True,
+        )
+        return None
+
+
 def _get_or_create_spreadsheet(client):
     """
     Return the gspread Spreadsheet to use.
 
-    Service accounts cannot create new Google Drive/Sheets files (no storage quota).
-    Instead we always use the spreadsheet set via GOOGLE_SHEETS_SPREADSHEET_ID.
-    Monthly separation is achieved through per-month tab names within that spreadsheet.
-
     Priority:
-      1. sheets_registry.json entry (already resolved this session).
-      2. GOOGLE_SHEETS_SPREADSHEET_ID env var.
+      1. sheets_registry.json entry (already resolved this run).
+      2. GOOGLE_SHEETS_SPREADSHEET_ID env var (configured spreadsheet).
+      3. Auto-create via Drive API in the monthly subfolder (if GOOGLE_DRIVE_PARENT_FOLDER_ID set).
+         Monthly tab names ('Nisan 2026 — 🧾 Faturalar') provide per-month separation
+         within a single spreadsheet if auto-create keeps failing.
     """
     registry = _load_registry()
-    key = "permanent"  # single key — same spreadsheet used for all months
+    month_key = _month_key()
 
-    if key in registry:
+    # 1. Registry hit for this month
+    if month_key in registry:
         try:
-            sh = client.open_by_key(registry[key])
-            logger.debug("Using registered spreadsheet id=%s", registry[key])
+            sh = client.open_by_key(registry[month_key])
+            logger.debug("Using registered spreadsheet for %s.", month_key)
             return sh
         except Exception as exc:
-            logger.warning("Registered spreadsheet inaccessible (%s); re-seeding.", exc)
-            registry.pop(key, None)
+            logger.warning("Registered spreadsheet inaccessible (%s); will retry.", exc)
+            registry.pop(month_key, None)
 
+    # Also check permanent key (legacy single-spreadsheet mode)
+    if "permanent" in registry:
+        try:
+            sh = client.open_by_key(registry["permanent"])
+            logger.debug("Using permanent spreadsheet.")
+            return sh
+        except Exception:
+            registry.pop("permanent", None)
+
+    # 2. Configured spreadsheet from env
     if settings.google_sheets_spreadsheet_id:
         try:
             sh = client.open_by_key(settings.google_sheets_spreadsheet_id)
-            registry[key] = settings.google_sheets_spreadsheet_id
+            registry[month_key] = settings.google_sheets_spreadsheet_id
             _save_registry(registry)
-            logger.info("Using spreadsheet from env var (id=%s).", settings.google_sheets_spreadsheet_id)
+            logger.info("Using env spreadsheet for %s.", month_key)
             return sh
         except Exception as exc:
-            logger.error("Cannot open GOOGLE_SHEETS_SPREADSHEET_ID=%s: %s",
-                         settings.google_sheets_spreadsheet_id, exc)
+            logger.error("Cannot open GOOGLE_SHEETS_SPREADSHEET_ID: %s", exc)
+
+    # 3. Auto-create via Drive API (places file directly in monthly folder at creation time)
+    title = f"Muhasebe — {_month_label()}"
+    logger.info("No spreadsheet configured; attempting auto-create: '%s'", title)
+    sheet_id = _try_create_spreadsheet_in_drive(title)
+
+    if sheet_id:
+        # Share with owner email so user can see it in their Drive
+        if settings.google_sheets_owner_email:
+            try:
+                tmp = client.open_by_key(sheet_id)
+                tmp.share(settings.google_sheets_owner_email, perm_type="user", role="writer", notify=False)
+                logger.info("Shared new spreadsheet with %s", settings.google_sheets_owner_email)
+            except Exception as exc:
+                logger.warning("Could not share spreadsheet: %s", exc)
+        registry[month_key] = sheet_id
+        _save_registry(registry)
+        sh = client.open_by_key(sheet_id)
+        # Set up tabs in the new spreadsheet
+        _bootstrap_spreadsheet_tabs(sh)
+        return sh
 
     raise RuntimeError(
-        "GOOGLE_SHEETS_SPREADSHEET_ID is not set or inaccessible. "
-        "Create a Google Spreadsheet, share it with the service account "
-        f"({settings.google_service_account_json and 'service account'}) as Editor, "
-        "then set GOOGLE_SHEETS_SPREADSHEET_ID in Railway environment variables."
+        "Cannot create or open a spreadsheet. Either:\n"
+        "  A) Set GOOGLE_SHEETS_SPREADSHEET_ID in Railway env vars, OR\n"
+        "  B) Set GOOGLE_DRIVE_PARENT_FOLDER_ID to a folder shared with the service account.\n"
+        f"Service account: whatsappsheet@whatsapp-account-manager-ai.iam.gserviceaccount.com"
     )
+
+
+def _bootstrap_spreadsheet_tabs(sh) -> None:
+    """Set up standard tabs on a freshly created spreadsheet."""
+    try:
+        ws = sh.sheet1
+        ws.update_title("📊 Özet")
+        _setup_summary_tab(ws, _month_label())
+        for tab_name in list(_TABS.keys())[1:]:
+            headers, _ = _TABS[tab_name]
+            new_ws = sh.add_worksheet(title=tab_name, rows=1000, cols=len(headers) + 2)
+            _setup_worksheet(new_ws, tab_name)
+        logger.info("Bootstrapped tabs on new spreadsheet.")
+    except Exception as exc:
+        logger.warning("Could not bootstrap tabs: %s", exc)
 
 
 # ─── Row builders ─────────────────────────────────────────────────────────────
