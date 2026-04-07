@@ -166,6 +166,7 @@ _AMOUNT_COLUMNS = {
 _lock = threading.Lock()
 _gspread_client = None  # lazy-initialised
 _drive_service = None   # lazy-initialised
+_sheets_service = None  # lazy-initialised (Sheets API v4, for spreadsheet creation)
 _creds = None           # stored for Drive service reuse
 _drive_folder_cache: dict[str, str] = {}  # month_label → folder_id
 
@@ -214,6 +215,28 @@ def _get_drive_service():
         return _drive_service
     except Exception as exc:
         logger.error("Failed to initialise Drive service: %s", exc, exc_info=True)
+        return None
+
+
+def _get_sheets_service():
+    """Return a Google Sheets API v4 service.
+
+    Used to CREATE spreadsheets — the Sheets API creates native Workspace files
+    which do not require Drive storage quota (unlike the Drive Files API).
+    """
+    global _sheets_service
+    if _sheets_service is not None:
+        return _sheets_service
+    _get_client()  # ensure _creds is populated
+    if _creds is None:
+        return None
+    try:
+        from googleapiclient.discovery import build
+        _sheets_service = build("sheets", "v4", credentials=_creds, cache_discovery=False)
+        logger.debug("Google Sheets API service initialised.")
+        return _sheets_service
+    except Exception as exc:
+        logger.error("Failed to initialise Sheets API service: %s", exc, exc_info=True)
         return None
 
 
@@ -571,13 +594,28 @@ def _setup_summary_tab(ws, month_label: str) -> None:
 
 
 def _create_and_setup_spreadsheet(client, title: str) -> str:
-    """Create a new spreadsheet with all tabs and return its ID."""
+    """Create a new spreadsheet with all tabs and return its ID.
+
+    Uses the Google Sheets API v4 to create the spreadsheet — NOT the Drive
+    Files API used by gspread's client.create().  Service accounts have no
+    personal Drive storage quota, so the Drive Files API returns 403.
+    The Sheets API creates native Google Workspace files which are quota-free.
+    """
     logger.info("Creating new spreadsheet: '%s'", title)
 
-    # Create without folder_id — gspread's folder_id param is unreliable across
-    # Drive permission models. We move it afterwards using the Drive API.
-    sh = client.create(title)
-    sheet_id = sh.id
+    sheets_svc = _get_sheets_service()
+    if sheets_svc is None:
+        raise RuntimeError("Google Sheets API service unavailable — cannot create spreadsheet.")
+
+    result = sheets_svc.spreadsheets().create(
+        body={"properties": {"title": title}},
+        fields="spreadsheetId",
+    ).execute()
+    sheet_id = result["spreadsheetId"]
+    logger.info("Spreadsheet '%s' created via Sheets API (id=%s)", title, sheet_id)
+
+    # Open via gspread for all subsequent tab operations
+    sh = client.open_by_key(sheet_id)
 
     # Move to monthly subfolder via Drive API
     if settings.google_drive_parent_folder_id:
