@@ -165,10 +165,16 @@ _AMOUNT_COLUMNS = {
 
 _lock = threading.Lock()
 _gspread_client = None  # lazy-initialised
-_drive_service = None   # lazy-initialised
-_sheets_service = None  # lazy-initialised (Sheets API v4, for spreadsheet creation)
-_creds = None           # stored for Drive service reuse
+_drive_service = None   # lazy-initialised (service account)
+_sheets_service = None  # lazy-initialised (Sheets API v4, service account)
+_creds = None           # service account credentials
 _drive_folder_cache: dict[str, str] = {}  # month_label → folder_id
+
+# OAuth2 user credentials — used ONLY for creating new files (spreadsheets).
+# Service accounts cannot create Workspace files (403 quota/permission error).
+_oauth_creds = None
+_oauth_drive_service = None
+_oauth_sheets_service = None
 
 
 # ─── Client initialisation ────────────────────────────────────────────────────
@@ -240,10 +246,119 @@ def _get_sheets_service():
         return None
 
 
+def _get_oauth_creds():
+    """Build OAuth2 user credentials from the stored refresh token.
+
+    These credentials are used ONLY for creating new files (spreadsheets, folders)
+    because service accounts cannot create Google Workspace files.
+    """
+    global _oauth_creds
+    if _oauth_creds is not None:
+        return _oauth_creds
+
+    if (
+        not settings.google_oauth_client_id
+        or not settings.google_oauth_client_secret
+        or not settings.google_oauth_refresh_token
+    ):
+        return None
+
+    try:
+        from google.oauth2.credentials import Credentials
+
+        _oauth_creds = Credentials(
+            token=None,
+            refresh_token=settings.google_oauth_refresh_token,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=settings.google_oauth_client_id,
+            client_secret=settings.google_oauth_client_secret,
+            scopes=_SCOPES,
+        )
+        logger.info("OAuth2 user credentials initialised for file creation.")
+        return _oauth_creds
+    except Exception as exc:
+        logger.error("Failed to build OAuth2 credentials: %s", exc, exc_info=True)
+        return None
+
+
+def _get_oauth_drive_service():
+    """Return a Google Drive API v3 service using OAuth2 user credentials."""
+    global _oauth_drive_service
+    if _oauth_drive_service is not None:
+        return _oauth_drive_service
+    creds = _get_oauth_creds()
+    if creds is None:
+        return None
+    try:
+        from googleapiclient.discovery import build
+        _oauth_drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        logger.debug("OAuth Drive service initialised.")
+        return _oauth_drive_service
+    except Exception as exc:
+        logger.error("Failed to initialise OAuth Drive service: %s", exc, exc_info=True)
+        return None
+
+
+def _get_oauth_sheets_service():
+    """Return a Google Sheets API v4 service using OAuth2 user credentials."""
+    global _oauth_sheets_service
+    if _oauth_sheets_service is not None:
+        return _oauth_sheets_service
+    creds = _get_oauth_creds()
+    if creds is None:
+        return None
+    try:
+        from googleapiclient.discovery import build
+        _oauth_sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+        logger.debug("OAuth Sheets API service initialised.")
+        return _oauth_sheets_service
+    except Exception as exc:
+        logger.error("Failed to initialise OAuth Sheets service: %s", exc, exc_info=True)
+        return None
+
+
+def _get_service_account_email() -> Optional[str]:
+    """Extract the service account email from the stored JSON credentials."""
+    if not settings.google_service_account_json:
+        return None
+    try:
+        raw_json = base64.b64decode(settings.google_service_account_json).decode("utf-8")
+        creds_dict = json.loads(raw_json)
+        return creds_dict.get("client_email")
+    except Exception:
+        return None
+
+
+def _share_with_service_account(file_id: str, drive_service) -> None:
+    """Share a file (created via OAuth) with the service account so gspread can access it."""
+    sa_email = _get_service_account_email()
+    if not sa_email:
+        logger.warning("Cannot share file with service account — no SA email found.")
+        return
+    try:
+        drive_service.permissions().create(
+            fileId=file_id,
+            body={
+                "type": "user",
+                "role": "writer",
+                "emailAddress": sa_email,
+            },
+            fields="id",
+            sendNotificationEmail=False,
+            supportsAllDrives=True,
+        ).execute()
+        logger.info("Shared file %s with service account %s", file_id, sa_email)
+    except Exception as exc:
+        logger.warning("Could not share file %s with service account: %s", file_id, exc)
+
+
 def _get_or_create_month_drive_folder() -> Optional[str]:
     """
     Return (creating if needed) a monthly subfolder inside GOOGLE_DRIVE_PARENT_FOLDER_ID.
     E.g. "Belgeler — Nisan 2026" inside the user's Muhasebe folder.
+
+    Prefers OAuth drive service (user credentials) for folder creation,
+    falls back to service account drive service.
     """
     if not settings.google_drive_parent_folder_id:
         return settings.google_drive_parent_folder_id or None
@@ -252,8 +367,14 @@ def _get_or_create_month_drive_folder() -> Optional[str]:
     if label in _drive_folder_cache:
         return _drive_folder_cache[label]
 
-    drive = _get_drive_service()
-    if drive is None:
+    # Prefer OAuth, fall back to service account
+    oauth_drive = _get_oauth_drive_service()
+    sa_drive = _get_drive_service()
+    # Use OAuth for searching too (it can see user's files); fall back to SA
+    search_drive = oauth_drive or sa_drive
+    create_drive = oauth_drive or sa_drive
+
+    if search_drive is None:
         return None
 
     folder_name = f"Belgeler — {label}"
@@ -267,7 +388,7 @@ def _get_or_create_month_drive_folder() -> Optional[str]:
             "mimeType='application/vnd.google-apps.folder' and "
             "trashed=false"
         )
-        results = drive.files().list(
+        results = search_drive.files().list(
             q=q, fields="files(id)", pageSize=1,
             supportsAllDrives=True, includeItemsFromAllDrives=True,
         ).execute()
@@ -277,16 +398,24 @@ def _get_or_create_month_drive_folder() -> Optional[str]:
             _drive_folder_cache[label] = folder_id
             return folder_id
 
+        if create_drive is None:
+            return parent
+
         # Create subfolder
         meta = {
             "name": folder_name,
             "mimeType": "application/vnd.google-apps.folder",
             "parents": [parent],
         }
-        folder = drive.files().create(body=meta, fields="id", supportsAllDrives=True).execute()
+        folder = create_drive.files().create(body=meta, fields="id", supportsAllDrives=True).execute()
         folder_id = folder["id"]
         _drive_folder_cache[label] = folder_id
         logger.info("Created Drive subfolder '%s' (id=%s)", folder_name, folder_id)
+
+        # If created via OAuth, share with service account so SA can also access it
+        if create_drive is oauth_drive and oauth_drive is not None:
+            _share_with_service_account(folder_id, oauth_drive)
+
         return folder_id
 
     except Exception as exc:
@@ -596,38 +725,53 @@ def _setup_summary_tab(ws, month_label: str) -> None:
 def _create_and_setup_spreadsheet(client, title: str) -> str:
     """Create a new spreadsheet with all tabs and return its ID.
 
-    Uses the Google Sheets API v4 to create the spreadsheet — NOT the Drive
-    Files API used by gspread's client.create().  Service accounts have no
-    personal Drive storage quota, so the Drive Files API returns 403.
-    The Sheets API creates native Google Workspace files which are quota-free.
+    Prefers OAuth user credentials for the create call — service accounts
+    cannot create Google Workspace files (403 quota / permission error).
+    Falls back to service account Sheets API as a last resort.
     """
     logger.info("Creating new spreadsheet: '%s'", title)
 
-    sheets_svc = _get_sheets_service()
+    # Prefer OAuth, fall back to service account
+    oauth_sheets = _get_oauth_sheets_service()
+    sa_sheets = _get_sheets_service()
+    sheets_svc = oauth_sheets or sa_sheets
+
     if sheets_svc is None:
-        raise RuntimeError("Google Sheets API service unavailable — cannot create spreadsheet.")
+        raise RuntimeError("No Sheets API service available — cannot create spreadsheet.")
+
+    using_oauth = sheets_svc is oauth_sheets
 
     result = sheets_svc.spreadsheets().create(
         body={"properties": {"title": title}},
         fields="spreadsheetId",
     ).execute()
     sheet_id = result["spreadsheetId"]
-    logger.info("Spreadsheet '%s' created via Sheets API (id=%s)", title, sheet_id)
+    logger.info(
+        "Spreadsheet '%s' created via %s (id=%s)",
+        title, "OAuth" if using_oauth else "service account", sheet_id,
+    )
 
-    # Open via gspread for all subsequent tab operations
+    # If created via OAuth, share with service account so gspread can open it
+    if using_oauth:
+        oauth_drive = _get_oauth_drive_service()
+        if oauth_drive:
+            _share_with_service_account(sheet_id, oauth_drive)
+
+    # Open via gspread (service account) for all subsequent tab operations
     sh = client.open_by_key(sheet_id)
 
     # Move to monthly subfolder via Drive API
     if settings.google_drive_parent_folder_id:
         folder_id = _get_or_create_month_drive_folder() or settings.google_drive_parent_folder_id
-        drive = _get_drive_service()
-        if drive:
+        # Use OAuth drive for move if available (owner can move their own files)
+        move_drive = _get_oauth_drive_service() or _get_drive_service()
+        if move_drive:
             try:
-                file_info = drive.files().get(
+                file_info = move_drive.files().get(
                     fileId=sheet_id, fields="parents", supportsAllDrives=True
                 ).execute()
                 current_parents = ",".join(file_info.get("parents", []))
-                drive.files().update(
+                move_drive.files().update(
                     fileId=sheet_id,
                     addParents=folder_id,
                     removeParents=current_parents,
@@ -732,17 +876,21 @@ def _ensure_tab_exists(sh, tab_name: str, base_name: str | None = None):
 
 def _try_create_spreadsheet_in_drive(title: str) -> Optional[str]:
     """
-    Attempt to create a Google Sheets file via Drive API with explicit parent folder.
+    Attempt to create a Google Sheets file via Drive API.
 
-    This avoids the service-account root quota issue by placing the file directly
-    inside a user-owned shared folder at creation time (not move-after-create).
+    Prefers OAuth user credentials (service accounts cannot create Workspace files).
+    Falls back to service account credentials as a last resort.
 
     Returns the spreadsheet ID on success, None on failure.
     """
     if not settings.google_drive_parent_folder_id:
         return None
 
-    drive = _get_drive_service()
+    # Prefer OAuth credentials — service accounts get 403 on file creation
+    oauth_drive = _get_oauth_drive_service()
+    sa_drive = _get_drive_service()
+    drive = oauth_drive or sa_drive
+
     if drive is None:
         return None
 
@@ -760,10 +908,18 @@ def _try_create_spreadsheet_in_drive(title: str) -> Optional[str]:
             supportsAllDrives=True,
         ).execute()
         sheet_id = file["id"]
-        logger.info("Auto-created spreadsheet '%s' in folder %s (id=%s)", title, folder_id, sheet_id)
+        logger.info(
+            "Auto-created spreadsheet '%s' in folder %s (id=%s) via %s",
+            title, folder_id, sheet_id,
+            "OAuth" if drive is oauth_drive else "service account",
+        )
+
+        # If created via OAuth, share with service account so gspread can access it
+        if drive is oauth_drive and oauth_drive is not None:
+            _share_with_service_account(sheet_id, oauth_drive)
+
         return sheet_id
     except Exception as exc:
-        # Log the full HTTP error so we know exactly what Google says
         logger.error(
             "Drive API spreadsheet creation failed for folder %s: %s",
             folder_id, exc, exc_info=True,
@@ -776,11 +932,9 @@ def _get_or_create_spreadsheet(client):
     Return the gspread Spreadsheet to use.
 
     Priority:
-      1. sheets_registry.json entry (already resolved this run).
+      1. sheets_registry.json entry for this month.
       2. GOOGLE_SHEETS_SPREADSHEET_ID env var (configured spreadsheet).
-      3. Auto-create via Drive API in the monthly subfolder (if GOOGLE_DRIVE_PARENT_FOLDER_ID set).
-         Monthly tab names ('Nisan 2026 — 🧾 Faturalar') provide per-month separation
-         within a single spreadsheet if auto-create keeps failing.
+      3. Auto-create via OAuth/Drive API in the monthly subfolder.
     """
     registry = _load_registry()
     month_key = _month_key()
@@ -815,13 +969,14 @@ def _get_or_create_spreadsheet(client):
         except Exception as exc:
             logger.error("Cannot open GOOGLE_SHEETS_SPREADSHEET_ID: %s", exc)
 
-    # 3. Auto-create via Drive API (places file directly in monthly folder at creation time)
+    # 3. Auto-create (prefers OAuth user creds, falls back to service account)
     title = f"Muhasebe — {_month_label()}"
     logger.info("No spreadsheet configured; attempting auto-create: '%s'", title)
     sheet_id = _try_create_spreadsheet_in_drive(title)
 
     if sheet_id:
         # Share with owner email so user can see it in their Drive
+        # (Only needed when created via service account; OAuth creates as user)
         if settings.google_sheets_owner_email:
             try:
                 tmp = client.open_by_key(sheet_id)
@@ -832,15 +987,15 @@ def _get_or_create_spreadsheet(client):
         registry[month_key] = sheet_id
         _save_registry(registry)
         sh = client.open_by_key(sheet_id)
-        # Set up tabs in the new spreadsheet
         _bootstrap_spreadsheet_tabs(sh)
         return sh
 
     raise RuntimeError(
-        "Cannot create or open a spreadsheet. Either:\n"
+        "Cannot create or open a spreadsheet. Options:\n"
         "  A) Set GOOGLE_SHEETS_SPREADSHEET_ID in Railway env vars, OR\n"
-        "  B) Set GOOGLE_DRIVE_PARENT_FOLDER_ID to a folder shared with the service account.\n"
-        f"Service account: whatsappsheet@whatsapp-account-manager-ai.iam.gserviceaccount.com"
+        "  B) Run /setup/google-auth to enable OAuth auto-creation, OR\n"
+        "  C) Set GOOGLE_DRIVE_PARENT_FOLDER_ID with a shared folder.\n"
+        f"Service account: {_get_service_account_email() or 'not configured'}"
     )
 
 

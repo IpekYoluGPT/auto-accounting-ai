@@ -46,6 +46,15 @@ class Settings(BaseSettings):
     # Google account email to share every auto-created spreadsheet with (editor access).
     google_sheets_owner_email: str = "yilmazatakan4423@gmail.com"
 
+    # Google OAuth2 (for spreadsheet creation on behalf of user)
+    # Service accounts cannot create Sheets files (403 quota/permission error).
+    # OAuth2 lets the system create files as the real user.
+    # Set client_id + client_secret from Google Cloud Console > Credentials > OAuth 2.0.
+    # Set refresh_token after running the one-time /setup/google-auth flow.
+    google_oauth_client_id: str = ""
+    google_oauth_client_secret: str = ""
+    google_oauth_refresh_token: str = ""
+
     # Manager phone number (WhatsApp format, e.g. 905XXXXXXXXX@c.us or just 905XXXXXXXXX)
     # Text messages from this number are treated as elden ödeme (cash payment) entries.
     manager_phone_number: str = ""
