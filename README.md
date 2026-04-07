@@ -1,6 +1,6 @@
 # auto-accounting-ai
 
-> Code-first AI backend that receives WhatsApp bill/invoice/receipt images, ignores junk messages, extracts accounting data with Gemini, and exports spreadsheet-ready output 24/7.
+> WhatsApp'tan gelen fatura, fis, cek ve dekont fotograflarini Gemini AI ile isleyip Google Sheets'e otomatik kaydeden muhasebe backend sistemi.
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-green.svg)](https://fastapi.tiangolo.com/)
@@ -8,99 +8,83 @@
 
 ---
 
-## Problem Statement
+## Ne Yapar?
 
-Small businesses and freelancers in Turkey share **fatura** (invoice), **fiş** (cash receipt), and **makbuz** (payment receipt) photos in a WhatsApp group. They also send unrelated messages, memes, and greetings in the same group. A human assistant currently spends hours every week manually sorting these messages and entering data into a spreadsheet.
+1. WhatsApp grubundan gelen her mesaji Periskope webhook ile alir
+2. Gemini AI ile finansal belge mi degil mi siniflandirir
+3. Belge kategorisini belirler (fatura, dekont, fis, cek, malzeme, iade)
+4. Yapilandirilmis muhasebe alanlarini cikarir (firma, tutar, KDV, tarih...)
+5. **Aylik Google Sheets** tablosuna otomatik yazar
+6. WhatsApp'a onay mesaji gonderir
 
-**auto-accounting-ai** automates the entire pipeline:
+### Coklu Belge Destegi
 
-1. Receives every WhatsApp message via webhook.
-2. Classifies whether the message contains a real financial document.
-3. Downloads and analyses qualifying media with the Gemini AI API.
-4. Extracts structured accounting fields.
-5. Exports spreadsheet-ready CSV/XLSX with Turkish column names plus source sender/group metadata.
-
-The backend now supports two ingress modes:
-- official Meta WhatsApp Cloud API webhooks at `POST /webhook`
-- Periskope webhooks for WhatsApp Web-connected groups/chats at `POST /integrations/periskope/webhook`
-
-When a webhook message includes group context, the bot treats that as the reply target and keeps the participant identity as export metadata.
+Tek bir fotografta birden fazla belge varsa (ornegin 3 cek yan yana), sistem her birini ayri ayri algilar ve kaydeder.
 
 ---
 
-## Architecture
+## Mimari
 
 ```
-WhatsApp Group
-      │  (fatura / fiş / makbuz photo)
-      ▼
-Meta Cloud API / Periskope  ──────►  POST /webhook or POST /integrations/periskope/webhook
-                              │
-                    ┌─────────▼──────────┐
-                    │ Shared Intake Flow │  ← keyword heuristics + Gemini flash
-                    └─────────┬──────────┘
-                              │
-                    ┌─────────▼──────────┐
-                    │  Record Store      │  ← claim check + CSV + dedup state
-                    └────────────────────┘
+WhatsApp Grubu
+      |  (fatura / fis / cek fotografi)
+      v
+Periskope Webhook  ────>  POST /integrations/periskope/webhook
+                              |
+                    +---------+-----------+
+                    v                     v
+              bill_classifier       doc_classifier
+              (finansal mi?)        (hangi kategori?)
+                    |                     |
+                    v                     v
+              gemini_extractor (coklu belge destekli)
+                    |
+                    +---> record_store (CSV + tekrar korumasi)
+                    +---> google_sheets (aylik spreadsheet)
+                    +---> WhatsApp onay mesaji
 ```
-
-See [docs/architecture.md](docs/architecture.md) for the full module breakdown.
 
 ---
 
-## Repository Structure
+## Proje Yapisi
 
 ```
 auto-accounting-ai/
 ├── app/
-│   ├── main.py                   # FastAPI app entry point
-│   ├── config.py                 # Settings (pydantic-settings)
+│   ├── main.py                        # FastAPI uygulama giris noktasi
+│   ├── config.py                      # Ortam degiskenleri (Pydantic Settings)
+│   ├── models/schemas.py              # Veri modelleri
 │   ├── routes/
-│   │   ├── groups.py             # Official WhatsApp group onboarding/management
-│   │   ├── periskope.py          # Periskope webhook + tool endpoints
-│   │   └── webhooks.py           # GET/POST /webhook
+│   │   ├── periskope.py               # Periskope webhook + arac endpointleri
+│   │   ├── webhooks.py                # Meta Cloud API webhook
+│   │   ├── groups.py                  # Resmi WhatsApp grup yonetimi
+│   │   └── setup.py                   # Google OAuth2 kurulum akisi
 │   ├── services/
+│   │   ├── gemini_client.py           # Gemini API istemcisi
 │   │   ├── accounting/
-│   │   │   ├── intake.py         # Shared inbound accounting pipeline
-│   │   │   ├── bill_classifier.py# Keyword + Gemini classification
-│   │   │   ├── gemini_extractor.py # AI extraction + normalisation
-│   │   │   ├── record_store.py   # CSV persistence + message claims/dedup
-│   │   │   └── exporter.py       # CSV / XLSX export helpers
-│   │   ├── providers/
-│   │   │   ├── periskope.py      # Periskope API client
-│   │   │   └── whatsapp.py       # WhatsApp Cloud API client
-│   │   └── gemini_client.py      # Shared Gemini structured-output helper
-│   ├── models/
-│   │   └── schemas.py            # Pydantic models
+│   │   │   ├── intake.py              # Merkezi mesaj isleme hatti
+│   │   │   ├── bill_classifier.py     # Belge siniflandirma
+│   │   │   ├── doc_classifier.py      # Kategori belirleme
+│   │   │   ├── gemini_extractor.py    # Coklu belge cikarimi
+│   │   │   ├── record_store.py        # CSV kayit + tekrar korumasi
+│   │   │   └── exporter.py            # CSV/XLSX formatlama
+│   │   └── providers/
+│   │       ├── google_sheets.py       # Aylik tablo yonetimi + OAuth + retry
+│   │       ├── periskope.py           # Periskope API istemcisi
+│   │       └── whatsapp.py            # Meta Cloud API istemcisi
 │   └── utils/
-│       ├── logging.py            # Structured logging
-│       └── file_storage.py       # Temp file helpers
+├── tests/                             # 88 test
 ├── docs/
-│   ├── architecture.md
-│   ├── setup.md
-│   └── data-schema.md
-├── examples/
-│   ├── sample_bill_result.json
-│   └── sample_accounting_rows.csv
-├── tests/
-│   ├── test_classifier.py
-│   ├── test_config.py
-│   ├── test_extractor.py
-│   ├── test_groups.py
-│   ├── test_record_store.py
-│   └── test_webhooks.py
 ├── .env.example
-├── pytest.ini
 ├── requirements.txt
-└── README.md
+└── railway.toml
 ```
 
 ---
 
-## Quick Start
+## Hizli Baslangic
 
-### 1. Clone and install
+### 1. Klonla ve kur
 
 ```bash
 git clone https://github.com/IpekYoluGPT/auto-accounting-ai.git
@@ -109,14 +93,14 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Configure
+### 2. Yapilandir
 
 ```bash
 cp .env.example .env
-# Fill in your credentials
+# Kimlik bilgilerini doldurun
 ```
 
-### 3. Run
+### 3. Calistir
 
 ```bash
 uvicorn app.main:app --reload --port 8000
@@ -124,179 +108,137 @@ uvicorn app.main:app --reload --port 8000
 
 ---
 
-## Environment Variables
+## Ortam Degiskenleri
 
-| Variable | Description | Default |
-|---|---|---|
-| `PORT` | HTTP server port | `8000` |
-| `WHATSAPP_VERIFY_TOKEN` | Webhook verification token | *(required)* |
-| `WHATSAPP_ACCESS_TOKEN` | Meta permanent access token | *(required)* |
-| `WHATSAPP_PHONE_NUMBER_ID` | Meta phone number ID | *(required)* |
-| `WHATSAPP_GROUPS_ONLY` | Process only official group messages; direct 1:1 intake stays disabled | `true` |
-| `PERISKOPE_API_KEY` | Periskope API key used for outbound replies and notes | *(optional)* |
-| `PERISKOPE_PHONE` | Periskope `x-phone` header value (phone number or phone_id) | *(optional)* |
-| `PERISKOPE_API_BASE_URL` | Periskope REST base URL | `https://api.periskope.app/v1` |
-| `PERISKOPE_MEDIA_BASE_URL` | Base URL used to resolve relative media paths from Periskope webhooks | `https://api.periskope.app` |
-| `PERISKOPE_SIGNING_KEY` | HMAC signing key for `x-periskope-signature` | *(optional but recommended)* |
-| `PERISKOPE_TOOL_TOKEN` | Shared secret for custom tool endpoints | *(optional but recommended)* |
-| `GEMINI_API_KEY` | Google Gemini API key | *(required)* |
-| `GEMINI_CLASSIFIER_MODEL` | Gemini model used for media classification | `gemini-flash-lite-latest` |
-| `GEMINI_EXTRACTOR_MODEL` | Gemini model used for field extraction | `gemini-flash-lite-latest` |
-| `STORAGE_DIR` | Directory for temp files, exports, and processed-message state | `./storage` |
-| `LOG_LEVEL` | `DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` |
+### Zorunlu
 
----
+| Degisken | Aciklama |
+|----------|----------|
+| `GEMINI_API_KEY` | Gemini AI API anahtari |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Base64 kodlanmis servis hesabi JSON |
+| `PERISKOPE_API_KEY` | Periskope API anahtari (giden mesajlar icin) |
+| `PERISKOPE_PHONE` | Periskope telefon numarasi / phone_id |
 
-## Group Onboarding API
+### Google Sheets (Aylik Otomatik Olusturma)
 
-The backend now exposes official group-management endpoints for onboarding tenants:
+| Degisken | Aciklama |
+|----------|----------|
+| `GOOGLE_OAUTH_CLIENT_ID` | OAuth2 istemci ID |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | OAuth2 istemci sifresi |
+| `GOOGLE_OAUTH_REFRESH_TOKEN` | OAuth2 yenileme tokeni (`/setup/google-auth` ile alinir) |
+| `GOOGLE_DRIVE_PARENT_FOLDER_ID` | Aylik alt klasorlerin olusturulacagi ust klasor |
+| `GOOGLE_SHEETS_OWNER_EMAIL` | Tablolarin paylasilacagi e-posta |
 
-- `POST /groups/onboard` creates a new official WhatsApp group and tries to fetch its invite link immediately.
-- `GET /groups` lists active groups for the configured business number.
-- `GET /groups/{group_id}` fetches group metadata.
-- `GET /groups/{group_id}/invite-link` returns the current invite link.
-- `POST /groups/{group_id}/invite-link/reset` resets the invite link.
-- `GET /groups/{group_id}/join-requests` lists open join requests.
-- `POST /groups/{group_id}/join-requests/approve` approves join requests.
+### Periskope
 
-By default, direct 1:1 user chats are not processed. If someone messages the bot outside the official group, they are told to use the accounting group instead.
+| Degisken | Aciklama | Varsayilan |
+|----------|----------|------------|
+| `PERISKOPE_API_BASE_URL` | Periskope API temel URL | `https://api.periskope.app/v1` |
+| `PERISKOPE_MEDIA_BASE_URL` | Medya indirme temel URL | `https://api.periskope.app` |
+| `PERISKOPE_SIGNING_KEY` | HMAC imza anahtari (onerilen) | *(bos)* |
+| `PERISKOPE_TOOL_TOKEN` | Arac endpoint guvenlik tokeni | *(bos)* |
+| `PERISKOPE_ALLOWED_CHAT_IDS` | Izin verilen sohbet ID'leri (virgul ile ayrilmis) | *(bos = tumunu reddet)* |
 
----
+### Diger
 
-## Periskope Integration
-
-If you connect a normal WhatsApp/WhatsApp Business app number to Periskope, configure:
-
-- webhook endpoint: `POST /integrations/periskope/webhook`
-- custom tool endpoints:
-  - `POST /integrations/periskope/tools/create_accounting_record`
-  - `POST /integrations/periskope/tools/get_submission_status`
-  - `POST /integrations/periskope/tools/assign_to_human`
-
-`/integrations/periskope/webhook` processes inbound `message.created` events, ignores self-sent messages to avoid loops, verifies `x-periskope-signature` when configured, downloads media from Periskope storage, and sends confirmations back through Periskope’s `/message/send` queue.
+| Degisken | Aciklama | Varsayilan |
+|----------|----------|------------|
+| `GEMINI_CLASSIFIER_MODEL` | Siniflandirma modeli | `gemini-2.5-flash` |
+| `GEMINI_EXTRACTOR_MODEL` | Cikarim modeli | `gemini-2.5-flash` |
+| `MANAGER_PHONE_NUMBER` | Elden odeme icin yonetici telefon numarasi | *(bos)* |
+| `WHATSAPP_GROUPS_ONLY` | Sadece grup mesajlarini isle | `true` |
+| `STORAGE_DIR` | Dosya depolama dizini | `./storage` |
+| `LOG_LEVEL` | Log seviyesi | `INFO` |
 
 ---
 
-## WhatsApp Webhook Flow
+## Google Sheets Kurulumu
 
+### Adim 1: OAuth2 Kurulumu (Tek Seferlik)
+
+1. Google Cloud Console'da OAuth2 istemcisi olusturun (Web application)
+2. Redirect URI ekleyin: `https://<railway-url>/setup/google-auth/callback`
+3. Railway'de `GOOGLE_OAUTH_CLIENT_ID` ve `GOOGLE_OAUTH_CLIENT_SECRET` ayarlayin
+4. `https://<railway-url>/setup/google-auth` adresini ziyaret edin
+5. Google izin ekranini onaylayin
+6. Gosterilen refresh token'i `GOOGLE_OAUTH_REFRESH_TOKEN` olarak Railway'e ekleyin
+
+### Adim 2: Servis Hesabi Paylasimi
+
+Google Drive'daki muhasebe klasorunu servis hesabi e-postasi ile paylasin:
+`whatsappsheet@whatsapp-account-manager-ai.iam.gserviceaccount.com`
+
+### Otomatik Aylik Akis
+
+Her ayin ilk belgesi geldiginde:
+1. "Belgeler -- Nisan 2026" alt klasoru olusturulur
+2. "Muhasebe -- Nisan 2026" spreadsheet'i olusturulur
+3. Tum sekmeler bootstrap edilir (Faturalar, Dekontlar, Harcama Fisleri, Cekler, Elden Odemeler, Malzeme, Iadeler, Ozet)
+4. Sonraki belgeler ayni spreadsheet'e eklenir
+
+---
+
+## Belge Kategorileri ve Sekmeler
+
+| Kategori | Sekme | Aciklama |
+|----------|-------|----------|
+| fatura | Faturalar | Resmi KDV'li faturalar |
+| odeme_dekontu | Dekontlar | Banka transferleri, EFT, FAST |
+| harcama_fisi | Harcama Fisleri | POS fisleri, akaryakit, market |
+| cek | Cekler | Banka cekleri |
+| elden_odeme | Elden Odemeler | Nakit odemeler (yonetici mesaji) |
+| malzeme | Malzeme | Irsaliye, malzeme teslim belgeleri |
+| iade | Iadeler | Iade ve iptal belgeleri |
+
+---
+
+## API Endpointleri
+
+### Saglik / Disari Aktarma
+
+- `GET /health` - Canlilik kontrolu
+- `GET /export.csv` - Gunun CSV disari aktarmasi
+- `GET /export.xlsx` - Gunun XLSX disari aktarmasi
+
+### Periskope (Birincil Yol)
+
+- `POST /integrations/periskope/webhook` - Gelen mesajlar
+- `POST /integrations/periskope/tools/create_accounting_record` - Dogrudan kayit olusturma
+- `POST /integrations/periskope/tools/get_submission_status` - Kayit durumu sorgulama
+- `POST /integrations/periskope/tools/assign_to_human` - Insana yonlendirme
+
+### OAuth Kurulumu
+
+- `GET /setup/google-auth` - OAuth2 akisi baslat
+- `GET /setup/google-auth/callback` - OAuth2 geri donus
+
+### Meta Cloud API (Ikincil)
+
+- `GET /webhook` - Meta dogrulama
+- `POST /webhook` - Gelen WhatsApp mesajlari
+
+---
+
+## Testler
+
+```bash
+python -m pytest tests/ -q           # Tam paket (88 test)
+python -m pytest tests/ -x -q        # Ilk hatada dur
 ```
-Meta Platform
-    │
-    │  POST /webhook  { "object": "whatsapp_business_account", ... }
-    ▼
-FastAPI route  →  parse payload  →  background task per message
-                                          │
-                              ┌───────────┴───────────┐
-                              │ text message?          │ image/doc?
-                              │                        │
-                         keyword classify        claim message id
-                              │                        │
-                         is_bill=True?           download media
-                              │                        │
-                         prompt user             Gemini classify
-                         to send photo               │
-                                               Gemini extract
-                                                    │
-                                            append to CSV once
-                                                    │
-                                       mark handled + reply ✅
-```
-
-### Sample Turkish User Messages
-
-| Event | Message |
-|---|---|
-| Bill accepted | ✅ Belgeniz alındı ve muhasebe kaydına eklendi. Firma: ABC Market · Toplam: 100.0 TRY |
-| Non-bill ignored | *(no reply — silent discard)* |
-| Text that looks like a bill | 📄 Fatura/fiş metin olarak algılandı. Lütfen belge fotoğrafını gönderin. |
-| Direct 1:1 chat while disabled | 🔒 Bu bot şimdilik yalnızca resmi WhatsApp muhasebe grubunda çalışıyor. Lütfen belgeyi grup içinden gönderin. |
-| Extraction failure | ⚠️ Belgeniz işlenirken bir hata oluştu. Lütfen daha sonra tekrar deneyin. |
-
----
-
-## Gemini Extraction Flow
-
-1. The message ID is claimed before expensive AI work so duplicate deliveries do not fan out across workers.
-2. Image bytes + MIME type are sent to `gemini-flash-lite-latest` via the `google-genai` SDK with structured JSON output.
-3. Response is parsed and normalised:
-   - Turkish date formats (`DD.MM.YYYY`) → ISO 8601 (`YYYY-MM-DD`)
-   - Turkish numbers (`1.234,56`) → float (`1234.56`)
-   - Currency defaults to `TRY`
-4. A `BillRecord` Pydantic model validates all fields.
-5. The record is appended to `storage/exports/records_YYYY-MM-DD.csv`, and the message is marked complete so later duplicates are skipped.
-
----
-
-## Example Input / Output
-
-### Input (WhatsApp image of a market receipt)
-
-*A JPEG photo of a supermarket cash receipt showing ABC Market, 100.00 TL total.*
-
-### Output (`sample_bill_result.json`)
-
-```json
-{
-  "company_name": "ABC Market",
-  "tax_number": "9876543210",
-  "document_date": "2024-03-10",
-  "currency": "TRY",
-  "subtotal": 84.75,
-  "vat_rate": 18.0,
-  "vat_amount": 15.25,
-  "total_amount": 100.00,
-  "payment_method": "Nakit",
-  "expense_category": "Yemek",
-  "confidence": 0.91
-}
-```
-
-### Export row (`sample_accounting_rows.csv`)
-
-| Firma Adı | Tarih | Para Birimi | Genel Toplam | Gider Kategorisi | Güven Skoru |
-|---|---|---|---|---|---|
-| ABC Market | 2024-03-10 | TRY | 100.0 | Yemek | 0.91 |
 
 ---
 
 ## Railway Deployment
 
-See [docs/setup.md](docs/setup.md) for step-by-step Railway deployment instructions.
-
-**Start command:**
+**Baslangic komutu:**
 ```
 uvicorn app.main:app --host 0.0.0.0 --port $PORT
 ```
 
----
-
-## Running Tests
-
-```bash
-python -m pytest -q
-```
+GitHub `main` dalina push yapildiginda otomatik deploy olur.
 
 ---
 
-## Expense Categories
-
-Gemini suggests one of the following Turkish categories for each document:
-
-`Yemek` · `Ulaşım` · `Konaklama` · `Ofis` · `Yazılım` · `Donanım` · `Abonelik` · `Kargo` · `Vergi` · `Diğer`
-
----
-
-## Roadmap
-
-- [ ] Google Sheets integration (append rows via Sheets API)
-- [ ] PostgreSQL / Supabase persistence
-- [ ] `/export` HTTP endpoint returning XLSX on demand
-- [ ] Multi-group / multi-tenant support
-- [ ] Dashboard (read-only, separate service)
-- [ ] ERP / e-invoice (e-fatura) integration
-
----
-
-## License
+## Lisans
 
 [MIT](LICENSE)
