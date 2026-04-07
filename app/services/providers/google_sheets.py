@@ -782,12 +782,11 @@ def _create_and_setup_spreadsheet(client, title: str) -> str:
             except Exception as exc:
                 logger.warning("Could not move spreadsheet to folder: %s", exc)
 
-    # Rename default Sheet1 → 📊 Özet
+    # Rename default Sheet1 → 📊 Özet (formulas written AFTER data tabs exist)
     default_ws = sh.sheet1
     default_ws.update_title("📊 Özet")
-    _setup_summary_tab(default_ws, _month_label())
 
-    # Create remaining tabs in display order
+    # Create data tabs FIRST so Özet formulas can reference them
     for tab_name in list(_TABS.keys())[1:]:
         headers, _ = _TABS[tab_name]
         ws = sh.add_worksheet(
@@ -796,6 +795,9 @@ def _create_and_setup_spreadsheet(client, title: str) -> str:
             cols=len(headers) + 2,
         )
         _setup_worksheet(ws, tab_name)
+
+    # NOW write Özet formulas (all referenced tabs exist)
+    _setup_summary_tab(default_ws, _month_label())
 
     # Share with owner
     if settings.google_sheets_owner_email:
@@ -1000,15 +1002,25 @@ def _get_or_create_spreadsheet(client):
 
 
 def _bootstrap_spreadsheet_tabs(sh) -> None:
-    """Set up standard tabs on a freshly created spreadsheet."""
+    """Set up standard tabs on a freshly created spreadsheet.
+
+    IMPORTANT: Data tabs are created FIRST, then Özet formulas are written.
+    If Özet formulas are written before the referenced tabs exist, they show #ERROR!.
+    """
     try:
-        ws = sh.sheet1
-        ws.update_title("📊 Özet")
-        _setup_summary_tab(ws, _month_label())
+        # 1. Rename default Sheet1 → 📊 Özet (but don't write formulas yet)
+        ozet_ws = sh.sheet1
+        ozet_ws.update_title("📊 Özet")
+
+        # 2. Create ALL data tabs first (so formula references will work)
         for tab_name in list(_TABS.keys())[1:]:
             headers, _ = _TABS[tab_name]
             new_ws = sh.add_worksheet(title=tab_name, rows=1000, cols=len(headers) + 2)
             _setup_worksheet(new_ws, tab_name)
+
+        # 3. NOW write Özet formulas (all referenced tabs exist)
+        _setup_summary_tab(ozet_ws, _month_label())
+
         logger.info("Bootstrapped tabs on new spreadsheet.")
     except Exception as exc:
         logger.warning("Could not bootstrap tabs: %s", exc)
@@ -1179,20 +1191,18 @@ def append_record(
         try:
             sh = _get_or_create_spreadsheet(client)
 
-            # Monthly tab: e.g. "Nisan 2026 — 🧾 Faturalar"
-            base_tab = _CATEGORY_TAB.get(category, "🧾 Faturalar")
-            tab_name = _monthly_tab_name(base_tab)
-            ws = _ensure_tab_exists(sh, tab_name, base_name=base_tab)
+            # Each spreadsheet is already monthly ("Muhasebe — Nisan 2026"),
+            # so tabs use base names directly (e.g. "🧾 Faturalar").
+            tab_name = _CATEGORY_TAB.get(category, "🧾 Faturalar")
+            ws = _ensure_tab_exists(sh, tab_name)
             seq = _next_seq(ws)
             row = _build_row(record, category, seq, drive_link=drive_link)
             ws.append_row(row, value_input_option="USER_ENTERED")
             logger.info("Appended row #%d to '%s'.", seq, tab_name)
 
             # Also log to ↩️ İadeler if this is a return document
-            if is_return and base_tab != "↩️ İadeler":
-                iade_base = "↩️ İadeler"
-                iade_tab = _monthly_tab_name(iade_base)
-                iade_ws = _ensure_tab_exists(sh, iade_tab, base_name=iade_base)
+            if is_return and tab_name != "↩️ İadeler":
+                iade_ws = _ensure_tab_exists(sh, "↩️ İadeler")
                 iade_seq = _next_seq(iade_ws)
                 iade_row = _build_row(record, DocumentCategory.IADE, iade_seq, drive_link=drive_link)
                 iade_ws.append_row(iade_row, value_input_option="USER_ENTERED")
