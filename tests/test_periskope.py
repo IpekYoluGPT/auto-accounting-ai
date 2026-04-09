@@ -17,7 +17,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.models.schemas import BillRecord, ClassificationResult
+from app.models.schemas import BillRecord, ClassificationResult, DocumentCategory
 from app.services.providers import periskope as periskope_service
 
 
@@ -123,7 +123,7 @@ def _patch_runtime_settings(
         yield
 
 
-def test_periskope_group_image_webhook_exports_and_replies():
+def test_periskope_group_image_webhook_exports_and_reacts():
     payload = _periskope_event(_periskope_image_message())
     signature = _sign_payload(payload, "periskope-secret")
     record = BillRecord(
@@ -148,11 +148,19 @@ def test_periskope_group_image_webhook_exports_and_replies():
             "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.96),
         ), patch(
+            "app.services.accounting.intake.doc_classifier.classify_document_type",
+            return_value=(DocumentCategory.FATURA, False),
+        ), patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             return_value=[record],
         ), patch(
+            "app.services.accounting.intake.google_sheets.upload_document",
+            return_value="https://drive.google.com/file/d/test/view",
+        ), patch(
             "app.routes.periskope.periskope.send_text_message",
-        ) as send_mock:
+        ) as send_mock, patch(
+            "app.routes.periskope.periskope.react_to_message",
+        ) as react_mock:
             response = client.post(
                 "/integrations/periskope/webhook",
                 json=payload,
@@ -166,9 +174,10 @@ def test_periskope_group_image_webhook_exports_and_replies():
         assert rows[0]["Kaynak Mesaj ID"] == "peri-msg-1"
         assert rows[0]["Kaynak Gönderen ID"] == "905456952965@c.us"
         assert rows[0]["Kaynak Grup ID"] == "120363410789660631@g.us"
-        assert send_mock.call_count == 2
-        assert send_mock.call_args_list[0].args[0] == "120363410789660631@g.us"
-        assert send_mock.call_args_list[0].kwargs["reply_to"] == "peri-msg-1"
+        send_mock.assert_not_called()
+        assert react_mock.call_count == 2
+        assert react_mock.call_args_list[0].args == ("peri-msg-1", "⌛")
+        assert react_mock.call_args_list[1].args == ("peri-msg-1", "✅")
 
 
 def test_periskope_webhook_rejects_invalid_signature():
@@ -275,11 +284,19 @@ def test_periskope_webhook_accepts_event_type_with_current_attributes():
             "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.96),
         ), patch(
+            "app.services.accounting.intake.doc_classifier.classify_document_type",
+            return_value=(DocumentCategory.FATURA, False),
+        ), patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             return_value=[record],
         ), patch(
+            "app.services.accounting.intake.google_sheets.upload_document",
+            return_value="https://drive.google.com/file/d/test/view",
+        ), patch(
             "app.routes.periskope.periskope.send_text_message",
-        ) as send_mock:
+        ) as send_mock, patch(
+            "app.routes.periskope.periskope.react_to_message",
+        ) as react_mock:
             response = client.post(
                 "/integrations/periskope/webhook",
                 json=payload,
@@ -291,7 +308,9 @@ def test_periskope_webhook_accepts_event_type_with_current_attributes():
         rows = _read_export_rows(tmpdir)
         assert len(rows) == 1
         assert rows[0]["Kaynak Mesaj ID"] == "peri-msg-2"
-        assert send_mock.call_count == 2
+        send_mock.assert_not_called()
+        assert react_mock.call_count == 2
+        assert [call.args[1] for call in react_mock.call_args_list] == ["⌛", "✅"]
 
 
 def test_periskope_webhook_accepts_null_has_media():
@@ -321,11 +340,19 @@ def test_periskope_webhook_accepts_null_has_media():
             "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ), patch(
+            "app.services.accounting.intake.doc_classifier.classify_document_type",
+            return_value=(DocumentCategory.FATURA, False),
+        ), patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             return_value=[record],
         ), patch(
+            "app.services.accounting.intake.google_sheets.upload_document",
+            return_value="https://drive.google.com/file/d/test/view",
+        ), patch(
             "app.routes.periskope.periskope.send_text_message",
-        ) as send_mock:
+        ) as send_mock, patch(
+            "app.routes.periskope.periskope.react_to_message",
+        ) as react_mock:
             response = client.post(
                 "/integrations/periskope/webhook",
                 json=payload,
@@ -337,7 +364,9 @@ def test_periskope_webhook_accepts_null_has_media():
         rows = _read_export_rows(tmpdir)
         assert len(rows) == 1
         assert rows[0]["Kaynak Mesaj ID"] == "peri-msg-3"
-        assert send_mock.call_count == 2
+        send_mock.assert_not_called()
+        assert react_mock.call_count == 2
+        assert [call.args[1] for call in react_mock.call_args_list] == ["⌛", "✅"]
 
 
 def test_fetch_media_falls_back_to_canonical_message_path_after_401():

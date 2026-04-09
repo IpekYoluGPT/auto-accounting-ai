@@ -178,6 +178,7 @@ def _process_periskope_message(message: PeriskopeMessage) -> None:
             msg_type=message.message_type,
             route=route,
             send_text=_send_periskope_text_message,
+            send_reaction=_send_periskope_reaction,
             fetch_media=(
                 lambda: periskope.fetch_media(media.path, message_id=message.message_id)
             )
@@ -214,6 +215,12 @@ def _resolve_periskope_route(message: PeriskopeMessage) -> MessageRoute:
 
 def _send_periskope_text_message(route: MessageRoute, text: str) -> None:
     periskope.send_text_message(route.chat_id, text, reply_to=route.reply_to_message_id)
+
+
+def _send_periskope_reaction(route: MessageRoute, emoji: str) -> None:
+    if not route.reply_to_message_id:
+        return
+    periskope.react_to_message(route.reply_to_message_id, emoji)
 
 
 def _is_allowed_periskope_chat(chat_id: str) -> bool:

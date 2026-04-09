@@ -12,6 +12,7 @@ def test_gemini_model_defaults():
     assert settings.whatsapp_groups_only is True
     assert settings.periskope_api_base_url == "https://api.periskope.app/v1"
     assert settings.periskope_media_base_url == "https://api.periskope.app"
+    assert settings.business_timezone == "Europe/Istanbul"
 
 
 def test_environment_overrides_are_applied(monkeypatch):
@@ -21,6 +22,7 @@ def test_environment_overrides_are_applied(monkeypatch):
     monkeypatch.setenv("WHATSAPP_GROUPS_ONLY", "false")
     monkeypatch.setenv("PERISKOPE_API_KEY", "periskope-key")
     monkeypatch.setenv("PERISKOPE_TOOL_TOKEN", "tool-key")
+    monkeypatch.setenv("BUSINESS_TIMEZONE", "UTC")
 
     settings = Settings(_env_file=None)
 
@@ -30,3 +32,4 @@ def test_environment_overrides_are_applied(monkeypatch):
     assert settings.whatsapp_groups_only is False
     assert settings.periskope_api_key == "periskope-key"
     assert settings.periskope_tool_token == "tool-key"
+    assert settings.business_timezone == "UTC"

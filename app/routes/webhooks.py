@@ -78,6 +78,7 @@ def _process_message(message) -> None:
             msg_type="image",
             route=route,
             send_text=_send_meta_text_message,
+            send_reaction=_send_meta_reaction,
             fetch_media=lambda: whatsapp.fetch_media(message.image.id),
             mime_type=message.image.mime_type or "image/jpeg",
             filename=f"{message.image.id}.jpg",
@@ -91,6 +92,7 @@ def _process_message(message) -> None:
             msg_type="document",
             route=route,
             send_text=_send_meta_text_message,
+            send_reaction=_send_meta_reaction,
             fetch_media=lambda: whatsapp.fetch_media(message.document.id),
             mime_type=message.document.mime_type or "application/pdf",
             filename=message.document.filename or f"{message.document.id}.pdf",
@@ -117,6 +119,7 @@ def _resolve_message_route(message) -> MessageRoute:
             chat_type="group",
             recipient_type="group",
             group_id=group_id,
+            reply_to_message_id=message.id,
         )
 
     return MessageRoute(
@@ -125,11 +128,24 @@ def _resolve_message_route(message) -> MessageRoute:
         chat_id=message.from_,
         chat_type="individual",
         recipient_type="individual",
+        reply_to_message_id=message.id,
     )
 
 def _send_meta_text_message(route: MessageRoute, text: str) -> None:
     whatsapp.send_text_message(
         route.chat_id,
         text,
+        recipient_type=route.recipient_type,
+        reply_to_message_id=route.reply_to_message_id,
+    )
+
+
+def _send_meta_reaction(route: MessageRoute, emoji: str) -> None:
+    if not route.reply_to_message_id:
+        return
+    whatsapp.send_reaction_message(
+        route.chat_id,
+        route.reply_to_message_id,
+        emoji,
         recipient_type=route.recipient_type,
     )

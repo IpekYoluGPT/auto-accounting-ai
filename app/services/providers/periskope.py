@@ -149,6 +149,19 @@ def send_text_message(chat_id: str, text: str, *, reply_to: str | None = None) -
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10), reraise=True)
+def react_to_message(message_id: str, reaction: str) -> dict[str, Any]:
+    """React to a Periskope message."""
+    with httpx.Client(timeout=20) as client:
+        resp = client.post(
+            f"{_api_base_url()}/message/{message_id}/react",
+            json={"reaction": reaction},
+            headers=_auth_headers(),
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10), reraise=True)
 def send_private_note(chat_id: str, message: str, *, reply_to: str | None = None) -> dict[str, Any]:
     """Create a private note in a Periskope chat for human follow-up."""
     payload: dict[str, Any] = {

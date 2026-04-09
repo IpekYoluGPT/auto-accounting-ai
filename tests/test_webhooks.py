@@ -13,7 +13,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.models.schemas import BillRecord, ClassificationResult
+from app.models.schemas import BillRecord, ClassificationResult, DocumentCategory
 
 
 def _image_payload(
@@ -173,7 +173,7 @@ def test_verify_webhook_invalid_token_returns_403():
     assert response.status_code == 403
 
 
-def test_happy_path_image_webhook_writes_csv_and_replies():
+def test_happy_path_image_webhook_writes_csv_and_reacts():
     record = BillRecord(
         company_name="ABC Market",
         total_amount=100.0,
@@ -192,11 +192,19 @@ def test_happy_path_image_webhook_writes_csv_and_replies():
             "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ), patch(
+            "app.services.accounting.intake.doc_classifier.classify_document_type",
+            return_value=(DocumentCategory.FATURA, False),
+        ), patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             return_value=[record],
         ), patch(
+            "app.services.accounting.intake.google_sheets.upload_document",
+            return_value="https://drive.google.com/file/d/test/view",
+        ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
-        ) as send_mock:
+        ) as send_mock, patch(
+            "app.routes.webhooks.whatsapp.send_reaction_message"
+        ) as reaction_mock:
             response = client.post("/webhook", json=_image_payload())
 
         assert response.status_code == 200
@@ -204,14 +212,14 @@ def test_happy_path_image_webhook_writes_csv_and_replies():
         rows = _read_export_rows(tmpdir)
         assert len(rows) == 1
         assert rows[0]["Genel Toplam"] == "100.0"
-        assert send_mock.call_count == 2
-        assert send_mock.call_args_list[0].args[0] == "905551112233"
-        assert send_mock.call_args_list[0].kwargs["recipient_type"] == "individual"
-        assert "s\u00fcrebilir" in send_mock.call_args_list[0].args[1].lower()
-        assert "muhasebe kayd\u0131na eklendi" in send_mock.call_args_list[1].args[1].lower()
+        send_mock.assert_not_called()
+        assert reaction_mock.call_count == 2
+        assert reaction_mock.call_args_list[0].args == ("905551112233", "wamid-1", "⌛")
+        assert reaction_mock.call_args_list[1].args == ("905551112233", "wamid-1", "✅")
+        assert reaction_mock.call_args_list[0].kwargs["recipient_type"] == "individual"
 
 
-def test_group_image_webhook_replies_to_group_and_exports_group_metadata():
+def test_group_image_webhook_reacts_to_group_and_exports_group_metadata():
     record = BillRecord(
         company_name="ABC Market",
         total_amount=100.0,
@@ -233,11 +241,19 @@ def test_group_image_webhook_replies_to_group_and_exports_group_metadata():
             "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ), patch(
+            "app.services.accounting.intake.doc_classifier.classify_document_type",
+            return_value=(DocumentCategory.FATURA, False),
+        ), patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             return_value=[record],
         ) as extract_mock, patch(
+            "app.services.accounting.intake.google_sheets.upload_document",
+            return_value="https://drive.google.com/file/d/test/view",
+        ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
-        ) as send_mock:
+        ) as send_mock, patch(
+            "app.routes.webhooks.whatsapp.send_reaction_message"
+        ) as reaction_mock:
             response = client.post("/webhook", json=_image_payload("wamid-group-1", group_id="group-123"))
 
         assert response.status_code == 200
@@ -257,9 +273,11 @@ def test_group_image_webhook_replies_to_group_and_exports_group_metadata():
             source_group_id="group-123",
             source_chat_type="group",
         )
-        assert send_mock.call_count == 2
-        assert send_mock.call_args_list[0].args[0] == "group-123"
-        assert send_mock.call_args_list[0].kwargs["recipient_type"] == "group"
+        send_mock.assert_not_called()
+        assert reaction_mock.call_count == 2
+        assert reaction_mock.call_args_list[0].args == ("group-123", "wamid-group-1", "⌛")
+        assert reaction_mock.call_args_list[1].args == ("group-123", "wamid-group-1", "✅")
+        assert reaction_mock.call_args_list[0].kwargs["recipient_type"] == "group"
 
 
 def test_bill_like_text_prompts_for_photo():
@@ -374,12 +392,20 @@ def test_duplicate_delivery_writes_only_one_export_row():
         ) as fetch_mock, patch(
             "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
+        ), patch(
+            "app.services.accounting.intake.doc_classifier.classify_document_type",
+            return_value=(DocumentCategory.FATURA, False),
         ) as classify_mock, patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             return_value=[record],
         ) as extract_mock, patch(
             "app.routes.webhooks.whatsapp.send_text_message"
-        ) as send_mock:
+        ) as send_mock, patch(
+            "app.services.accounting.intake.google_sheets.upload_document",
+            return_value="https://drive.google.com/file/d/test/view",
+        ), patch(
+            "app.routes.webhooks.whatsapp.send_reaction_message"
+        ) as reaction_mock:
             response_one = client.post("/webhook", json=_image_payload())
             response_two = client.post("/webhook", json=_image_payload())
 
@@ -387,7 +413,8 @@ def test_duplicate_delivery_writes_only_one_export_row():
         assert response_two.status_code == 200
         rows = _read_export_rows(tmpdir)
         assert len(rows) == 1
-        assert send_mock.call_count == 2
+        send_mock.assert_not_called()
+        assert reaction_mock.call_count == 2
         fetch_mock.assert_called_once()
         classify_mock.assert_called_once()
         extract_mock.assert_called_once()
@@ -403,14 +430,18 @@ def test_classification_failure_sends_error_and_writes_no_row():
             side_effect=RuntimeError("classifier down"),
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
-        ) as send_mock:
+        ) as send_mock, patch(
+            "app.routes.webhooks.whatsapp.send_reaction_message"
+        ) as reaction_mock:
             response = client.post("/webhook", json=_image_payload())
 
         assert response.status_code == 200
         assert _read_export_rows(tmpdir) == []
-        assert send_mock.call_count == 2
-        assert "s\u00fcrebilir" in send_mock.call_args_list[0].args[1].lower()
-        assert "hata" in send_mock.call_args_list[1].args[1].lower()
+        send_mock.assert_called_once()
+        assert "doğrulanamadı" in send_mock.call_args.args[1].lower()
+        assert send_mock.call_args.kwargs["reply_to_message_id"] == "wamid-1"
+        assert reaction_mock.call_count == 2
+        assert [call.args[2] for call in reaction_mock.call_args_list] == ["⌛", "⚠️"]
 
 
 def test_extraction_failure_sends_error_and_writes_no_row():
@@ -422,18 +453,24 @@ def test_extraction_failure_sends_error_and_writes_no_row():
             "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ), patch(
+            "app.services.accounting.intake.doc_classifier.classify_document_type",
+            return_value=(DocumentCategory.FATURA, False),
+        ), patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             side_effect=RuntimeError("extractor down"),
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
-        ) as send_mock:
+        ) as send_mock, patch(
+            "app.routes.webhooks.whatsapp.send_reaction_message"
+        ) as reaction_mock:
             response = client.post("/webhook", json=_image_payload())
 
         assert response.status_code == 200
         assert _read_export_rows(tmpdir) == []
-        assert send_mock.call_count == 2
-        assert "s\u00fcrebilir" in send_mock.call_args_list[0].args[1].lower()
-        assert "hata" in send_mock.call_args_list[1].args[1].lower()
+        send_mock.assert_called_once()
+        assert "bilgiler çıkarılamadı" in send_mock.call_args.args[1].lower()
+        assert reaction_mock.call_count == 2
+        assert [call.args[2] for call in reaction_mock.call_args_list] == ["⌛", "⚠️"]
 
 
 def test_non_bill_image_is_skipped_without_export():
@@ -446,14 +483,17 @@ def test_non_bill_image_is_skipped_without_export():
             return_value=ClassificationResult(is_bill=False, reason="meme", confidence=0.97),
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
-        ) as send_mock:
+        ) as send_mock, patch(
+            "app.routes.webhooks.whatsapp.send_reaction_message"
+        ) as reaction_mock:
             response = client.post("/webhook", json=_image_payload())
 
         assert response.status_code == 200
         assert _read_export_rows(tmpdir) == []
-        assert send_mock.call_count == 2
-        assert "s\u00fcrebilir" in send_mock.call_args_list[0].args[1].lower()
-        assert "muhasebe belgesi olarak alg\u0131lanmad\u0131" in send_mock.call_args_list[1].args[1].lower()
+        send_mock.assert_called_once()
+        assert "muhasebe belgesi olarak alg\u0131lanmad\u0131" in send_mock.call_args.args[1].lower()
+        assert reaction_mock.call_count == 2
+        assert [call.args[2] for call in reaction_mock.call_args_list] == ["⌛", "⚠️"]
 
 
 def test_repeated_non_bill_text_warning_is_throttled():
@@ -481,17 +521,19 @@ def test_repeated_non_bill_images_always_get_terminal_reply():
             return_value=ClassificationResult(is_bill=False, reason="meme", confidence=0.97),
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
-        ) as send_mock:
+        ) as send_mock, patch(
+            "app.routes.webhooks.whatsapp.send_reaction_message"
+        ) as reaction_mock:
             response_one = client.post("/webhook", json=_image_payload("wamid-image-1"))
             response_two = client.post("/webhook", json=_image_payload("wamid-image-2"))
 
     assert response_one.status_code == 200
     assert response_two.status_code == 200
-    assert send_mock.call_count == 4
-    assert "s\u00fcrebilir" in send_mock.call_args_list[0].args[1].lower()
+    assert send_mock.call_count == 2
+    assert "muhasebe belgesi olarak alg\u0131lanmad\u0131" in send_mock.call_args_list[0].args[1].lower()
     assert "muhasebe belgesi olarak alg\u0131lanmad\u0131" in send_mock.call_args_list[1].args[1].lower()
-    assert "s\u00fcrebilir" in send_mock.call_args_list[2].args[1].lower()
-    assert "muhasebe belgesi olarak alg\u0131lanmad\u0131" in send_mock.call_args_list[3].args[1].lower()
+    assert reaction_mock.call_count == 4
+    assert [call.args[2] for call in reaction_mock.call_args_list] == ["⌛", "⚠️", "⌛", "⚠️"]
 
 
 def test_document_webhook_defaults_pdf_metadata():
@@ -512,12 +554,20 @@ def test_document_webhook_defaults_pdf_metadata():
         ), patch(
             "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="document", confidence=0.94),
+        ), patch(
+            "app.services.accounting.intake.doc_classifier.classify_document_type",
+            return_value=(DocumentCategory.FATURA, False),
         ) as classify_mock, patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             return_value=[record],
         ) as extract_mock, patch(
+            "app.services.accounting.intake.google_sheets.upload_document",
+            return_value="https://drive.google.com/file/d/test/view",
+        ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
-        ) as send_mock:
+        ) as send_mock, patch(
+            "app.routes.webhooks.whatsapp.send_reaction_message"
+        ) as reaction_mock:
             response = client.post("/webhook", json=_document_payload())
 
         assert response.status_code == 200
@@ -534,9 +584,10 @@ def test_document_webhook_defaults_pdf_metadata():
             source_group_id=None,
             source_chat_type="individual",
         )
-        assert send_mock.call_count == 2
-        assert send_mock.call_args_list[0].kwargs["recipient_type"] == "individual"
-        assert "s\u00fcrebilir" in send_mock.call_args_list[0].args[1].lower()
+        send_mock.assert_not_called()
+        assert reaction_mock.call_count == 2
+        assert reaction_mock.call_args_list[0].kwargs["recipient_type"] == "individual"
+        assert [call.args[2] for call in reaction_mock.call_args_list] == ["⌛", "✅"]
 
 
 def test_send_failure_does_not_abort_export():
@@ -558,18 +609,27 @@ def test_send_failure_does_not_abort_export():
             "app.services.accounting.intake.bill_classifier.classify_image",
             return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
         ), patch(
+            "app.services.accounting.intake.doc_classifier.classify_document_type",
+            return_value=(DocumentCategory.FATURA, False),
+        ), patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             return_value=[record],
         ), patch(
-            "app.routes.webhooks.whatsapp.send_text_message",
+            "app.services.accounting.intake.google_sheets.upload_document",
+            return_value="https://drive.google.com/file/d/test/view",
+        ), patch(
+            "app.routes.webhooks.whatsapp.send_reaction_message",
             side_effect=RuntimeError("send failed"),
+        ) as reaction_mock, patch(
+            "app.routes.webhooks.whatsapp.send_text_message"
         ) as send_mock:
             response = client.post("/webhook", json=_image_payload())
 
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
         assert len(_read_export_rows(tmpdir)) == 1
-        assert send_mock.call_count == 2
+        assert reaction_mock.call_count == 2
+        send_mock.assert_not_called()
 
 
 def test_failed_attempt_releases_claim_and_allows_retry():
@@ -594,9 +654,17 @@ def test_failed_attempt_releases_claim_and_allows_retry():
                 ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
             ],
         ), patch(
+            "app.services.accounting.intake.doc_classifier.classify_document_type",
+            return_value=(DocumentCategory.FATURA, False),
+        ), patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             return_value=[record],
-        ), patch("app.routes.webhooks.whatsapp.send_text_message") as send_mock:
+        ), patch(
+            "app.services.accounting.intake.google_sheets.upload_document",
+            return_value="https://drive.google.com/file/d/test/view",
+        ), patch("app.routes.webhooks.whatsapp.send_text_message") as send_mock, patch(
+            "app.routes.webhooks.whatsapp.send_reaction_message"
+        ) as reaction_mock:
             response_one = client.post("/webhook", json=_image_payload("wamid-retry-1"))
             response_two = client.post("/webhook", json=_image_payload("wamid-retry-1"))
 
@@ -604,4 +672,5 @@ def test_failed_attempt_releases_claim_and_allows_retry():
         assert response_two.status_code == 200
         rows = _read_export_rows(tmpdir)
         assert len(rows) == 1
-        assert send_mock.call_count == 4
+        assert send_mock.call_count == 1
+        assert reaction_mock.call_count == 4

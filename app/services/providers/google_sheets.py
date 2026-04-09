@@ -17,9 +17,10 @@ import base64
 import json
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.config import settings
 from app.models.schemas import BillRecord, DocumentCategory
@@ -59,7 +60,7 @@ _TABS: dict[str, tuple[list[str], dict]] = {
         {"red": 0.76, "green": 0.09, "blue": 0.09},
     ),
     "💵 Elden Ödemeler": (
-        ["#", "Tarih", "Saat", "Alıcı / Açıklama", "TUTAR", "Para Birimi", "Kaydeden"],
+        ["#", "Tarih", "Saat", "Alıcı / Açıklama", "TUTAR", "Para Birimi", "Kaydeden", "📎 Belge"],
         {"red": 0.46, "green": 0.11, "blue": 0.64},
     ),
     "🏗️ Malzeme": (
@@ -97,6 +98,16 @@ _PLAIN_TO_EMOJI: dict[str, str] = {
     "Elden Ödemeler": "💵 Elden Ödemeler",
     "Malzeme": "🏗️ Malzeme",
     "İadeler": "↩️ İadeler",
+}
+
+_TAB_TOTAL_COLUMNS: dict[str, str] = {
+    "🧾 Faturalar": "K",
+    "💳 Dekontlar": "H",
+    "⛽ Harcama Fişleri": "J",
+    "📝 Çekler": "G",
+    "💵 Elden Ödemeler": "E",
+    "🏗️ Malzeme": "J",
+    "↩️ İadeler": "F",
 }
 
 _SCOPES = [
@@ -176,6 +187,53 @@ _drive_folder_cache: dict[str, str] = {}  # month_label → folder_id
 _oauth_creds = None
 _oauth_drive_service = None
 _oauth_sheets_service = None
+_rollover_thread: threading.Thread | None = None
+_rollover_stop_event: threading.Event | None = None
+_rollover_lock = threading.Lock()
+
+
+def _get_business_timezone():
+    timezone_name = settings.business_timezone.strip() or "Europe/Istanbul"
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        logger.warning(
+            "Unknown BUSINESS_TIMEZONE '%s'; falling back to UTC for monthly rollover.",
+            timezone_name,
+        )
+        return timezone.utc
+
+
+def _now() -> datetime:
+    return datetime.now(_get_business_timezone())
+
+
+def _next_month_rollover_at(now: datetime | None = None) -> datetime:
+    current = now or _now()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=_get_business_timezone())
+
+    year = current.year
+    month = current.month + 1
+    if month == 13:
+        month = 1
+        year += 1
+
+    return current.replace(
+        year=year,
+        month=month,
+        day=1,
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+
+def _seconds_until_next_month_rollover(now: datetime | None = None) -> float:
+    current = now or _now()
+    rollover_at = _next_month_rollover_at(current)
+    return max((rollover_at - current).total_seconds(), 1.0)
 
 
 # ─── Client initialisation ────────────────────────────────────────────────────
@@ -377,10 +435,14 @@ def _share_with_service_account(file_id: str, drive_service) -> None:
         logger.warning("Could not share file %s with service account: %s", file_id, exc)
 
 
+def _month_drive_folder_name() -> str:
+    return f"Fişler — {_month_label()}"
+
+
 def _get_or_create_month_drive_folder() -> Optional[str]:
     """
     Return (creating if needed) a monthly subfolder inside GOOGLE_DRIVE_PARENT_FOLDER_ID.
-    E.g. "Belgeler — Nisan 2026" inside the user's Muhasebe folder.
+    E.g. "Fişler — Nisan 2026" inside the user's Muhasebe folder.
 
     Prefers OAuth drive service (user credentials) for folder creation,
     falls back to service account drive service.
@@ -402,7 +464,7 @@ def _get_or_create_month_drive_folder() -> Optional[str]:
     if search_drive is None:
         return None
 
-    folder_name = f"Belgeler — {label}"
+    folder_name = _month_drive_folder_name()
     parent = settings.google_drive_parent_folder_id
 
     try:
@@ -463,7 +525,7 @@ def upload_document(
         logger.debug("GOOGLE_DRIVE_PARENT_FOLDER_ID not set; skipping Drive upload.")
         return None
 
-    drive = _get_drive_service()
+    drive = _get_oauth_drive_service() or _get_drive_service()
     if drive is None:
         return None
 
@@ -486,7 +548,7 @@ def upload_document(
         ).execute()
 
         link = uploaded.get("webViewLink", "")
-        logger.info("Uploaded '%s' to Drive → %s", filename, link)
+        logger.info("Uploaded '%s' to Drive folder '%s' → %s", filename, _month_drive_folder_name(), link)
         return link
 
     except Exception as exc:
@@ -521,7 +583,7 @@ def _save_registry(registry: dict[str, str]) -> None:
 
 
 def _month_key() -> str:
-    return datetime.now().strftime("%Y-%m")
+    return _now().strftime("%Y-%m")
 
 
 def _month_label() -> str:
@@ -530,7 +592,7 @@ def _month_label() -> str:
         5: "Mayıs", 6: "Haziran", 7: "Temmuz", 8: "Ağustos",
         9: "Eylül", 10: "Ekim", 11: "Kasım", 12: "Aralık",
     }
-    now = datetime.now()
+    now = _now()
     return f"{months_tr[now.month]} {now.year}"
 
 
@@ -547,6 +609,33 @@ def _col_letter(idx: int) -> str:
     return result
 
 
+def _build_tab_total_formula(tab_name: str) -> str | None:
+    total_col = _TAB_TOTAL_COLUMNS.get(tab_name)
+    if not total_col:
+        return None
+    return f"=IFERROR(SUM({total_col}3:{total_col}),0)"
+
+
+def _build_summary_formula(tab_name: str) -> str:
+    total_col = _TAB_TOTAL_COLUMNS[tab_name]
+    return f"=IFERROR('{tab_name}'!{total_col}2,0)"
+
+
+def _total_row_values(tab_name: str) -> list[str]:
+    headers, _ = _TABS[tab_name]
+    values = [""] * len(headers)
+    values[0] = "TOPLAM"
+    total_formula = _build_tab_total_formula(tab_name)
+    if total_formula:
+        total_col_idx = ord(_TAB_TOTAL_COLUMNS[tab_name]) - ord("A")
+        values[total_col_idx] = total_formula
+    return values
+
+
+def _looks_like_total_row(first_cell: str | None) -> bool:
+    return (first_cell or "").strip().upper() == "TOPLAM"
+
+
 def _setup_worksheet(ws, tab_name: str) -> None:
     """Format a data worksheet: freeze row 1, bold + coloured headers,
     column widths, text-wrap on long fields, number format on amounts."""
@@ -557,10 +646,12 @@ def _setup_worksheet(ws, tab_name: str) -> None:
     col_count = len(headers)
     last_col = _col_letter(col_count - 1)
     header_range = f"A1:{last_col}1"
-    data_range = f"A2:{last_col}1000"
+    total_range = f"A2:{last_col}2"
+    data_range = f"A3:{last_col}1000"
 
     # Write headers
     ws.update([headers], "A1", value_input_option="RAW")
+    ws.update([_total_row_values(tab_name)], "A2", value_input_option="USER_ENTERED")
 
     # Bold white text on coloured background
     ws.format(header_range, {
@@ -582,7 +673,12 @@ def _setup_worksheet(ws, tab_name: str) -> None:
         "textFormat": {"fontSize": 10},
     })
 
-    ws.freeze(rows=1)
+    ws.format(total_range, {
+        "backgroundColor": {"red": 0.96, "green": 0.96, "blue": 0.96},
+        "textFormat": {"bold": True, "fontSize": 10},
+        "verticalAlignment": "MIDDLE",
+    })
+    ws.freeze(rows=2)
 
     # Build batch requests for column widths, wrap, and number format
     requests = []
@@ -610,7 +706,7 @@ def _setup_worksheet(ws, tab_name: str) -> None:
                 "repeatCell": {
                     "range": {
                         "sheetId": sheet_id,
-                        "startRowIndex": 1,
+                        "startRowIndex": 2,
                         "startColumnIndex": i,
                         "endColumnIndex": i + 1,
                     },
@@ -629,7 +725,7 @@ def _setup_worksheet(ws, tab_name: str) -> None:
                 "repeatCell": {
                     "range": {
                         "sheetId": sheet_id,
-                        "startRowIndex": 1,
+                        "startRowIndex": 2,
                         "startColumnIndex": i,
                         "endColumnIndex": i + 1,
                     },
@@ -672,6 +768,11 @@ def _setup_summary_tab(ws, month_label: str) -> None:
     """Populate the 📊 Özet tab with title, labels, and cross-sheet SUM formulas."""
     header_color = _TABS["📊 Özet"][1]
 
+    try:
+        ws.clear()
+    except Exception:
+        pass
+
     ws.update([["📊 ÖZET — " + month_label, ""]], "A1", value_input_option="RAW")
     ws.format("A1:B1", {
         "backgroundColor": header_color,
@@ -686,13 +787,13 @@ def _setup_summary_tab(ws, month_label: str) -> None:
     ws.freeze(rows=1)
 
     summary_rows = [
-        ["🧾 Faturalar Toplamı (TL)",       "=IFERROR(SUM('🧾 Faturalar'!K2:K),0)"],
-        ["💳 Ödeme Dekontları (TL)",         "=IFERROR(SUM('💳 Dekontlar'!H2:H),0)"],
-        ["⛽ Harcama Fişleri (TL)",          "=IFERROR(SUM('⛽ Harcama Fişleri'!J2:J),0)"],
-        ["📝 Çekler (TL)",                   "=IFERROR(SUM('📝 Çekler'!G2:G),0)"],
-        ["💵 Elden Ödemeler (TL)",           "=IFERROR(SUM('💵 Elden Ödemeler'!E2:E),0)"],
-        ["🏗️ Malzeme (TL)",                 "=IFERROR(SUM('🏗️ Malzeme'!J2:J),0)"],
-        ["↩️ İadeler (TL)",                  "=IFERROR(SUM('↩️ İadeler'!F2:F),0)"],
+        ["🧾 Faturalar Toplamı (TL)",       _build_summary_formula("🧾 Faturalar")],
+        ["💳 Ödeme Dekontları (TL)",         _build_summary_formula("💳 Dekontlar")],
+        ["⛽ Harcama Fişleri (TL)",          _build_summary_formula("⛽ Harcama Fişleri")],
+        ["📝 Çekler (TL)",                   _build_summary_formula("📝 Çekler")],
+        ["💵 Elden Ödemeler (TL)",           _build_summary_formula("💵 Elden Ödemeler")],
+        ["🏗️ Malzeme (TL)",                 _build_summary_formula("🏗️ Malzeme")],
+        ["↩️ İadeler (TL)",                  _build_summary_formula("↩️ İadeler")],
         ["", ""],
         ["💰 GENEL TOPLAM (TL)",             "=SUM(B2:B8)"],
     ]
@@ -745,6 +846,44 @@ def _setup_summary_tab(ws, month_label: str) -> None:
         pass  # column width is cosmetic, ignore errors
 
     logger.debug("📊 Özet tab populated for %s.", month_label)
+
+
+def _ensure_tab_total_row(ws, tab_name: str) -> None:
+    headers, _ = _TABS[tab_name]
+    last_col = _col_letter(len(headers) - 1)
+    row_two = ws.row_values(2)
+    if row_two:
+        first_cell = row_two[0] if row_two else ""
+    else:
+        first_cell = ""
+
+    if row_two and not _looks_like_total_row(first_cell):
+        ws.insert_row([""] * len(headers), index=2, value_input_option="RAW")
+
+    ws.update([_total_row_values(tab_name)], "A2", value_input_option="USER_ENTERED")
+    ws.format(f"A2:{last_col}2", {
+        "backgroundColor": {"red": 0.96, "green": 0.96, "blue": 0.96},
+        "textFormat": {"bold": True, "fontSize": 10},
+        "verticalAlignment": "MIDDLE",
+    })
+
+    total_col = _TAB_TOTAL_COLUMNS.get(tab_name)
+    if total_col:
+        ws.format(f"{total_col}2:{total_col}2", {
+            "textFormat": {"bold": True, "fontSize": 10},
+            "horizontalAlignment": "RIGHT",
+            "numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"},
+        })
+    ws.freeze(rows=2)
+
+
+def _repair_monthly_spreadsheet_layout(sh) -> None:
+    for tab_name in list(_TABS.keys())[1:]:
+        ws = _ensure_tab_exists(sh, tab_name)
+        _ensure_tab_total_row(ws, tab_name)
+
+    summary_ws = _ensure_tab_exists(sh, "📊 Özet")
+    _setup_summary_tab(summary_ws, _month_label())
 
 
 def _create_and_setup_spreadsheet(client, title: str) -> str:
@@ -1018,14 +1157,8 @@ def _get_or_create_spreadsheet(client):
             logger.warning("Registered spreadsheet inaccessible (%s); will retry.", exc)
             registry.pop(month_key, None)
 
-    # Also check permanent key (legacy single-spreadsheet mode)
-    if "permanent" in registry:
-        try:
-            sh = client.open_by_key(registry["permanent"])
-            logger.debug("Using permanent spreadsheet.")
-            return sh
-        except Exception:
-            registry.pop("permanent", None)
+    # Ignore legacy single-spreadsheet mode so each month gets its own sheet.
+    registry.pop("permanent", None)
 
     # 2. Configured spreadsheet from env
     if settings.google_sheets_spreadsheet_id:
@@ -1101,6 +1234,7 @@ def _bootstrap_spreadsheet_tabs(sh) -> None:
 
         # 3. NOW write Özet formulas (all referenced tabs exist)
         _setup_summary_tab(ozet_ws, _month_label())
+        _repair_monthly_spreadsheet_layout(sh)
 
         logger.info("Bootstrapped tabs on new spreadsheet.")
     except Exception as exc:
@@ -1195,6 +1329,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_l
             _safe(r.total_amount),
             _safe(r.currency or "TRY"),
             _safe(r.source_sender_id),
+            _drive_cell(drive_link),
         ]
 
     if category == DocumentCategory.MALZEME:
@@ -1241,8 +1376,17 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_l
 
 def _next_seq(ws) -> int:
     try:
-        vals = ws.col_values(1)
-        return max(len(vals), 1)
+        vals = ws.col_values(1)[2:]
+        numeric_values: list[int] = []
+        for value in vals:
+            raw = (value or "").strip()
+            if not raw:
+                continue
+            try:
+                numeric_values.append(int(float(raw)))
+            except ValueError:
+                continue
+        return (max(numeric_values) + 1) if numeric_values else 1
     except Exception:
         return 1
 
@@ -1303,6 +1447,71 @@ def append_record(
             )
 
 
+def ensure_current_month_spreadsheet_ready() -> None:
+    """
+    Proactively prepare the current month's spreadsheet.
+
+    This keeps the monthly rollover independent from the first invoice arriving
+    after the month changes, while preserving all prior month sheets in Drive.
+    """
+    client = _get_client()
+    if client is None:
+        logger.debug("Google Sheets monthly rollover check skipped; client unavailable.")
+        return
+
+    with _lock:
+        try:
+            sh = _get_or_create_spreadsheet(client)
+            _repair_monthly_spreadsheet_layout(sh)
+            logger.info("Google Sheets monthly spreadsheet is ready for %s.", _month_key())
+        except Exception as exc:
+            logger.warning("Could not prepare current month's spreadsheet: %s", exc)
+
+
+def _monthly_rollover_worker(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        wait_seconds = _seconds_until_next_month_rollover()
+        if stop_event.wait(wait_seconds):
+            break
+        ensure_current_month_spreadsheet_ready()
+
+
+def start_monthly_rollover_scheduler() -> None:
+    global _rollover_thread, _rollover_stop_event
+
+    with _rollover_lock:
+        if _rollover_thread is not None and _rollover_thread.is_alive():
+            return
+
+        _rollover_stop_event = threading.Event()
+        _rollover_thread = threading.Thread(
+            target=_monthly_rollover_worker,
+            args=(_rollover_stop_event,),
+            name="google-sheets-monthly-rollover",
+            daemon=True,
+        )
+        _rollover_thread.start()
+        logger.info(
+            "Started Google Sheets monthly rollover scheduler (timezone=%s).",
+            settings.business_timezone,
+        )
+
+
+def stop_monthly_rollover_scheduler() -> None:
+    global _rollover_thread, _rollover_stop_event
+
+    with _rollover_lock:
+        stop_event = _rollover_stop_event
+        thread = _rollover_thread
+        _rollover_stop_event = None
+        _rollover_thread = None
+
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=1.0)
+
+
 def ensure_summary_tab_exists(spreadsheet_id: Optional[str] = None) -> None:
     """
     Utility: ensure the 📊 Özet tab exists on the current month's sheet.
@@ -1313,7 +1522,7 @@ def ensure_summary_tab_exists(spreadsheet_id: Optional[str] = None) -> None:
         return
     try:
         sh = _get_or_create_spreadsheet(client)
-        _ensure_tab_exists(sh, "📊 Özet")
+        _repair_monthly_spreadsheet_layout(sh)
         logger.info("📊 Özet tab ensured.")
     except Exception as exc:
         logger.warning("Could not ensure Özet tab: %s", exc)

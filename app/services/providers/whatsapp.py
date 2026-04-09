@@ -178,7 +178,13 @@ def approve_group_join_requests(group_id: str, *, join_request_ids: list[str]) -
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10), reraise=True)
-def send_text_message(to: str, text: str, *, recipient_type: str = "individual") -> None:
+def send_text_message(
+    to: str,
+    text: str,
+    *,
+    recipient_type: str = "individual",
+    reply_to_message_id: str | None = None,
+) -> None:
     """Send a plain-text WhatsApp message to an individual chat or a group."""
     if not settings.whatsapp_access_token or not settings.whatsapp_phone_number_id:
         logger.warning("WhatsApp credentials not configured; skipping outbound message.")
@@ -192,8 +198,42 @@ def send_text_message(to: str, text: str, *, recipient_type: str = "individual")
     }
     if recipient_type != "individual":
         payload["recipient_type"] = recipient_type
+    if reply_to_message_id:
+        payload["context"] = {"message_id": reply_to_message_id}
     url = f"{_GRAPH_BASE}/{settings.whatsapp_phone_number_id}/messages"
     with httpx.Client(timeout=15) as client:
         resp = client.post(url, json=payload, headers=_auth_headers())
         resp.raise_for_status()
         logger.debug("Sent %s message to %s", recipient_type, to)
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10), reraise=True)
+def send_reaction_message(
+    to: str,
+    message_id: str,
+    emoji: str,
+    *,
+    recipient_type: str = "individual",
+) -> None:
+    """Send or update a reaction on a WhatsApp message."""
+    if not settings.whatsapp_access_token or not settings.whatsapp_phone_number_id:
+        logger.warning("WhatsApp credentials not configured; skipping outbound reaction.")
+        return
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "reaction",
+        "reaction": {
+            "message_id": message_id,
+            "emoji": emoji,
+        },
+    }
+    if recipient_type != "individual":
+        payload["recipient_type"] = recipient_type
+
+    url = f"{_GRAPH_BASE}/{settings.whatsapp_phone_number_id}/messages"
+    with httpx.Client(timeout=15) as client:
+        resp = client.post(url, json=payload, headers=_auth_headers())
+        resp.raise_for_status()
+        logger.debug("Sent %s reaction %s to %s", recipient_type, emoji, to)

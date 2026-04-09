@@ -14,6 +14,7 @@ class Settings(BaseSettings):
 
     # Server
     port: int = 8000
+    business_timezone: str = "Europe/Istanbul"
 
     # WhatsApp Cloud API
     whatsapp_verify_token: str = "changeme"

@@ -61,15 +61,35 @@ MSG_UNRELATED_IMAGE = (
     "Bu görsel muhasebe belgesi olarak algılanmadı. "
     "Lütfen fatura veya fiş fotoğrafı gönderin."
 )
-MSG_PROCESSING = (
-    "⏳ Belge işleniyor, bu 5-10 saniye sürebilir. "
-    "Bittiğinde haber vereceğim."
-)
 MSG_GROUPS_ONLY = (
     "🔒 Bu bot şimdilik yalnızca muhasebe grubunda çalışıyor. "
     "Lütfen belgeyi grup içinden gönderin."
 )
 MSG_ERROR = "⚠️ Belgeniz işlenirken bir hata oluştu. Lütfen daha sonra tekrar deneyin."
+MSG_MEDIA_FETCH_ERROR = (
+    "Belge indirilemedi, bu yüzden işlenemedi. "
+    "Lütfen görüntüyü tekrar gönderin."
+)
+MSG_MEDIA_CLASSIFICATION_ERROR = (
+    "Belgenin muhasebe evrakı olup olmadığı doğrulanamadı. "
+    "Lütfen aynı görseli tekrar gönderin."
+)
+MSG_MEDIA_CATEGORY_ERROR = (
+    "Belgenin türü belirlenemedi. "
+    "Lütfen tek belge içeren daha net bir görsel gönderin."
+)
+MSG_MEDIA_EXTRACTION_ERROR = (
+    "Belgedeki bilgiler çıkarılamadı. "
+    "Lütfen tek belge içeren daha net bir görsel gönderin."
+)
+MSG_MEDIA_EMPTY_EXTRACTION = (
+    "Belge algılandı ama okunabilir bilgi çıkarılamadı. "
+    "Lütfen daha net bir fotoğraf gönderin."
+)
+
+REACTION_PROCESSING = "⌛"
+REACTION_SUCCESS = "✅"
+REACTION_WARNING = "⚠️"
 
 # Human-readable category labels for confirmation messages
 _CATEGORY_LABELS: dict[DocumentCategory, str] = {
@@ -81,6 +101,13 @@ _CATEGORY_LABELS: dict[DocumentCategory, str] = {
     DocumentCategory.MALZEME: "Malzeme / İrsaliye",
     DocumentCategory.IADE: "İade Belgesi",
     DocumentCategory.BELIRSIZ: "Genel Belge",
+}
+
+_RETRYABLE_MEDIA_OUTCOMES = {
+    "media_fetch_failed",
+    "classification_failed",
+    "category_failed",
+    "extraction_failed",
 }
 
 
@@ -99,6 +126,7 @@ class MessageRoute:
 
 
 SendTextFn = Callable[[MessageRoute, str], None]
+SendReactionFn = Callable[[MessageRoute, str], None]
 FetchMediaFn = Callable[[], bytes]
 
 
@@ -125,6 +153,7 @@ def process_incoming_message(
     msg_type: str,
     route: MessageRoute,
     send_text: SendTextFn,
+    send_reaction: SendReactionFn | None = None,
     text: str | None = None,
     fetch_media: FetchMediaFn | None = None,
     mime_type: str | None = None,
@@ -169,6 +198,14 @@ def process_incoming_message(
 
         if msg_type in {"image", "document"}:
             if fetch_media is None or not mime_type or not filename or not source_type:
+                _handle_media_failure(
+                    route,
+                    send_text,
+                    send_reaction,
+                    message=MSG_MEDIA_FETCH_ERROR,
+                    reason="missing media configuration",
+                    outcome="missing_media_configuration",
+                )
                 record_store.mark_message_handled(message_id, outcome="missing_media_configuration")
                 logger.warning("Missing media configuration for message id=%s", message_id)
                 return
@@ -177,13 +214,16 @@ def process_incoming_message(
                 message_id=message_id,
                 route=route,
                 send_text=send_text,
+                send_reaction=send_reaction,
                 fetch_media=fetch_media,
                 mime_type=mime_type,
                 filename=filename,
                 source_type=source_type,
                 attachment_url=attachment_url,
             )
-            if outcome != "exported":
+            if outcome in _RETRYABLE_MEDIA_OUTCOMES:
+                record_store.release_message_processing(message_id)
+            elif outcome != "exported":
                 record_store.mark_message_handled(message_id, outcome=outcome)
             return
 
@@ -193,7 +233,16 @@ def process_incoming_message(
     except Exception as exc:
         logger.error("Unhandled error processing message %s: %s", message_id, exc, exc_info=True)
         record_store.release_message_processing(message_id)
-        _safe_send_text_message(route, MSG_ERROR, reason="fatal processing error", send_text=send_text)
+        if msg_type in {"image", "document"}:
+            _handle_media_failure(
+                route,
+                send_text,
+                send_reaction,
+                message=MSG_ERROR,
+                reason="fatal processing error",
+            )
+        else:
+            _safe_send_text_message(route, MSG_ERROR, reason="fatal processing error", send_text=send_text)
 
 
 # ─── Text handlers ────────────────────────────────────────────────────────────
@@ -295,22 +344,40 @@ def _handle_media(
     message_id: str,
     route: MessageRoute,
     send_text: SendTextFn,
+    send_reaction: SendReactionFn | None,
     fetch_media: FetchMediaFn,
     mime_type: str,
     filename: str,
     source_type: str,
     attachment_url: str | None = None,
 ) -> str:
-    _safe_send_text_message(route, MSG_PROCESSING, reason="processing notice", send_text=send_text)
-    raw_bytes = fetch_media()
-
-    # Use Periskope's GCS attachment URL directly as the document link.
-    # Drive upload is intentionally skipped: service accounts have no storage quota
-    # and concurrent httplib2 calls are not thread-safe (causes segfaults under load).
-    drive_link: str | None = attachment_url
+    _safe_send_reaction(route, REACTION_PROCESSING, reason="processing reaction", send_reaction=send_reaction)
+    try:
+        raw_bytes = fetch_media()
+    except Exception as exc:
+        logger.warning("Failed to fetch media for message id=%s: %s", message_id, exc)
+        return _handle_media_failure(
+            route,
+            send_text,
+            send_reaction,
+            message=MSG_MEDIA_FETCH_ERROR,
+            reason="media fetch failed",
+            outcome="media_fetch_failed",
+        )
 
     # Step 1: Is this a financial document at all?
-    classification = bill_classifier.classify_image(raw_bytes, mime_type=mime_type)
+    try:
+        classification = bill_classifier.classify_image(raw_bytes, mime_type=mime_type)
+    except Exception as exc:
+        logger.warning("Failed to classify media for message id=%s: %s", message_id, exc)
+        return _handle_media_failure(
+            route,
+            send_text,
+            send_reaction,
+            message=MSG_MEDIA_CLASSIFICATION_ERROR,
+            reason="media classification failed",
+            outcome="classification_failed",
+        )
     logger.info(
         "Image classification: is_bill=%s confidence=%.2f reason=%s",
         classification.is_bill,
@@ -319,28 +386,65 @@ def _handle_media(
     )
 
     if not classification.is_bill:
-        _safe_send_text_message(route, MSG_UNRELATED_IMAGE, reason="unrelated image warning", send_text=send_text)
-        return "warned_non_bill_media"
+        return _handle_media_failure(
+            route,
+            send_text,
+            send_reaction,
+            message=MSG_UNRELATED_IMAGE,
+            reason="unrelated image warning",
+            outcome="warned_non_bill_media",
+        )
 
     # Step 2: Which category?
-    category, is_return = doc_classifier.classify_document_type(raw_bytes, mime_type=mime_type)
+    try:
+        category, is_return = doc_classifier.classify_document_type(raw_bytes, mime_type=mime_type)
+    except Exception as exc:
+        logger.warning("Failed to classify document type for message id=%s: %s", message_id, exc)
+        return _handle_media_failure(
+            route,
+            send_text,
+            send_reaction,
+            message=MSG_MEDIA_CATEGORY_ERROR,
+            reason="document type classification failed",
+            outcome="category_failed",
+        )
 
     # Step 3: Extract structured fields (may return multiple documents)
-    records = gemini_extractor.extract_bills(
-        image_bytes=raw_bytes,
-        mime_type=mime_type,
-        source_message_id=message_id,
-        source_filename=filename,
-        source_type=source_type,
-        source_sender_id=route.sender_id,
-        source_group_id=route.group_id,
-        source_chat_type=route.chat_type,
-    )
+    try:
+        records = gemini_extractor.extract_bills(
+            image_bytes=raw_bytes,
+            mime_type=mime_type,
+            source_message_id=message_id,
+            source_filename=filename,
+            source_type=source_type,
+            source_sender_id=route.sender_id,
+            source_group_id=route.group_id,
+            source_chat_type=route.chat_type,
+        )
+    except Exception as exc:
+        logger.warning("Failed to extract bills for message id=%s: %s", message_id, exc)
+        return _handle_media_failure(
+            route,
+            send_text,
+            send_reaction,
+            message=MSG_MEDIA_EXTRACTION_ERROR,
+            reason="bill extraction failed",
+            outcome="extraction_failed",
+        )
 
     if not records:
         logger.warning("Gemini returned zero documents for message id=%s", message_id)
-        _safe_send_text_message(route, MSG_UNRELATED_IMAGE, reason="empty extraction", send_text=send_text)
-        return "warned_non_bill_media"
+        return _handle_media_failure(
+            route,
+            send_text,
+            send_reaction,
+            message=MSG_MEDIA_EMPTY_EXTRACTION,
+            reason="empty extraction",
+            outcome="empty_extraction",
+        )
+
+    # Store the source document in Drive so accounting can verify the original.
+    drive_link = google_sheets.upload_document(raw_bytes, filename=filename, mime_type=mime_type)
 
     # Step 4 & 5: Persist and write each record to Sheets
     persisted_count = 0
@@ -357,23 +461,10 @@ def _handle_media(
         )
 
     if persisted_count == 0:
+        _safe_send_reaction(route, REACTION_SUCCESS, reason="already exported reaction", send_reaction=send_reaction)
         return "already_exported"
 
-    # Confirmation message
-    category_label = _CATEGORY_LABELS.get(category, "Belge")
-    if len(records) == 1:
-        reply = MSG_ACCEPTED.format(
-            category=category_label,
-            company=records[0].company_name or "Bilinmiyor",
-            total=records[0].total_amount or "?",
-            currency=records[0].currency or "TRY",
-        )
-    else:
-        reply = MSG_MULTI_ACCEPTED.format(
-            count=persisted_count,
-            details="\n".join(details_lines),
-        )
-    _safe_send_text_message(route, reply, reason="success confirmation", send_text=send_text)
+    _safe_send_reaction(route, REACTION_SUCCESS, reason="success reaction", send_reaction=send_reaction)
     return "exported"
 
 
@@ -395,6 +486,43 @@ def _safe_send_text_message(
             exc,
             exc_info=True,
         )
+
+
+def _safe_send_reaction(
+    route: MessageRoute,
+    emoji: str,
+    *,
+    reason: str,
+    send_reaction: SendReactionFn | None,
+) -> None:
+    if send_reaction is None:
+        return
+    try:
+        send_reaction(route, emoji)
+    except Exception as exc:
+        logger.error(
+            "Failed to send %s to chat_id=%s (chat_type=%s platform=%s): %s",
+            reason,
+            route.chat_id,
+            route.chat_type,
+            route.platform,
+            exc,
+            exc_info=True,
+        )
+
+
+def _handle_media_failure(
+    route: MessageRoute,
+    send_text: SendTextFn,
+    send_reaction: SendReactionFn | None,
+    *,
+    message: str,
+    reason: str,
+    outcome: str = "media_failure",
+) -> str:
+    _safe_send_reaction(route, REACTION_WARNING, reason=f"{reason} reaction", send_reaction=send_reaction)
+    _safe_send_text_message(route, message, reason=reason, send_text=send_text)
+    return outcome
 
 
 def _send_throttled_warning(

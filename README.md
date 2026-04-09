@@ -15,7 +15,8 @@
 3. Belge kategorisini belirler (fatura, dekont, fis, cek, malzeme, iade)
 4. Yapilandirilmis muhasebe alanlarini cikarir (firma, tutar, KDV, tarih...)
 5. **Aylik Google Sheets** tablosuna otomatik yazar
-6. WhatsApp'a onay mesaji gonderir
+6. WhatsApp'ta belgeye reaksiyon koyar: islenirken `⌛`, basariliysa `✅`, hata varsa `⚠️`
+7. Sadece hata durumunda ilgili belgeye reply atip neden islenmedigini yazar
 
 ### Coklu Belge Destegi
 
@@ -128,6 +129,7 @@ uvicorn app.main:app --reload --port 8000
 | `GOOGLE_OAUTH_REFRESH_TOKEN` | OAuth2 yenileme tokeni (`/setup/google-auth` ile alinir) |
 | `GOOGLE_DRIVE_PARENT_FOLDER_ID` | Aylik alt klasorlerin olusturulacagi ust klasor |
 | `GOOGLE_SHEETS_OWNER_EMAIL` | Tablolarin paylasilacagi e-posta |
+| `BUSINESS_TIMEZONE` | Aylik Sheets yenileme saat dilimi | `Europe/Istanbul` |
 
 ### Periskope
 
@@ -170,11 +172,15 @@ Google Drive'daki muhasebe klasorunu servis hesabi e-postasi ile paylasin:
 
 ### Otomatik Aylik Akis
 
-Her ayin ilk belgesi geldiginde:
-1. "Belgeler -- Nisan 2026" alt klasoru olusturulur
+Servis acilisinda ve her ayin 1'inde yeni ayin tablosu hazir tutulur.
+Bir onceki ayin spreadsheet'i silinmez; ayni Drive klasor yapisinda arsiv olarak kalir.
+
+Yeni ay icin:
+1. "Fişler -- Nisan 2026" alt klasoru olusturulur ve onaylanan belge görselleri/PDF'leri buraya yuklenir
 2. "Muhasebe -- Nisan 2026" spreadsheet'i olusturulur
 3. Tum sekmeler bootstrap edilir (Faturalar, Dekontlar, Harcama Fisleri, Cekler, Elden Odemeler, Malzeme, Iadeler, Ozet)
-4. Sonraki belgeler ayni spreadsheet'e eklenir
+4. Her veri sekmesinde `📎 Belge` kolonu uzerinden Drive'daki orijinal fis/fatura acilabilir
+5. Sonraki belgeler ayni spreadsheet'e eklenir
 
 ---
 

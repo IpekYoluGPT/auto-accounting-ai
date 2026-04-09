@@ -15,6 +15,7 @@ from app.routes.groups import router as groups_router
 from app.routes.periskope import router as periskope_router
 from app.routes.setup import router as setup_router
 from app.services.accounting.exporter import TURKISH_HEADERS, tabular_rows_to_xlsx_bytes
+from app.services.providers import google_sheets
 from app.routes.webhooks import router as webhook_router
 from app.utils.logging import get_logger
 
@@ -24,7 +25,12 @@ logger = get_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Auto Accounting AI started.")
-    yield
+    google_sheets.ensure_current_month_spreadsheet_ready()
+    google_sheets.start_monthly_rollover_scheduler()
+    try:
+        yield
+    finally:
+        google_sheets.stop_monthly_rollover_scheduler()
 
 
 app = FastAPI(
