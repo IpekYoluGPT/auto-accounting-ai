@@ -134,3 +134,25 @@ def test_app_startup_prepares_current_month_sheet_and_scheduler():
     ensure_mock.assert_called_once_with()
     start_mock.assert_called_once_with()
     stop_mock.assert_called_once_with()
+
+
+def test_ensure_current_month_spreadsheet_ready_skips_immediate_repair_for_recent_bootstrap():
+    fake_client = MagicMock()
+    fake_sheet = MagicMock()
+    fake_sheet.id = "sheet-123"
+
+    google_sheets._recently_prepared_spreadsheets.clear()
+    google_sheets._mark_recently_prepared(fake_sheet)
+
+    with patch(
+        "app.services.providers.google_sheets._get_client",
+        return_value=fake_client,
+    ), patch(
+        "app.services.providers.google_sheets._get_or_create_spreadsheet",
+        return_value=fake_sheet,
+    ), patch(
+        "app.services.providers.google_sheets._repair_monthly_spreadsheet_layout",
+    ) as repair_mock:
+        google_sheets.ensure_current_month_spreadsheet_ready()
+
+    repair_mock.assert_not_called()

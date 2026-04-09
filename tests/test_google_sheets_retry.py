@@ -4,10 +4,12 @@ Unit tests for Google Sheets retry-on-rate-limit logic.
 
 from __future__ import annotations
 
+import ssl
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from app.services.providers import google_sheets
 from app.services.providers.google_sheets import _retry_on_rate_limit
 
 
@@ -83,3 +85,49 @@ def test_retry_exponential_backoff_delays():
 
     delays = [call.args[0] for call in mock_sleep.call_args_list]
     assert delays == [5.0, 10.0, 20.0]  # 5 * 2^0, 5 * 2^1, 5 * 2^2
+
+
+def test_upload_document_retries_transient_ssl_error(monkeypatch):
+    call_state = {"count": 0}
+
+    class FakeCreateRequest:
+        def execute(self):
+            call_state["count"] += 1
+            if call_state["count"] == 1:
+                raise ssl.SSLError("record layer failure")
+            return {"webViewLink": "https://drive.google.com/file/d/test/view"}
+
+    class FakeFilesResource:
+        def create(self, **kwargs):
+            return FakeCreateRequest()
+
+    class FakeDriveService:
+        def files(self):
+            return FakeFilesResource()
+
+    monkeypatch.setattr(google_sheets.settings, "google_drive_parent_folder_id", "folder-1")
+    monkeypatch.setattr(
+        google_sheets,
+        "_get_oauth_drive_service",
+        lambda force_refresh=False: None,
+    )
+    monkeypatch.setattr(
+        google_sheets,
+        "_get_drive_service",
+        lambda force_refresh=False: FakeDriveService(),
+    )
+    monkeypatch.setattr(
+        google_sheets,
+        "_get_or_create_month_drive_folder",
+        lambda: "folder-1",
+    )
+    monkeypatch.setattr("app.services.providers.google_sheets.time.sleep", lambda seconds: None)
+
+    link = google_sheets.upload_document(
+        b"fake-image",
+        filename="receipt.jpg",
+        mime_type="image/jpeg",
+    )
+
+    assert link == "https://drive.google.com/file/d/test/view"
+    assert call_state["count"] == 2

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import json
+import ssl
 import threading
 import time
 from datetime import datetime, timezone
@@ -190,6 +191,8 @@ _oauth_sheets_service = None
 _rollover_thread: threading.Thread | None = None
 _rollover_stop_event: threading.Event | None = None
 _rollover_lock = threading.Lock()
+_recently_prepared_spreadsheets: dict[str, float] = {}
+_RECENT_PREPARED_TTL_SECONDS = 180.0
 
 
 def _get_business_timezone():
@@ -265,9 +268,11 @@ def _get_client():
         return None
 
 
-def _get_drive_service():
+def _get_drive_service(*, force_refresh: bool = False):
     """Return a Google Drive API v3 service, sharing credentials with gspread."""
     global _drive_service
+    if force_refresh:
+        _drive_service = None
     if _drive_service is not None:
         return _drive_service
     _get_client()  # ensure _creds is populated
@@ -340,9 +345,11 @@ def _get_oauth_creds():
         return None
 
 
-def _get_oauth_drive_service():
+def _get_oauth_drive_service(*, force_refresh: bool = False):
     """Return a Google Drive API v3 service using OAuth2 user credentials."""
     global _oauth_drive_service
+    if force_refresh:
+        _oauth_drive_service = None
     if _oauth_drive_service is not None:
         return _oauth_drive_service
     creds = _get_oauth_creds()
@@ -398,6 +405,69 @@ def _retry_on_rate_limit(fn, *, max_retries: int = 5, base_delay: float = 5.0):
             time.sleep(delay)
     # Should not reach here, but just in case
     return fn()
+
+
+def _is_transient_drive_error(exc: Exception) -> bool:
+    if isinstance(exc, (ssl.SSLError, BrokenPipeError, TimeoutError, ConnectionError)):
+        return True
+
+    error_text = str(exc).lower()
+    return any(
+        token in error_text
+        for token in (
+            "broken pipe",
+            "record layer failure",
+            "ssl",
+            "tls",
+            "connection aborted",
+            "connection reset",
+            "server disconnected",
+            "timed out",
+            "timeout",
+            "temporary failure",
+        )
+    )
+
+
+def _retry_on_transient_drive_error(fn, *, max_retries: int = 3, base_delay: float = 2.0):
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            if not _is_transient_drive_error(exc) or attempt >= max_retries:
+                raise
+            delay = base_delay * (2 ** attempt)
+            logger.warning(
+                "Transient Drive error on attempt %d/%d; retrying in %.0fs … (%s)",
+                attempt + 1,
+                max_retries + 1,
+                delay,
+                exc,
+            )
+            _get_drive_service(force_refresh=True)
+            _get_oauth_drive_service(force_refresh=True)
+            time.sleep(delay)
+    return fn()
+
+
+def _mark_recently_prepared(spreadsheet) -> None:
+    sheet_id = getattr(spreadsheet, "id", None)
+    if not sheet_id:
+        return
+    _recently_prepared_spreadsheets[str(sheet_id)] = time.monotonic()
+
+
+def _was_recently_prepared(spreadsheet) -> bool:
+    sheet_id = getattr(spreadsheet, "id", None)
+    if not sheet_id:
+        return False
+    prepared_at = _recently_prepared_spreadsheets.get(str(sheet_id))
+    if prepared_at is None:
+        return False
+    if (time.monotonic() - prepared_at) > _RECENT_PREPARED_TTL_SECONDS:
+        _recently_prepared_spreadsheets.pop(str(sheet_id), None)
+        return False
+    return True
 
 
 def _get_service_account_email() -> Optional[str]:
@@ -525,8 +595,9 @@ def upload_document(
         logger.debug("GOOGLE_DRIVE_PARENT_FOLDER_ID not set; skipping Drive upload.")
         return None
 
-    drive = _get_oauth_drive_service() or _get_drive_service()
-    if drive is None:
+    use_oauth_drive = _get_oauth_drive_service() is not None
+    drive_getter = _get_oauth_drive_service if use_oauth_drive else _get_drive_service
+    if drive_getter() is None:
         return None
 
     try:
@@ -534,18 +605,23 @@ def upload_document(
         from googleapiclient.http import MediaIoBaseUpload
 
         folder_id = _get_or_create_month_drive_folder()
-
         file_meta: dict = {"name": filename}
         if folder_id:
             file_meta["parents"] = [folder_id]
 
-        media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=False)
-        uploaded = drive.files().create(
-            body=file_meta,
-            media_body=media,
-            fields="id,webViewLink",
-            supportsAllDrives=True,
-        ).execute()
+        def _upload_once():
+            drive = drive_getter()
+            if drive is None:
+                raise RuntimeError("Drive service unavailable during upload.")
+            media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=False)
+            return drive.files().create(
+                body=file_meta,
+                media_body=media,
+                fields="id,webViewLink",
+                supportsAllDrives=True,
+            ).execute()
+
+        uploaded = _retry_on_transient_drive_error(_upload_once)
 
         link = uploaded.get("webViewLink", "")
         logger.info("Uploaded '%s' to Drive folder '%s' → %s", filename, _month_drive_folder_name(), link)
@@ -636,7 +712,7 @@ def _looks_like_total_row(first_cell: str | None) -> bool:
     return (first_cell or "").strip().upper() == "TOPLAM"
 
 
-def _setup_worksheet(ws, tab_name: str) -> None:
+def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
     """Format a data worksheet: freeze row 1, bold + coloured headers,
     column widths, text-wrap on long fields, number format on amounts."""
     headers, color = _TABS[tab_name]
@@ -652,6 +728,11 @@ def _setup_worksheet(ws, tab_name: str) -> None:
     # Write headers
     ws.update([headers], "A1", value_input_option="RAW")
     ws.update([_total_row_values(tab_name)], "A2", value_input_option="USER_ENTERED")
+    ws.freeze(rows=2)
+
+    if lightweight:
+        logger.debug("Worksheet '%s' bootstrapped in lightweight mode.", tab_name)
+        return
 
     # Bold white text on coloured background
     ws.format(header_range, {
@@ -678,8 +759,6 @@ def _setup_worksheet(ws, tab_name: str) -> None:
         "textFormat": {"bold": True, "fontSize": 10},
         "verticalAlignment": "MIDDLE",
     })
-    ws.freeze(rows=2)
-
     # Build batch requests for column widths, wrap, and number format
     requests = []
     sheet_id = ws.id
@@ -764,16 +843,34 @@ def _setup_worksheet(ws, tab_name: str) -> None:
     logger.debug("Worksheet '%s' formatted (%d columns).", tab_name, col_count)
 
 
-def _setup_summary_tab(ws, month_label: str) -> None:
+def _setup_summary_tab(ws, month_label: str, *, lightweight: bool = False) -> None:
     """Populate the 📊 Özet tab with title, labels, and cross-sheet SUM formulas."""
     header_color = _TABS["📊 Özet"][1]
 
-    try:
-        ws.clear()
-    except Exception:
-        pass
+    if not lightweight:
+        try:
+            ws.clear()
+        except Exception:
+            pass
 
     ws.update([["📊 ÖZET — " + month_label, ""]], "A1", value_input_option="RAW")
+    ws.update([
+        ["🧾 Faturalar Toplamı (TL)",       _build_summary_formula("🧾 Faturalar")],
+        ["💳 Ödeme Dekontları (TL)",         _build_summary_formula("💳 Dekontlar")],
+        ["⛽ Harcama Fişleri (TL)",          _build_summary_formula("⛽ Harcama Fişleri")],
+        ["📝 Çekler (TL)",                   _build_summary_formula("📝 Çekler")],
+        ["💵 Elden Ödemeler (TL)",           _build_summary_formula("💵 Elden Ödemeler")],
+        ["🏗️ Malzeme (TL)",                 _build_summary_formula("🏗️ Malzeme")],
+        ["↩️ İadeler (TL)",                  _build_summary_formula("↩️ İadeler")],
+        ["", ""],
+        ["💰 GENEL TOPLAM (TL)",             "=SUM(B2:B8)"],
+    ], "A2", value_input_option="USER_ENTERED")
+    ws.freeze(rows=1)
+
+    if lightweight:
+        logger.debug("Summary tab bootstrapped in lightweight mode for %s.", month_label)
+        return
+
     ws.format("A1:B1", {
         "backgroundColor": header_color,
         "textFormat": {
@@ -784,20 +881,6 @@ def _setup_summary_tab(ws, month_label: str) -> None:
         "horizontalAlignment": "CENTER",
     })
     ws.merge_cells("A1:B1")
-    ws.freeze(rows=1)
-
-    summary_rows = [
-        ["🧾 Faturalar Toplamı (TL)",       _build_summary_formula("🧾 Faturalar")],
-        ["💳 Ödeme Dekontları (TL)",         _build_summary_formula("💳 Dekontlar")],
-        ["⛽ Harcama Fişleri (TL)",          _build_summary_formula("⛽ Harcama Fişleri")],
-        ["📝 Çekler (TL)",                   _build_summary_formula("📝 Çekler")],
-        ["💵 Elden Ödemeler (TL)",           _build_summary_formula("💵 Elden Ödemeler")],
-        ["🏗️ Malzeme (TL)",                 _build_summary_formula("🏗️ Malzeme")],
-        ["↩️ İadeler (TL)",                  _build_summary_formula("↩️ İadeler")],
-        ["", ""],
-        ["💰 GENEL TOPLAM (TL)",             "=SUM(B2:B8)"],
-    ]
-    ws.update(summary_rows, "A2", value_input_option="USER_ENTERED")
 
     # Style label column
     ws.format("A2:A8", {"textFormat": {"fontSize": 11}})
@@ -884,6 +967,7 @@ def _repair_monthly_spreadsheet_layout(sh) -> None:
 
     summary_ws = _ensure_tab_exists(sh, "📊 Özet")
     _setup_summary_tab(summary_ws, _month_label())
+    _mark_recently_prepared(sh)
 
 
 def _create_and_setup_spreadsheet(client, title: str) -> str:
@@ -1230,11 +1314,11 @@ def _bootstrap_spreadsheet_tabs(sh) -> None:
         for tab_name in list(_TABS.keys())[1:]:
             headers, _ = _TABS[tab_name]
             new_ws = sh.add_worksheet(title=tab_name, rows=1000, cols=len(headers) + 2)
-            _setup_worksheet(new_ws, tab_name)
+            _setup_worksheet(new_ws, tab_name, lightweight=True)
 
         # 3. NOW write Özet formulas (all referenced tabs exist)
-        _setup_summary_tab(ozet_ws, _month_label())
-        _repair_monthly_spreadsheet_layout(sh)
+        _setup_summary_tab(ozet_ws, _month_label(), lightweight=True)
+        _mark_recently_prepared(sh)
 
         logger.info("Bootstrapped tabs on new spreadsheet.")
     except Exception as exc:
@@ -1462,7 +1546,10 @@ def ensure_current_month_spreadsheet_ready() -> None:
     with _lock:
         try:
             sh = _get_or_create_spreadsheet(client)
-            _repair_monthly_spreadsheet_layout(sh)
+            if _was_recently_prepared(sh):
+                logger.info("Spreadsheet %s was prepared recently; skipping immediate repair.", sh.id)
+            else:
+                _repair_monthly_spreadsheet_layout(sh)
             logger.info("Google Sheets monthly spreadsheet is ready for %s.", _month_key())
         except Exception as exc:
             logger.warning("Could not prepare current month's spreadsheet: %s", exc)
