@@ -1,18 +1,16 @@
 """
-Gemini-powered invoice / receipt field extractor.
-
-Sends an image (or document) to Gemini and requests a strictly structured
-JSON response conforming to the BillRecord schema.
+Gemini-backed extraction with an OCR-first direct path.
 """
 
 from __future__ import annotations
 
-import re
 from typing import Optional
 
 from app.config import settings
-from app.models.schemas import AIExtractionResult, AIMultiExtractionResult, BillRecord
+from app.models.ocr import OCRParseBundle
+from app.models.schemas import AIMultiExtractionResult, BillRecord, DocumentCategory
 from app.services import gemini_client
+from app.services.accounting import ocr
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -29,31 +27,35 @@ Use null for missing values.
 Normalize dates to YYYY-MM-DD, times to HH:MM, and Turkish decimal numbers to standard decimals.
 Default currency to TRY when it is not shown."""
 
-# Turkish number format: 1.234,56 -> 1234.56
-_TR_NUMBER_RE = re.compile(r"(\d{1,3}(?:\.\d{3})*),(\d{2})")
+_OCR_VALIDATION_PROMPT = """Validate and extract bookkeeping fields from this Turkish financial document.
+
+You will receive:
+- the original media
+- OCR text
+- OCR key-value fields
+- OCR entities
+- OCR tables
+- a deterministic candidate record built from OCR
+
+Rules:
+- Prefer explicit OCR-grounded values.
+- Do not invent numbers, tax IDs, or document IDs.
+- Preserve Turkish characters exactly when visible.
+- Fix OCR mistakes only when the OCR evidence and arithmetic clearly support the correction.
+- Return multiple documents only if the image truly contains more than one distinct document.
+- Return only the schema."""
 
 
 def _parse_tr_number(value: str) -> Optional[float]:
-    """Convert a Turkish-formatted number string to float."""
-    if value is None:
-        return None
-    cleaned = _TR_NUMBER_RE.sub(lambda m: m.group(0).replace(".", "").replace(",", "."), str(value))
-    cleaned = cleaned.replace(",", ".")
-    try:
-        return float(cleaned)
-    except (ValueError, TypeError):
-        return None
+    """Backward-compatible wrapper for tests."""
+    return ocr.parse_tr_number(value)
 
 
 def _normalize_record(raw: dict) -> BillRecord:
-    """Coerce raw Gemini JSON dict into a validated BillRecord."""
+    """Coerce raw JSON dict into a validated BillRecord."""
 
     def _safe_float(v) -> Optional[float]:
-        if v is None:
-            return None
-        if isinstance(v, (int, float)):
-            return float(v)
-        return _parse_tr_number(str(v))
+        return ocr.parse_tr_number(v)
 
     def _safe_str(v) -> Optional[str]:
         if v is None:
@@ -69,18 +71,6 @@ def _normalize_record(raw: dict) -> BillRecord:
     else:
         currency_raw = "TRY"
 
-    doc_date = _safe_str(raw.get("document_date"))
-    if doc_date:
-        match = re.match(r"^(\d{1,2})[./](\d{1,2})[./](\d{4})$", doc_date)
-        if match:
-            doc_date = f"{match.group(3)}-{match.group(2).zfill(2)}-{match.group(1).zfill(2)}"
-
-    doc_time = _safe_str(raw.get("document_time"))
-    if doc_time:
-        match = re.match(r"^(\d{1,2})[:.](\d{2})(?::\d{2})?$", doc_time)
-        if match:
-            doc_time = f"{match.group(1).zfill(2)}:{match.group(2)}"
-
     return BillRecord(
         company_name=_safe_str(raw.get("company_name")),
         tax_number=_safe_str(raw.get("tax_number")),
@@ -88,8 +78,8 @@ def _normalize_record(raw: dict) -> BillRecord:
         document_number=_safe_str(raw.get("document_number")),
         invoice_number=_safe_str(raw.get("invoice_number")),
         receipt_number=_safe_str(raw.get("receipt_number")),
-        document_date=doc_date,
-        document_time=doc_time,
+        document_date=ocr.normalize_date(_safe_str(raw.get("document_date"))) or _safe_str(raw.get("document_date")),
+        document_time=ocr.normalize_time(_safe_str(raw.get("document_time"))) or _safe_str(raw.get("document_time")),
         currency=currency_raw,
         subtotal=_safe_float(raw.get("subtotal")),
         vat_rate=_safe_float(raw.get("vat_rate")),
@@ -115,29 +105,58 @@ def extract_bills(
     source_sender_id: Optional[str] = None,
     source_group_id: Optional[str] = None,
     source_chat_type: Optional[str] = None,
+    *,
+    ocr_bundle: OCRParseBundle | None = None,
+    category_hint: DocumentCategory | None = None,
 ) -> list[BillRecord]:
     """
-    Send *image_bytes* to Gemini and return a list of normalised BillRecords.
+    Extract one or more bookkeeping records from media.
 
-    A single photo may contain multiple documents (e.g. 3 cheques side by side).
-    Gemini is asked to detect and extract each one separately.
-
-    Raises RuntimeError immediately if the API key is not configured.
-    Retries transient Gemini API errors up to 5 times.
+    When a strong OCR bundle is present, returns a direct deterministic record
+    without calling Gemini. Otherwise, Gemini receives the media together with
+    OCR context and validates/fills the record(s).
     """
+    assessment = None
+    model_name = settings.gemini_extractor_model
+    prompt = _EXTRACTION_PROMPT
+
+    if ocr_bundle is not None:
+        assessment = ocr.assess_extraction(ocr_bundle, category_hint=category_hint)
+        if assessment.use_direct:
+            logger.info(
+                "Using direct OCR extraction for %s (score=%.2f quality=%.2f)",
+                source_message_id or source_filename or "document",
+                assessment.parse_score,
+                ocr_bundle.quality_score,
+            )
+            direct = assessment.record.model_copy(deep=True)
+            _attach_source_metadata(
+                direct,
+                source_message_id=source_message_id,
+                source_filename=source_filename,
+                source_type=source_type,
+                source_sender_id=source_sender_id,
+                source_group_id=source_group_id,
+                source_chat_type=source_chat_type,
+            )
+            return [direct]
+
+        model_name = settings.gemini_validation_model
+        prompt = _build_ocr_validation_prompt(ocr_bundle, assessment, category_hint)
+
     if not settings.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured.")
 
     logger.info(
-        "Sending image (%d bytes, %s) to Gemini model %s for multi-document extraction",
+        "Sending media (%d bytes, %s) to Gemini model %s for extraction",
         len(image_bytes),
         mime_type,
-        settings.gemini_extractor_model,
+        model_name,
     )
 
     multi_result = gemini_client.generate_structured_content(
-        model=settings.gemini_extractor_model,
-        prompt=_EXTRACTION_PROMPT,
+        model=model_name,
+        prompt=prompt,
         response_schema=AIMultiExtractionResult,
         thinking_level="low",
         media_bytes=image_bytes,
@@ -152,8 +171,6 @@ def extract_bills(
     records: list[BillRecord] = []
     for idx, doc in enumerate(raw_docs):
         record = _normalize_record(doc.model_dump())
-        # For multi-document images, append a sub-index to the message id
-        # so each record has a unique dedup key.
         if len(raw_docs) > 1 and source_message_id:
             record.source_message_id = f"{source_message_id}__doc{idx + 1}"
         else:
@@ -168,9 +185,7 @@ def extract_bills(
     logger.info(
         "Extraction complete: %d document(s) found. [%s]",
         len(records),
-        ", ".join(
-            f"{r.company_name or '?'}={r.total_amount}" for r in records
-        ),
+        ", ".join(f"{r.company_name or '?'}={r.total_amount}" for r in records),
     )
     return records
 
@@ -184,12 +199,11 @@ def extract_bill(
     source_sender_id: Optional[str] = None,
     source_group_id: Optional[str] = None,
     source_chat_type: Optional[str] = None,
+    *,
+    ocr_bundle: OCRParseBundle | None = None,
+    category_hint: DocumentCategory | None = None,
 ) -> BillRecord:
-    """
-    Backward-compatible wrapper: returns the first extracted record.
-
-    Prefer extract_bills() for new code — it handles multi-document images.
-    """
+    """Backward-compatible wrapper: returns the first extracted record."""
     records = extract_bills(
         image_bytes=image_bytes,
         mime_type=mime_type,
@@ -199,7 +213,46 @@ def extract_bill(
         source_sender_id=source_sender_id,
         source_group_id=source_group_id,
         source_chat_type=source_chat_type,
+        ocr_bundle=ocr_bundle,
+        category_hint=category_hint,
     )
     if not records:
         raise RuntimeError("Gemini returned no documents from the image.")
     return records[0]
+
+
+def _build_ocr_validation_prompt(
+    ocr_bundle: OCRParseBundle,
+    assessment: ocr.OCRExtractionAssessment,
+    category_hint: DocumentCategory | None,
+) -> str:
+    category_text = category_hint.value if category_hint is not None else "unknown"
+    multi_doc_text = "yes" if assessment.multi_document_suspected else "no"
+    return (
+        f"{_OCR_VALIDATION_PROMPT}\n\n"
+        f"Category hint: {category_text}\n"
+        f"Multiple documents suspected: {multi_doc_text}\n"
+        f"OCR quality score: {ocr_bundle.quality_score}\n"
+        f"OCR parse score: {assessment.parse_score}\n"
+        f"OCR parse reasons: {', '.join(assessment.reasons) or 'none'}\n\n"
+        f"Deterministic OCR candidate:\n{ocr.serialize_candidate_record(assessment.record)}\n\n"
+        f"OCR bundle:\n{ocr.serialize_ocr_bundle(ocr_bundle)}"
+    )
+
+
+def _attach_source_metadata(
+    record: BillRecord,
+    *,
+    source_message_id: Optional[str],
+    source_filename: Optional[str],
+    source_type: Optional[str],
+    source_sender_id: Optional[str],
+    source_group_id: Optional[str],
+    source_chat_type: Optional[str],
+) -> None:
+    record.source_message_id = source_message_id
+    record.source_filename = source_filename
+    record.source_type = source_type
+    record.source_sender_id = source_sender_id
+    record.source_group_id = source_group_id
+    record.source_chat_type = source_chat_type

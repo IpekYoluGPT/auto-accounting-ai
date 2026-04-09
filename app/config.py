@@ -2,6 +2,7 @@
 Application configuration loaded from environment variables.
 """
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -35,6 +36,7 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_classifier_model: str = "gemini-2.5-flash"
     gemini_extractor_model: str = "gemini-2.5-flash"
+    gemini_validation_model: str = "gemini-2.5-pro"
 
     # Google Sheets
     # Base64-encoded service account JSON (from Google Cloud Console)
@@ -55,6 +57,29 @@ class Settings(BaseSettings):
     google_oauth_client_id: str = ""
     google_oauth_client_secret: str = ""
     google_oauth_refresh_token: str = ""
+
+    # Google Document AI
+    google_document_ai_project_id: str = ""
+    google_document_ai_location: str = "eu"
+    google_document_ai_form_processor_id: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "GOOGLE_DOCUMENT_AI_FORM_PROCESSOR_ID",
+            "GOOGLE_DOCUMENT_AI_FOR_PROCESSOR",
+        ),
+    )
+    google_document_ai_ocr_processor_id: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "GOOGLE_DOCUMENT_AI_OCR_PROCESSOR_ID",
+            "GOOGLE_DOCUMENT_AI_OCR_PROCESSOR",
+        ),
+    )
+
+    # OCR pipeline thresholds
+    ocr_min_text_chars: int = 60
+    ocr_min_parse_score: float = 0.72
+    ocr_min_quality_score: float = 0.45
 
     # Manager phone number (WhatsApp format, e.g. 905XXXXXXXXX@c.us or just 905XXXXXXXXX)
     # Text messages from this number are treated as elden ödeme (cash payment) entries.

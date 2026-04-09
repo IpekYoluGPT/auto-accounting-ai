@@ -25,6 +25,7 @@ from app.services.accounting import (
     bill_classifier,
     doc_classifier,
     gemini_extractor,
+    ocr,
     record_store,
 )
 from app.services.providers import google_sheets
@@ -365,9 +366,27 @@ def _handle_media(
             outcome="media_fetch_failed",
         )
 
+    prepared = ocr.prepare_document(raw_bytes, mime_type=mime_type)
+    working_bytes = prepared.media_bytes
+    working_mime_type = prepared.mime_type
+    ocr_bundle = prepared.ocr_bundle
+    if prepared.warnings:
+        logger.info(
+            "Media prepared for OCR: message_id=%s warnings=%s",
+            message_id,
+            prepared.warnings,
+        )
+
     # Step 1: Is this a financial document at all?
     try:
-        classification = bill_classifier.classify_image(raw_bytes, mime_type=mime_type)
+        if ocr_bundle is not None:
+            classification = bill_classifier.classify_image(
+                working_bytes,
+                mime_type=working_mime_type,
+                ocr_bundle=ocr_bundle,
+            )
+        else:
+            classification = bill_classifier.classify_image(working_bytes, mime_type=working_mime_type)
     except Exception as exc:
         logger.warning("Failed to classify media for message id=%s: %s", message_id, exc)
         return _handle_media_failure(
@@ -397,7 +416,14 @@ def _handle_media(
 
     # Step 2: Which category?
     try:
-        category, is_return = doc_classifier.classify_document_type(raw_bytes, mime_type=mime_type)
+        if ocr_bundle is not None:
+            category, is_return = doc_classifier.classify_document_type(
+                working_bytes,
+                mime_type=working_mime_type,
+                ocr_bundle=ocr_bundle,
+            )
+        else:
+            category, is_return = doc_classifier.classify_document_type(working_bytes, mime_type=working_mime_type)
     except Exception as exc:
         logger.warning("Failed to classify document type for message id=%s: %s", message_id, exc)
         return _handle_media_failure(
@@ -411,16 +437,20 @@ def _handle_media(
 
     # Step 3: Extract structured fields (may return multiple documents)
     try:
-        records = gemini_extractor.extract_bills(
-            image_bytes=raw_bytes,
-            mime_type=mime_type,
-            source_message_id=message_id,
-            source_filename=filename,
-            source_type=source_type,
-            source_sender_id=route.sender_id,
-            source_group_id=route.group_id,
-            source_chat_type=route.chat_type,
-        )
+        extract_kwargs = {
+            "image_bytes": working_bytes,
+            "mime_type": working_mime_type,
+            "source_message_id": message_id,
+            "source_filename": filename,
+            "source_type": source_type,
+            "source_sender_id": route.sender_id,
+            "source_group_id": route.group_id,
+            "source_chat_type": route.chat_type,
+        }
+        if ocr_bundle is not None:
+            extract_kwargs["ocr_bundle"] = ocr_bundle
+            extract_kwargs["category_hint"] = category
+        records = gemini_extractor.extract_bills(**extract_kwargs)
     except Exception as exc:
         logger.warning("Failed to extract bills for message id=%s: %s", message_id, exc)
         return _handle_media_failure(

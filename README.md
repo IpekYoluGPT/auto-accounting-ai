@@ -1,6 +1,6 @@
 # auto-accounting-ai
 
-> WhatsApp'tan gelen fatura, fis, cek ve dekont fotograflarini Gemini AI ile isleyip Google Sheets'e otomatik kaydeden muhasebe backend sistemi.
+> WhatsApp'tan gelen fatura, fis, cek ve dekont fotograflarini Google Document AI + Gemini ile isleyip Google Sheets'e otomatik kaydeden muhasebe backend sistemi.
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-green.svg)](https://fastapi.tiangolo.com/)
@@ -11,12 +11,13 @@
 ## Ne Yapar?
 
 1. WhatsApp grubundan gelen her mesaji Periskope webhook ile alir
-2. Gemini AI ile finansal belge mi degil mi siniflandirir
-3. Belge kategorisini belirler (fatura, dekont, fis, cek, malzeme, iade)
-4. Yapilandirilmis muhasebe alanlarini cikarir (firma, tutar, KDV, tarih...)
-5. **Aylik Google Sheets** tablosuna otomatik yazar
-6. WhatsApp'ta belgeye reaksiyon koyar: islenirken `⌛`, basariliysa `✅`, hata varsa `⚠️`
-7. Sadece hata durumunda ilgili belgeye reply atip neden islenmedigini yazar
+2. Google Document AI ile OCR, tablo ve key-value alanlarini cikarir
+3. OCR verisi uzerinden finansal belge mi degil mi siniflandirir
+4. Belge kategorisini belirler (fatura, dekont, fis, cek, malzeme, iade)
+5. Temiz OCR sonucunda dogrudan kayit olusturur; zor belgelerde Gemini ile dogrular
+6. **Aylik Google Sheets** tablosuna otomatik yazar
+7. WhatsApp'ta belgeye reaksiyon koyar: islenirken `⌛`, basariliysa `✅`, hata varsa `⚠️`
+8. Sadece hata durumunda ilgili belgeye reply atip neden islenmedigini yazar
 
 ### Coklu Belge Destegi
 
@@ -34,11 +35,12 @@ Periskope Webhook  ────>  POST /integrations/periskope/webhook
                               |
                     +---------+-----------+
                     v                     v
-              bill_classifier       doc_classifier
-              (finansal mi?)        (hangi kategori?)
+            Google Document AI      OCR kurallari + Gemini
+              (OCR + tablo)        (finansal mi? / kategori?)
                     |                     |
-                    v                     v
-              gemini_extractor (coklu belge destekli)
+                    +----------+----------+
+                               v
+                 gemini_extractor (yalnizca zor durumlarda)
                     |
                     +---> record_store (CSV + tekrar korumasi)
                     +---> google_sheets (aylik spreadsheet)
@@ -66,15 +68,17 @@ auto-accounting-ai/
 │   │   │   ├── intake.py              # Merkezi mesaj isleme hatti
 │   │   │   ├── bill_classifier.py     # Belge siniflandirma
 │   │   │   ├── doc_classifier.py      # Kategori belirleme
-│   │   │   ├── gemini_extractor.py    # Coklu belge cikarimi
+│   │   │   ├── gemini_extractor.py    # OCR destekli Gemini dogrulama / fallback
+│   │   │   ├── ocr.py                 # Media normalize + OCR parse + deterministic extraction
 │   │   │   ├── record_store.py        # CSV kayit + tekrar korumasi
 │   │   │   └── exporter.py            # CSV/XLSX formatlama
 │   │   └── providers/
+│   │       ├── google_document_ai.py  # Document AI Form Parser + Enterprise OCR
 │   │       ├── google_sheets.py       # Aylik tablo yonetimi + OAuth + retry
 │   │       ├── periskope.py           # Periskope API istemcisi
 │   │       └── whatsapp.py            # Meta Cloud API istemcisi
 │   └── utils/
-├── tests/                             # 88 test
+├── tests/                             # 109 test
 ├── docs/
 ├── .env.example
 ├── requirements.txt
@@ -119,6 +123,7 @@ uvicorn app.main:app --reload --port 8000
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | Base64 kodlanmis servis hesabi JSON |
 | `PERISKOPE_API_KEY` | Periskope API anahtari (giden mesajlar icin) |
 | `PERISKOPE_PHONE` | Periskope telefon numarasi / phone_id |
+| `GOOGLE_DOCUMENT_AI_FORM_PROCESSOR_ID` | Form Parser processor ID |
 
 ### Google Sheets (Aylik Otomatik Olusturma)
 
@@ -130,6 +135,24 @@ uvicorn app.main:app --reload --port 8000
 | `GOOGLE_DRIVE_PARENT_FOLDER_ID` | Aylik alt klasorlerin olusturulacagi ust klasor |
 | `GOOGLE_SHEETS_OWNER_EMAIL` | Tablolarin paylasilacagi e-posta |
 | `BUSINESS_TIMEZONE` | Aylik Sheets yenileme saat dilimi | `Europe/Istanbul` |
+
+### Google Document AI OCR
+
+| Degisken | Aciklama | Varsayilan |
+|----------|----------|------------|
+| `GOOGLE_DOCUMENT_AI_PROJECT_ID` | Document AI project ID | servis hesabindan okunur |
+| `GOOGLE_DOCUMENT_AI_LOCATION` | Processor lokasyonu | `eu` |
+| `GOOGLE_DOCUMENT_AI_FORM_PROCESSOR_ID` | Birincil OCR/Form Parser processor ID | *(bos)* |
+| `GOOGLE_DOCUMENT_AI_OCR_PROCESSOR_ID` | Ikincil Enterprise OCR processor ID | *(bos)* |
+| `OCR_MIN_TEXT_CHARS` | OCR minimum okunabilir metin esigi | `60` |
+| `OCR_MIN_PARSE_SCORE` | OCR dogrudan kayit minimum skoru | `0.72` |
+| `OCR_MIN_QUALITY_SCORE` | OCR kalite esigi | `0.45` |
+
+Not:
+Eger host ortaminda env degisken adi uzunlugu siniri varsa, uygulama su kisa aliaslari da kabul eder:
+`GOOGLE_DOCUMENT_AI_FOR_PROCESSOR` -> `GOOGLE_DOCUMENT_AI_FORM_PROCESSOR_ID`
+`GOOGLE_DOCUMENT_AI_OCR_PROCESSOR` -> `GOOGLE_DOCUMENT_AI_OCR_PROCESSOR_ID`
+Degisken adlari kisa olabilir; Google Cloud tarafindaki processor "Name" alani ile karistirmayin. Uygulamaya girilecek deger her zaman processor detay sayfasindaki gercek `ID` degeridir.
 
 ### Periskope
 
@@ -147,6 +170,7 @@ uvicorn app.main:app --reload --port 8000
 |----------|----------|------------|
 | `GEMINI_CLASSIFIER_MODEL` | Siniflandirma modeli | `gemini-2.5-flash` |
 | `GEMINI_EXTRACTOR_MODEL` | Cikarim modeli | `gemini-2.5-flash` |
+| `GEMINI_VALIDATION_MODEL` | OCR fallback / validation modeli | `gemini-2.5-pro` |
 | `MANAGER_PHONE_NUMBER` | Elden odeme icin yonetici telefon numarasi | *(bos)* |
 | `WHATSAPP_GROUPS_ONLY` | Sadece grup mesajlarini isle | `true` |
 | `STORAGE_DIR` | Dosya depolama dizini | `./storage` |
@@ -228,7 +252,7 @@ Yeni ay icin:
 ## Testler
 
 ```bash
-python -m pytest tests/ -q           # Tam paket (88 test)
+python -m pytest tests/ -q           # Tam paket (109 test)
 python -m pytest tests/ -x -q        # Ilk hatada dur
 ```
 

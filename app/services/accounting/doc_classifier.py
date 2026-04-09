@@ -21,7 +21,9 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 from app.config import settings
+from app.models.ocr import OCRParseBundle
 from app.models.schemas import DocumentCategory
+from app.services.accounting import ocr
 from app.services import gemini_client
 from app.utils.logging import get_logger
 
@@ -52,6 +54,12 @@ Kategori seçenekleri (yalnızca birini seç):
 
 Ayrıca: is_return alanını true yap eğer bu belge bir iade veya iptal işlemini gösteriyorsa.
 
+JSON formatında döndür."""
+
+_OCR_CATEGORY_PROMPT = """Bu bir Türkçe finansal belgeden çıkarılmış OCR çıktısıdır.
+
+OCR metni, tablo satırları ve anahtar-değer alanları üzerinden belgenin kategorisini belirle.
+OCR kanıtına sadık kal. Belirsizsen belirsiz döndür.
 JSON formatında döndür."""
 
 
@@ -87,6 +95,8 @@ JSON formatında döndür."""
 def classify_document_type(
     image_bytes: bytes,
     mime_type: str = "image/jpeg",
+    *,
+    ocr_bundle: Optional[OCRParseBundle] = None,
 ) -> tuple[DocumentCategory, bool]:
     """
     Classify a confirmed financial document into one of 6 categories.
@@ -104,10 +114,23 @@ def classify_document_type(
         settings.gemini_classifier_model,
         len(image_bytes),
     )
+    if ocr_bundle is not None:
+        detected_category, is_return = ocr.detect_category_from_ocr(ocr_bundle)
+        if detected_category is not None:
+            logger.info(
+                "Document type inferred from OCR: %s | is_return=%s",
+                detected_category.value,
+                is_return,
+            )
+            return detected_category, is_return
+
     try:
+        prompt = _CATEGORY_PROMPT
+        if ocr_bundle is not None:
+            prompt = f"{_OCR_CATEGORY_PROMPT}\n\n{ocr.serialize_ocr_bundle(ocr_bundle)}"
         raw: _RawDocumentTypeResult = gemini_client.generate_structured_content(
             model=settings.gemini_classifier_model,
-            prompt=_CATEGORY_PROMPT,
+            prompt=prompt,
             response_schema=_RawDocumentTypeResult,
             thinking_level="minimal",
             media_bytes=image_bytes,

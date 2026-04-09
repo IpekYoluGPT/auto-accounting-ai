@@ -6,8 +6,28 @@ from unittest.mock import ANY, patch
 
 import pytest
 
+from app.models.ocr import OCRMediaMetadata, OCRParseBundle
 from app.models.schemas import ClassificationResult
 from app.services.accounting.bill_classifier import classify_image, classify_text
+
+
+def _ocr_bundle(text: str, *, quality_score: float = 0.88) -> OCRParseBundle:
+    return OCRParseBundle(
+        text=text,
+        lines=[line for line in text.splitlines() if line],
+        quality_score=quality_score,
+        readability_score=quality_score,
+        text_char_count=len(text),
+        processor_used="form_parser",
+        metadata=OCRMediaMetadata(
+            mime_type="image/jpeg",
+            original_mime_type="image/jpeg",
+            byte_size=1024,
+            width=1200,
+            height=1600,
+            source_hash="abc123",
+        ),
+    )
 
 
 class TestClassifyText:
@@ -87,6 +107,40 @@ class TestClassifyImage:
             media_bytes=b"fake_image_bytes",
             mime_type="image/png",
         )
+
+    def test_ocr_direct_positive_short_circuits_gemini(self):
+        bundle = _ocr_bundle("ÖZTÜRK GIDA LTD. ŞTİ.\nTarih: 09.04.2026\nToplam: 1.500,00 TL\nKDV %20: 250,00 TL")
+
+        with patch("app.services.accounting.bill_classifier.gemini_client.generate_structured_content") as mock_generate:
+            result = classify_image(b"fake_image_bytes", ocr_bundle=bundle)
+
+        assert result.is_bill is True
+        assert result.reason == "ocr financial anchors"
+        mock_generate.assert_not_called()
+
+    def test_ocr_direct_negative_short_circuits_gemini(self):
+        bundle = _ocr_bundle("Happy birthday to you\nSee you tomorrow at the cafe", quality_score=0.9)
+
+        with patch("app.services.accounting.bill_classifier.gemini_client.generate_structured_content") as mock_generate:
+            result = classify_image(b"fake_image_bytes", ocr_bundle=bundle)
+
+        assert result.is_bill is False
+        assert result.reason == "ocr lacks financial anchors"
+        mock_generate.assert_not_called()
+
+    def test_ocr_ambiguous_falls_back_to_gemini(self, monkeypatch):
+        monkeypatch.setattr("app.services.gemini_client.settings.gemini_api_key", "fake_key")
+        expected = ClassificationResult(is_bill=True, reason="Gemini fallback", confidence=0.81)
+        bundle = _ocr_bundle("ABC\n123", quality_score=0.4)
+
+        with patch(
+            "app.services.accounting.bill_classifier.gemini_client.generate_structured_content",
+            return_value=expected,
+        ) as mock_generate:
+            result = classify_image(b"fake_image_bytes", mime_type="image/png", ocr_bundle=bundle)
+
+        assert result == expected
+        assert "OCR_TEXT" in mock_generate.call_args.kwargs["prompt"]
 
     def test_generation_error_propagates(self, monkeypatch):
         monkeypatch.setattr("app.services.gemini_client.settings.gemini_api_key", "fake_key")

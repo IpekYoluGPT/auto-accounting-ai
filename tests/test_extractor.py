@@ -6,8 +6,28 @@ from unittest.mock import ANY, patch
 
 import pytest
 
+from app.models.ocr import OCRMediaMetadata, OCRParseBundle
 from app.models.schemas import AIExtractionResult, AIMultiExtractionResult, BillRecord
 from app.services.accounting.gemini_extractor import _normalize_record, _parse_tr_number, extract_bill, extract_bills
+
+
+def _ocr_bundle(text: str, *, quality_score: float = 0.92) -> OCRParseBundle:
+    return OCRParseBundle(
+        text=text,
+        lines=[line for line in text.splitlines() if line],
+        quality_score=quality_score,
+        readability_score=quality_score,
+        text_char_count=len(text),
+        processor_used="form_parser",
+        metadata=OCRMediaMetadata(
+            mime_type="image/jpeg",
+            original_mime_type="image/jpeg",
+            byte_size=1024,
+            width=1200,
+            height=1600,
+            source_hash="ocr-hash",
+        ),
+    )
 
 
 class TestParseTrNumber:
@@ -166,6 +186,67 @@ class TestExtractBill:
             media_bytes=b"fake_image",
             mime_type="application/pdf",
         )
+
+    def test_direct_ocr_extraction_skips_gemini(self):
+        bundle = _ocr_bundle(
+            "ÖZTÜRK GIDA LTD. ŞTİ.\n"
+            "Tarih: 09.04.2026\n"
+            "Saat: 14:32\n"
+            "Fiş No: 004218\n"
+            "Ara Toplam: 1.250,00 TL\n"
+            "KDV %20: 250,00 TL\n"
+            "Genel Toplam: 1.500,00 TL\n"
+            "Ödeme: Nakit"
+        )
+
+        with patch("app.services.accounting.gemini_extractor.gemini_client.generate_structured_content") as mock_generate:
+            records = extract_bills(
+                b"fake_image",
+                mime_type="image/jpeg",
+                source_message_id="msg-ocr-1",
+                source_filename="receipt.jpg",
+                source_type="image",
+                ocr_bundle=bundle,
+            )
+
+        assert len(records) == 1
+        record = records[0]
+        assert record.company_name == "ÖZTÜRK GIDA LTD. ŞTİ."
+        assert record.document_date == "2026-04-09"
+        assert record.total_amount == pytest.approx(1500.0)
+        assert record.vat_amount == pytest.approx(250.0)
+        assert record.payment_method == "Nakit"
+        assert record.source_message_id == "msg-ocr-1"
+        mock_generate.assert_not_called()
+
+    def test_ocr_validation_uses_validation_model(self, monkeypatch):
+        monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
+        monkeypatch.setattr(
+            "app.services.accounting.gemini_extractor.settings.gemini_validation_model",
+            "gemini-2.5-pro-test",
+        )
+        bundle = _ocr_bundle("ABC\n123", quality_score=0.4)
+        expected = AIMultiExtractionResult(
+            documents=[AIExtractionResult(company_name="Fallback Corp", total_amount=50.0, currency="TRY")]
+        )
+
+        with patch(
+            "app.services.accounting.gemini_extractor.gemini_client.generate_structured_content",
+            return_value=expected,
+        ) as mock_generate:
+            records = extract_bills(
+                b"fake_image",
+                mime_type="image/jpeg",
+                source_message_id="msg-ocr-2",
+                source_filename="receipt.jpg",
+                source_type="image",
+                ocr_bundle=bundle,
+            )
+
+        assert len(records) == 1
+        assert records[0].company_name == "Fallback Corp"
+        assert mock_generate.call_args.kwargs["model"] == "gemini-2.5-pro-test"
+        assert "Deterministic OCR candidate" in mock_generate.call_args.kwargs["prompt"]
 
     def test_multi_document_extraction(self, monkeypatch):
         monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
