@@ -19,11 +19,6 @@ logger = get_logger(__name__)
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
-# Fallback model when the primary model returns 503 overload errors.
-# gemini-2.0-flash is no longer available to new API key users (returns 404).
-_FALLBACK_MODEL = "gemini-1.5-flash"
-
-
 @lru_cache(maxsize=4)
 def _build_client(api_key: str) -> genai.Client:
     """Create and memoize Gemini clients by API key."""
@@ -35,6 +30,22 @@ def get_client() -> genai.Client:
     if not settings.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured.")
     return _build_client(settings.gemini_api_key)
+
+
+def _fallback_models(primary_model: str) -> list[str]:
+    """Return configured fallback models in priority order, excluding the primary."""
+    candidates = [
+        settings.gemini_validation_model,
+        settings.gemini_extractor_model,
+        settings.gemini_classifier_model,
+    ]
+    unique_models: list[str] = []
+    for candidate in candidates:
+        model = (candidate or "").strip()
+        if not model or model == primary_model or model in unique_models:
+            continue
+        unique_models.append(model)
+    return unique_models
 
 
 def _call_model(
@@ -87,7 +98,8 @@ def generate_structured_content(
     """Generate structured JSON and validate it against a Pydantic schema.
 
     Retries up to 5 times with exponential backoff.
-    On 503 overload errors, automatically falls back to gemini-2.0-flash.
+    On upstream overload/quota errors, automatically tries the other configured
+    Gemini models before tenacity retries the original request.
     """
     contents: list[str | types.Part] = [prompt]
     if media_bytes is not None:
@@ -107,21 +119,21 @@ def generate_structured_content(
         )
     except Exception as exc:
         error_str = str(exc)
-        # On 503 overload, try fallback model immediately before tenacity retries
-        if "503" in error_str and model != _FALLBACK_MODEL:
-            logger.warning(
-                "Model %s returned 503 overload — trying fallback %s",
-                model,
-                _FALLBACK_MODEL,
-            )
-            try:
-                return _call_model(
-                    model=_FALLBACK_MODEL,
-                    contents=contents,
-                    response_schema=response_schema,
-                    thinking_level=thinking_level,
+        if any(token in error_str for token in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED")):
+            for fallback_model in _fallback_models(model):
+                logger.warning(
+                    "Model %s failed with upstream availability error — trying fallback %s",
+                    model,
+                    fallback_model,
                 )
-            except Exception as fallback_exc:
-                logger.warning("Fallback model also failed: %s", fallback_exc)
-                raise exc  # re-raise original so tenacity retries primary
+                try:
+                    return _call_model(
+                        model=fallback_model,
+                        contents=contents,
+                        response_schema=response_schema,
+                        thinking_level=thinking_level,
+                    )
+                except Exception as fallback_exc:
+                    logger.warning("Fallback model %s also failed: %s", fallback_model, fallback_exc)
+            raise exc  # re-raise original so tenacity retries primary
         raise

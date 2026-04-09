@@ -158,6 +158,8 @@ def react_to_message(message_id: str, reaction: str) -> dict[str, Any]:
             headers=_auth_headers(),
         )
         resp.raise_for_status()
+        if resp.status_code == 204 or not resp.content.strip():
+            return {"ok": True}
         return resp.json()
 
 

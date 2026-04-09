@@ -87,6 +87,10 @@ MSG_MEDIA_EMPTY_EXTRACTION = (
     "Belge algılandı ama okunabilir bilgi çıkarılamadı. "
     "Lütfen daha net bir fotoğraf gönderin."
 )
+MSG_MEDIA_TEMPORARY_UPSTREAM_ERROR = (
+    "Belge alındı ancak OCR/AI servisi şu anda yoğun veya geçici olarak erişilemiyor. "
+    "Lütfen 1-2 dakika sonra aynı görseli tekrar gönderin."
+)
 
 REACTION_PROCESSING = "⌛"
 REACTION_SUCCESS = "✅"
@@ -393,7 +397,7 @@ def _handle_media(
             route,
             send_text,
             send_reaction,
-            message=MSG_MEDIA_CLASSIFICATION_ERROR,
+            message=_message_for_media_exception(exc, MSG_MEDIA_CLASSIFICATION_ERROR),
             reason="media classification failed",
             outcome="classification_failed",
         )
@@ -430,7 +434,7 @@ def _handle_media(
             route,
             send_text,
             send_reaction,
-            message=MSG_MEDIA_CATEGORY_ERROR,
+            message=_message_for_media_exception(exc, MSG_MEDIA_CATEGORY_ERROR),
             reason="document type classification failed",
             outcome="category_failed",
         )
@@ -457,7 +461,7 @@ def _handle_media(
             route,
             send_text,
             send_reaction,
-            message=MSG_MEDIA_EXTRACTION_ERROR,
+            message=_message_for_media_exception(exc, MSG_MEDIA_EXTRACTION_ERROR),
             reason="bill extraction failed",
             outcome="extraction_failed",
         )
@@ -567,3 +571,21 @@ def _send_throttled_warning(
         return False
     _safe_send_text_message(route, text, reason=reason, send_text=send_text)
     return True
+
+
+def _message_for_media_exception(exc: Exception, default_message: str) -> str:
+    error = str(exc).lower()
+    if any(
+        token in error
+        for token in (
+            "503",
+            "429",
+            "unavailable",
+            "resource_exhausted",
+            "overload",
+            "timed out",
+            "timeout",
+        )
+    ):
+        return MSG_MEDIA_TEMPORARY_UPSTREAM_ERROR
+    return default_message

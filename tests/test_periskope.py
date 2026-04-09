@@ -180,6 +180,27 @@ def test_periskope_group_image_webhook_exports_and_reacts():
         assert react_mock.call_args_list[1].args == ("peri-msg-1", "✅")
 
 
+def test_periskope_react_to_message_accepts_204_empty_response(monkeypatch):
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json, headers):
+            request = httpx.Request("POST", url)
+            return httpx.Response(204, request=request, content=b"")
+
+    monkeypatch.setattr(periskope_service.settings, "periskope_api_key", "test-key")
+    monkeypatch.setattr(periskope_service.settings, "periskope_phone", "905000000000")
+    monkeypatch.setattr(periskope_service.httpx, "Client", lambda timeout: FakeClient())
+
+    result = periskope_service.react_to_message("peri-msg-1", "⌛")
+
+    assert result == {"ok": True}
+
+
 def test_periskope_webhook_rejects_invalid_signature():
     payload = _periskope_event(_periskope_image_message())
     client = TestClient(app)

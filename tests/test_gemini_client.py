@@ -69,3 +69,28 @@ def test_generate_structured_content_raises_when_parsed_missing(monkeypatch):
             response_schema=SampleSchema,
             thinking_level="low",
         )
+
+
+def test_generate_structured_content_uses_configured_fallback_model(monkeypatch):
+    calls: list[str] = []
+
+    def fake_call_model(*, model, contents, response_schema, thinking_level):
+        calls.append(model)
+        if model == "gemini-primary":
+            raise RuntimeError("503 UNAVAILABLE")
+        return SampleSchema(value=model)
+
+    monkeypatch.setattr(gemini_client, "_call_model", fake_call_model)
+    monkeypatch.setattr(gemini_client.settings, "gemini_validation_model", "gemini-2.5-pro")
+    monkeypatch.setattr(gemini_client.settings, "gemini_extractor_model", "gemini-primary")
+    monkeypatch.setattr(gemini_client.settings, "gemini_classifier_model", "gemini-primary")
+
+    result = gemini_client.generate_structured_content(
+        model="gemini-primary",
+        prompt="extract",
+        response_schema=SampleSchema,
+        thinking_level="low",
+    )
+
+    assert result == SampleSchema(value="gemini-2.5-pro")
+    assert calls == ["gemini-primary", "gemini-2.5-pro"]

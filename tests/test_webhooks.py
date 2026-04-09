@@ -444,6 +444,29 @@ def test_classification_failure_sends_error_and_writes_no_row():
         assert [call.args[2] for call in reaction_mock.call_args_list] == ["⌛", "⚠️"]
 
 
+def test_classification_failure_503_sends_temporary_upstream_message():
+    with TemporaryDirectory() as tmpdir:
+        client = TestClient(app)
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
+        ), patch(
+            "app.services.accounting.intake.bill_classifier.classify_image",
+            side_effect=RuntimeError("503 UNAVAILABLE"),
+        ), patch(
+            "app.routes.webhooks.whatsapp.send_text_message"
+        ) as send_mock, patch(
+            "app.routes.webhooks.whatsapp.send_reaction_message"
+        ) as reaction_mock:
+            response = client.post("/webhook", json=_image_payload("wamid-503-1"))
+
+        assert response.status_code == 200
+        assert _read_export_rows(tmpdir) == []
+        send_mock.assert_called_once()
+        assert "ocr/ai servisi" in send_mock.call_args.args[1].lower()
+        assert reaction_mock.call_count == 2
+        assert [call.args[2] for call in reaction_mock.call_args_list] == ["⌛", "⚠️"]
+
+
 def test_extraction_failure_sends_error_and_writes_no_row():
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)

@@ -105,7 +105,16 @@ def _process_with_processor(processor_id: str, media_bytes: bytes, mime_type: st
             },
             json=payload,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            response_text = response.text.strip()
+            if response_text:
+                raise RuntimeError(
+                    f"Document AI processor {processor_id} failed with "
+                    f"{response.status_code}: {response_text}"
+                ) from exc
+            raise
         return response.json()
 
 
