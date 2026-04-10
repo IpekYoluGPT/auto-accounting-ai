@@ -41,39 +41,39 @@ _TABS: dict[str, tuple[list[str], dict]] = {
     "🧾 Faturalar": (
         ["#", "Tarih", "Saat", "Firma Adı", "Vergi No", "Vergi Dairesi",
          "Fatura No", "KDVsiz Tutar", "KDV %", "KDV Tutarı", "GENEL TOPLAM",
-         "Ödeme Yöntemi", "Gider Kategorisi", "Açıklama", "Notlar", "📎 Belge"],
+         "Ödeme Yöntemi", "Gider Kategorisi", "Açıklama", "Notlar", "İşleme", "📎 Belge"],
         {"red": 0.16, "green": 0.38, "blue": 0.74},
     ),
     "💳 Dekontlar": (
         ["#", "Tarih", "Saat", "Banka / Firma", "Referans No",
-         "Gönderen", "Alıcı / Açıklama", "TUTAR", "Para Birimi", "Notlar", "📎 Belge"],
+         "Gönderen", "Alıcı / Açıklama", "TUTAR", "Para Birimi", "Notlar", "İşleme", "📎 Belge"],
         {"red": 0.13, "green": 0.55, "blue": 0.13},
     ),
     "⛽ Harcama Fişleri": (
         ["#", "Tarih", "Saat", "Firma", "Fiş No", "Vergi No",
          "KDVsiz", "KDV %", "KDV", "TOPLAM", "Ödeme", "Kategori",
-         "Açıklama", "Plaka", "📎 Belge"],
+         "Açıklama", "Plaka", "İşleme", "📎 Belge"],
         {"red": 0.90, "green": 0.49, "blue": 0.13},
     ),
     "📝 Çekler": (
         ["#", "Çek / Belge No", "Düzenleyen Firma", "Vergi No",
          "Lehdar (Alıcı)", "Vade Tarihi", "TUTAR", "Para Birimi",
-         "Açıklama", "📎 Belge"],
+         "Açıklama", "İşleme", "📎 Belge"],
         {"red": 0.76, "green": 0.09, "blue": 0.09},
     ),
     "💵 Elden Ödemeler": (
-        ["#", "Tarih", "Saat", "Alıcı / Açıklama", "TUTAR", "Para Birimi", "Kaydeden", "📎 Belge"],
+        ["#", "Tarih", "Saat", "Alıcı / Açıklama", "TUTAR", "Para Birimi", "Kaydeden", "İşleme", "📎 Belge"],
         {"red": 0.46, "green": 0.11, "blue": 0.64},
     ),
     "🏗️ Malzeme": (
         ["#", "Tarih", "Firma", "İrsaliye / Belge No", "Malzeme Cinsi",
          "Miktar", "Birim", "Teslim Yeri", "Plaka", "Tutar",
-         "Açıklama", "📎 Belge"],
+         "Açıklama", "İşleme", "📎 Belge"],
         {"red": 0.47, "green": 0.27, "blue": 0.08},
     ),
     "↩️ İadeler": (
         ["#", "Tarih", "Belge Türü", "Firma", "Belge No",
-         "TUTAR", "Para Birimi", "Açıklama", "📎 Belge"],
+         "TUTAR", "Para Birimi", "Açıklama", "İşleme", "📎 Belge"],
         {"red": 0.44, "green": 0.44, "blue": 0.44},
     ),
 }
@@ -153,6 +153,7 @@ _COL_WIDTHS: dict[str, int] = {
     "Açıklama": 260,
     "Alıcı / Açıklama": 240,
     "Notlar": 200,
+    "İşleme": 90,
     "Malzeme Cinsi": 220,
     "Teslim Yeri": 180,
     "Plaka": 75,
@@ -612,7 +613,16 @@ def upload_document(
 
         try:
             import io
-            from googleapiclient.http import MediaIoBaseUpload
+            try:
+                from googleapiclient.http import MediaIoBaseUpload
+            except ImportError:
+                # Keep mocked Drive uploads testable in environments that do not
+                # install the optional HTTP helper module.
+                class MediaIoBaseUpload:  # type: ignore[no-redef]
+                    def __init__(self, fd, mimetype: str, resumable: bool):
+                        self.fd = fd
+                        self.mimetype = mimetype
+                        self.resumable = resumable
 
             folder_id = _get_or_create_month_drive_folder()
             file_meta: dict = {"name": filename}
@@ -1429,7 +1439,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_l
             _safe(r.subtotal), _safe(r.vat_rate), _safe(r.vat_amount),
             _safe(r.total_amount),
             _safe(r.payment_method), _safe(r.expense_category),
-            _safe(r.description), _safe(r.notes),
+            _safe(r.description), _safe(r.notes), _safe(r.processing_method),
             _drive_cell(drive_link),
         ]
 
@@ -1443,7 +1453,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_l
             _safe(r.description),
             _safe(r.total_amount),
             _safe(r.currency or "TRY"),
-            _safe(r.notes),
+            _safe(r.notes), _safe(r.processing_method),
             _drive_cell(drive_link),
         ]
 
@@ -1464,7 +1474,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_l
             _safe(r.total_amount),
             _safe(r.payment_method), _safe(r.expense_category),
             _safe(r.description),
-            plaka,
+            plaka, _safe(r.processing_method),
             _drive_cell(drive_link),
         ]
 
@@ -1477,7 +1487,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_l
             _safe(r.document_date),
             _safe(r.total_amount),
             _safe(r.currency or "TRY"),
-            _safe(r.description),
+            _safe(r.description), _safe(r.processing_method),
             _drive_cell(drive_link),
         ]
 
@@ -1489,6 +1499,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_l
             _safe(r.total_amount),
             _safe(r.currency or "TRY"),
             _safe(r.source_sender_id),
+            _safe(r.processing_method),
             _drive_cell(drive_link),
         ]
 
@@ -1503,7 +1514,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_l
             _safe(r.notes),
             "",
             _safe(r.total_amount),
-            _safe(r.expense_category),
+            _safe(r.expense_category), _safe(r.processing_method),
             _drive_cell(drive_link),
         ]
 
@@ -1516,7 +1527,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_l
             _safe(r.document_number or r.invoice_number),
             _safe(r.total_amount),
             _safe(r.currency or "TRY"),
-            _safe(r.description),
+            _safe(r.description), _safe(r.processing_method),
             _drive_cell(drive_link),
         ]
 
@@ -1529,9 +1540,31 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_l
         _safe(r.subtotal), _safe(r.vat_rate), _safe(r.vat_amount),
         _safe(r.total_amount),
         _safe(r.payment_method), _safe(r.expense_category),
-        _safe(r.description), _safe(r.notes),
-        _safe(r.source_message_id),
+        _safe(r.description), _safe(r.notes), _safe(r.processing_method),
+        _drive_cell(drive_link),
     ]
+
+
+def reset_current_month_spreadsheet_data() -> int:
+    """Clear current-month sheet data while preserving headers, totals, and formatting."""
+    client = _get_client()
+    if client is None:
+        raise RuntimeError("Google Sheets client unavailable.")
+
+    with _lock:
+        sh = _get_or_create_spreadsheet(client)
+
+        for tab_name in _TABS:
+            ws = _ensure_tab_exists(sh, tab_name)
+            ws.clear()
+            if tab_name == "📊 Özet":
+                _setup_summary_tab(ws, _month_label())
+            else:
+                _setup_worksheet(ws, tab_name)
+
+        _mark_recently_prepared(sh)
+        logger.info("Reset current-month spreadsheet data for %s (sheet=%s).", _month_key(), sh.id)
+        return len(_TABS)
 
 
 def _next_seq(ws) -> int:

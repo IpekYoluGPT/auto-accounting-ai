@@ -177,6 +177,7 @@ class TestExtractBill:
         assert record.total_amount == 100.0
         assert record.expense_category == "Yemek"
         assert record.source_message_id == "msg_123"
+        assert record.processing_method == "LLM"
         assert record.confidence == pytest.approx(0.91)
         mock_generate.assert_called_once_with(
             model="gemini-test-extractor",
@@ -217,6 +218,7 @@ class TestExtractBill:
         assert record.vat_amount == pytest.approx(250.0)
         assert record.payment_method == "Nakit"
         assert record.source_message_id == "msg-ocr-1"
+        assert record.processing_method == "OCR"
         mock_generate.assert_not_called()
 
     def test_ocr_validation_uses_validation_model(self, monkeypatch):
@@ -245,6 +247,7 @@ class TestExtractBill:
 
         assert len(records) == 1
         assert records[0].company_name == "Fallback Corp"
+        assert records[0].processing_method == "LLM"
         assert mock_generate.call_args.kwargs["model"] == "gemini-2.5-pro-test"
         assert "Deterministic OCR candidate" in mock_generate.call_args.kwargs["prompt"]
 
@@ -294,6 +297,7 @@ class TestExtractBill:
         assert records[0].source_message_id == "msg_456__doc1"
         assert records[1].source_message_id == "msg_456__doc2"
         assert records[2].source_message_id == "msg_456__doc3"
+        assert all(record.processing_method == "LLM" for record in records)
 
     def test_generation_error_propagates(self, monkeypatch):
         monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")

@@ -312,6 +312,7 @@ def _handle_manager_text(
         source_group_id=route.group_id,
         source_chat_type=route.chat_type,
         source_type="manager_text",
+        processing_method="LLM",
         confidence=0.9,
     )
 

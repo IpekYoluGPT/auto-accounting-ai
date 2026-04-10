@@ -38,6 +38,7 @@ COLUMN_MAP: dict[str, str] = {
     "source_message_id": "Kaynak Mesaj ID",
     "source_filename": "Kaynak Dosya Adı",
     "source_type": "Kaynak Türü",
+    "processing_method": "İşleme",
     "source_sender_id": "Kaynak Gönderen ID",
     "source_group_id": "Kaynak Grup ID",
     "source_chat_type": "Sohbet Türü",

@@ -92,6 +92,7 @@ def _normalize_record(raw: dict) -> BillRecord:
         source_message_id=_safe_str(raw.get("source_message_id")),
         source_filename=_safe_str(raw.get("source_filename")),
         source_type=_safe_str(raw.get("source_type")),
+        processing_method=_safe_str(raw.get("processing_method")),
         confidence=_safe_float(raw.get("confidence")),
     )
 
@@ -139,6 +140,7 @@ def extract_bills(
                 source_group_id=source_group_id,
                 source_chat_type=source_chat_type,
             )
+            direct.processing_method = "OCR"
             return [direct]
 
         model_name = settings.gemini_validation_model
@@ -180,6 +182,7 @@ def extract_bills(
         record.source_sender_id = source_sender_id
         record.source_group_id = source_group_id
         record.source_chat_type = source_chat_type
+        record.processing_method = "LLM"
         records.append(record)
 
     logger.info(
