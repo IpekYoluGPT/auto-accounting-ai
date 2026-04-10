@@ -707,16 +707,22 @@ def _col_letter(idx: int) -> str:
     return result
 
 
+def _formula_arg_separator() -> str:
+    return ";"
+
+
 def _build_tab_total_formula(tab_name: str) -> str | None:
     total_col = _TAB_TOTAL_COLUMNS.get(tab_name)
     if not total_col:
         return None
-    return f"=IFERROR(SUM({total_col}3:{total_col}),0)"
+    sep = _formula_arg_separator()
+    return f"=IFERROR(SUM({total_col}3:{total_col}){sep}0)"
 
 
 def _build_summary_formula(tab_name: str) -> str:
     total_col = _TAB_TOTAL_COLUMNS[tab_name]
-    return f"=IFERROR('{tab_name}'!{total_col}2,0)"
+    sep = _formula_arg_separator()
+    return f"=IFERROR('{tab_name}'!{total_col}2{sep}0)"
 
 
 def _total_row_values(tab_name: str) -> list[str]:
@@ -982,10 +988,46 @@ def _ensure_tab_total_row(ws, tab_name: str) -> None:
     ws.freeze(rows=2)
 
 
+def _repair_drive_link_formulas(ws, tab_name: str) -> None:
+    drive_col = _drive_column_letter(tab_name)
+    try:
+        values = ws.get(
+            f"{drive_col}3:{drive_col}",
+            value_render_option="FORMULA",
+        )
+    except Exception:
+        return
+
+    repaired = 0
+    separator = _formula_arg_separator()
+    for row_number, row in enumerate(values, start=3):
+        formula = row[0] if row else ""
+        if not formula or not formula.startswith('=HYPERLINK("'):
+            continue
+        if f'"{separator}"' in formula:
+            continue
+        if '","' not in formula:
+            continue
+
+        fixed_formula = formula.replace('","', f'"{separator}"', 1)
+        _retry_on_rate_limit(
+            lambda fixed_formula=fixed_formula, row_number=row_number: ws.update(
+                [[fixed_formula]],
+                f"{drive_col}{row_number}",
+                value_input_option="USER_ENTERED",
+            )
+        )
+        repaired += 1
+
+    if repaired:
+        logger.info("Repaired %d Drive link formula(s) on '%s'.", repaired, tab_name)
+
+
 def _repair_monthly_spreadsheet_layout(sh) -> None:
     for tab_name in list(_TABS.keys())[1:]:
         ws = _ensure_tab_exists(sh, tab_name)
         _ensure_tab_total_row(ws, tab_name)
+        _repair_drive_link_formulas(ws, tab_name)
 
     summary_ws = _ensure_tab_exists(sh, "📊 Özet")
     _setup_summary_tab(summary_ws, _month_label())
@@ -1012,7 +1054,13 @@ def _create_and_setup_spreadsheet(client, title: str) -> str:
     using_oauth = sheets_svc is oauth_sheets
 
     result = sheets_svc.spreadsheets().create(
-        body={"properties": {"title": title}},
+        body={
+            "properties": {
+                "title": title,
+                "locale": "tr_TR",
+                "timeZone": settings.business_timezone,
+            }
+        },
         fields="spreadsheetId",
     ).execute()
     sheet_id = result["spreadsheetId"]
@@ -1364,7 +1412,8 @@ def _drive_column_letter(tab_name: str) -> str:
 def _drive_cell(drive_link: Optional[str]) -> str:
     """Return a HYPERLINK formula if we have a link, otherwise empty string."""
     if drive_link:
-        return f'=HYPERLINK("{drive_link}","📄 Görüntüle")'
+        sep = _formula_arg_separator()
+        return f'=HYPERLINK("{drive_link}"{sep}"📄 Görüntüle")'
     return ""
 
 

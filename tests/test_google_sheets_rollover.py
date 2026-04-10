@@ -27,8 +27,8 @@ def test_next_month_rollover_boundary_uses_configured_timezone():
 
 
 def test_tab_total_and_summary_formulas_use_dedicated_total_cells():
-    assert google_sheets._build_tab_total_formula("🧾 Faturalar") == "=IFERROR(SUM(K3:K),0)"
-    assert google_sheets._build_summary_formula("🧾 Faturalar") == "=IFERROR('🧾 Faturalar'!K2,0)"
+    assert google_sheets._build_tab_total_formula("🧾 Faturalar") == "=IFERROR(SUM(K3:K);0)"
+    assert google_sheets._build_summary_formula("🧾 Faturalar") == "=IFERROR('🧾 Faturalar'!K2;0)"
 
 
 def test_month_drive_folder_name_uses_fisler_prefix():
@@ -54,7 +54,7 @@ def test_ensure_tab_total_row_inserts_row_when_existing_data_starts_on_row_two()
 
     ws.insert_row.assert_called_once()
     ws.update.assert_called_once_with(
-        [["TOPLAM", "", "", "", "", "", "", "", "", "", "=IFERROR(SUM(K3:K),0)", "", "", "", "", ""]],
+        [["TOPLAM", "", "", "", "", "", "", "", "", "", "=IFERROR(SUM(K3:K);0)", "", "", "", "", ""]],
         "A2",
         value_input_option="USER_ENTERED",
     )
@@ -75,8 +75,68 @@ def test_elden_odeme_row_includes_drive_verification_cell():
         drive_link="https://drive.google.com/file/d/example/view",
     )
 
-    assert row[-1] == '=HYPERLINK("https://drive.google.com/file/d/example/view","📄 Görüntüle")'
+    assert row[-1] == '=HYPERLINK("https://drive.google.com/file/d/example/view";"📄 Görüntüle")'
     assert google_sheets._TABS["💵 Elden Ödemeler"][0][-1] == "📎 Belge"
+
+
+def test_repair_drive_link_formulas_rewrites_old_comma_separator():
+    ws = MagicMock()
+    ws.get.return_value = [
+        ['=HYPERLINK("https://drive.google.com/file/d/a/view","📄 Görüntüle")'],
+        ['=HYPERLINK("https://drive.google.com/file/d/b/view";"📄 Görüntüle")'],
+        [""],
+    ]
+
+    google_sheets._repair_drive_link_formulas(ws, "💳 Dekontlar")
+
+    ws.update.assert_called_once_with(
+        [['=HYPERLINK("https://drive.google.com/file/d/a/view";"📄 Görüntüle")']],
+        "K3",
+        value_input_option="USER_ENTERED",
+    )
+
+
+def test_create_spreadsheet_sets_turkish_locale_and_timezone():
+    client = MagicMock()
+    spreadsheet = MagicMock()
+    client.open_by_key.return_value = spreadsheet
+
+    create_execute = MagicMock(return_value={"spreadsheetId": "sheet-123"})
+    create_call = MagicMock(return_value=MagicMock(execute=create_execute))
+    sheets_service = MagicMock()
+    sheets_service.spreadsheets.return_value.create = create_call
+
+    with patch(
+        "app.services.providers.google_sheets._get_oauth_sheets_service",
+        return_value=sheets_service,
+    ), patch(
+        "app.services.providers.google_sheets._get_sheets_service",
+        return_value=None,
+    ), patch(
+        "app.services.providers.google_sheets._get_oauth_drive_service",
+        return_value=None,
+    ), patch(
+        "app.services.providers.google_sheets._get_drive_service",
+        return_value=None,
+    ), patch(
+        "app.services.providers.google_sheets.settings.google_drive_parent_folder_id",
+        "",
+    ), patch(
+        "app.services.providers.google_sheets._bootstrap_spreadsheet_tabs",
+    ):
+        sheet_id = google_sheets._create_and_setup_spreadsheet(client, "Muhasebe — Nisan 2026")
+
+    assert sheet_id == "sheet-123"
+    create_call.assert_called_once_with(
+        body={
+            "properties": {
+                "title": "Muhasebe — Nisan 2026",
+                "locale": "tr_TR",
+                "timeZone": "Europe/Istanbul",
+            }
+        },
+        fields="spreadsheetId",
+    )
 
 
 def test_get_or_create_spreadsheet_creates_new_month_without_overwriting_old_registry():

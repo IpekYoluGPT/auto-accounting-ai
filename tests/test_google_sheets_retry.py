@@ -257,7 +257,7 @@ def test_process_pending_document_uploads_backfills_missing_drive_links(tmp_path
     fake_client.open_by_key.assert_called_once_with("sheet-123")
     fake_sheet.worksheet.assert_called_once_with("💳 Dekontlar")
     fake_ws.update.assert_called_once_with(
-        [['=HYPERLINK("https://drive.google.com/file/d/pending/view","📄 Görüntüle")']],
+        [['=HYPERLINK("https://drive.google.com/file/d/pending/view";"📄 Görüntüle")']],
         "K7",
         value_input_option="USER_ENTERED",
     )
