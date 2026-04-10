@@ -7,6 +7,7 @@ from __future__ import annotations
 import ssl
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -210,3 +211,56 @@ def test_upload_document_serializes_concurrent_drive_requests(monkeypatch):
         "https://drive.google.com/file/d/test/view",
     ]
     assert state["max_active"] == 1
+
+
+def test_process_pending_document_uploads_backfills_missing_drive_links(tmp_path, monkeypatch):
+    monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
+    monkeypatch.setattr(
+        google_sheets,
+        "start_pending_drive_upload_worker",
+        lambda: None,
+    )
+
+    target = {
+        "spreadsheet_id": "sheet-123",
+        "tab_name": "💳 Dekontlar",
+        "row_number": 7,
+    }
+    google_sheets.queue_pending_document_upload(
+        file_bytes=b"pending-payload",
+        filename="Dekont.pdf",
+        mime_type="application/pdf",
+        targets=[target],
+        source_message_id="wamid-pending-1",
+    )
+
+    fake_ws = MagicMock()
+    fake_sheet = MagicMock()
+    fake_sheet.worksheet.return_value = fake_ws
+    fake_client = MagicMock()
+    fake_client.open_by_key.return_value = fake_sheet
+
+    monkeypatch.setattr(
+        google_sheets,
+        "_get_client",
+        lambda: fake_client,
+    )
+    monkeypatch.setattr(
+        google_sheets,
+        "upload_document",
+        lambda file_bytes, filename, mime_type: "https://drive.google.com/file/d/pending/view",
+    )
+
+    processed = google_sheets.process_pending_document_uploads()
+
+    assert processed == 1
+    fake_client.open_by_key.assert_called_once_with("sheet-123")
+    fake_sheet.worksheet.assert_called_once_with("💳 Dekontlar")
+    fake_ws.update.assert_called_once_with(
+        [['=HYPERLINK("https://drive.google.com/file/d/pending/view","📄 Görüntüle")']],
+        "K7",
+        value_input_option="USER_ENTERED",
+    )
+    assert google_sheets._load_pending_drive_uploads() == []
+    payload_files = list((Path(tmp_path) / "state" / "pending_drive_uploads").glob("*"))
+    assert payload_files == []

@@ -21,6 +21,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.config import settings
@@ -178,6 +179,7 @@ _AMOUNT_COLUMNS = {
 
 _lock = threading.Lock()
 _drive_upload_lock = threading.Lock()
+_pending_drive_uploads_lock = threading.Lock()
 _gspread_client = None  # lazy-initialised
 _drive_service = None   # lazy-initialised (service account)
 _sheets_service = None  # lazy-initialised (Sheets API v4, service account)
@@ -192,8 +194,11 @@ _oauth_sheets_service = None
 _rollover_thread: threading.Thread | None = None
 _rollover_stop_event: threading.Event | None = None
 _rollover_lock = threading.Lock()
+_pending_drive_worker_thread: threading.Thread | None = None
+_pending_drive_worker_lock = threading.Lock()
 _recently_prepared_spreadsheets: dict[str, float] = {}
 _RECENT_PREPARED_TTL_SECONDS = 180.0
+_PENDING_DRIVE_WORKER_DELAY_SECONDS = 15.0
 
 
 def _get_business_timezone():
@@ -643,6 +648,18 @@ def upload_document(
 def _registry_path() -> Path:
     path = Path(settings.storage_dir) / "state" / "sheets_registry.json"
     path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _pending_drive_uploads_state_path() -> Path:
+    path = Path(settings.storage_dir) / "state" / "pending_drive_uploads.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _pending_drive_uploads_dir() -> Path:
+    path = Path(settings.storage_dir) / "state" / "pending_drive_uploads"
+    path.mkdir(parents=True, exist_ok=True)
     return path
 
 
@@ -1339,6 +1356,11 @@ def _safe(v) -> str:
     return str(v)
 
 
+def _drive_column_letter(tab_name: str) -> str:
+    headers, _ = _TABS[tab_name]
+    return _col_letter(len(headers) - 1)
+
+
 def _drive_cell(drive_link: Optional[str]) -> str:
     """Return a HYPERLINK formula if we have a link, otherwise empty string."""
     if drive_link:
@@ -1480,6 +1502,170 @@ def _next_seq(ws) -> int:
         return 1
 
 
+def _build_drive_link_target(*, spreadsheet_id: str, tab_name: str, row_number: int) -> dict[str, str | int]:
+    return {
+        "spreadsheet_id": str(spreadsheet_id),
+        "tab_name": tab_name,
+        "row_number": int(row_number),
+    }
+
+
+def _load_pending_drive_uploads() -> list[dict]:
+    path = _pending_drive_uploads_state_path()
+    if not path.exists():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return raw if isinstance(raw, list) else []
+
+
+def _save_pending_drive_uploads(items: list[dict]) -> None:
+    _pending_drive_uploads_state_path().write_text(
+        json.dumps(items, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _write_drive_link_to_target(target: dict[str, str | int], drive_link: str) -> None:
+    client = _get_client()
+    if client is None:
+        raise RuntimeError("Google Sheets client unavailable for pending Drive link backfill.")
+
+    spreadsheet_id = str(target["spreadsheet_id"])
+    tab_name = str(target["tab_name"])
+    row_number = int(target["row_number"])
+    cell_a1 = f"{_drive_column_letter(tab_name)}{row_number}"
+
+    sh = client.open_by_key(spreadsheet_id)
+    ws = sh.worksheet(tab_name)
+    _retry_on_rate_limit(
+        lambda: ws.update([[_drive_cell(drive_link)]], cell_a1, value_input_option="USER_ENTERED")
+    )
+
+
+def queue_pending_document_upload(
+    *,
+    file_bytes: bytes,
+    filename: str,
+    mime_type: str,
+    targets: list[dict[str, str | int]],
+    source_message_id: str | None = None,
+) -> None:
+    if not targets:
+        return
+
+    pending_id = uuid4().hex
+    payload_path = _pending_drive_uploads_dir() / f"{pending_id}.bin"
+    payload_path.write_bytes(file_bytes)
+
+    item = {
+        "id": pending_id,
+        "filename": filename,
+        "mime_type": mime_type,
+        "payload_path": str(payload_path),
+        "targets": targets,
+        "source_message_id": source_message_id or "",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "attempts": 0,
+    }
+
+    with _pending_drive_uploads_lock:
+        items = _load_pending_drive_uploads()
+        items.append(item)
+        _save_pending_drive_uploads(items)
+
+    logger.warning(
+        "Queued pending Drive upload for message id=%s with %d target cell(s).",
+        source_message_id,
+        len(targets),
+    )
+    start_pending_drive_upload_worker()
+
+
+def process_pending_document_uploads(*, max_items: int | None = None) -> int:
+    processed = 0
+
+    while True:
+        if max_items is not None and processed >= max_items:
+            break
+
+        with _pending_drive_uploads_lock:
+            items = _load_pending_drive_uploads()
+            if not items:
+                break
+            item = items.pop(0)
+            _save_pending_drive_uploads(items)
+
+        payload_path = Path(str(item.get("payload_path", "")))
+        if not payload_path.exists():
+            logger.warning(
+                "Dropping pending Drive upload id=%s because payload is missing: %s",
+                item.get("id"),
+                payload_path,
+            )
+            continue
+
+        try:
+            drive_link = upload_document(
+                payload_path.read_bytes(),
+                filename=str(item.get("filename") or payload_path.name),
+                mime_type=str(item.get("mime_type") or "application/octet-stream"),
+            )
+            if not drive_link:
+                raise RuntimeError("Drive upload returned no link.")
+
+            for target in item.get("targets", []):
+                _write_drive_link_to_target(target, drive_link)
+
+            payload_path.unlink(missing_ok=True)
+            processed += 1
+            logger.info(
+                "Backfilled pending Drive link for message id=%s into %d sheet cell(s).",
+                item.get("source_message_id") or "?",
+                len(item.get("targets", [])),
+            )
+        except Exception as exc:
+            item["attempts"] = int(item.get("attempts", 0)) + 1
+            item["last_error"] = str(exc)
+            with _pending_drive_uploads_lock:
+                items = _load_pending_drive_uploads()
+                items.append(item)
+                _save_pending_drive_uploads(items)
+            logger.warning(
+                "Pending Drive upload retry failed for message id=%s: %s",
+                item.get("source_message_id") or "?",
+                exc,
+            )
+            break
+
+    return processed
+
+
+def _pending_drive_upload_worker() -> None:
+    try:
+        time.sleep(_PENDING_DRIVE_WORKER_DELAY_SECONDS)
+        process_pending_document_uploads()
+    except Exception as exc:
+        logger.warning("Pending Drive upload worker stopped after error: %s", exc)
+
+
+def start_pending_drive_upload_worker() -> None:
+    global _pending_drive_worker_thread
+
+    with _pending_drive_worker_lock:
+        if _pending_drive_worker_thread is not None and _pending_drive_worker_thread.is_alive():
+            return
+
+        _pending_drive_worker_thread = threading.Thread(
+            target=_pending_drive_upload_worker,
+            name="google-sheets-pending-drive-upload",
+            daemon=True,
+        )
+        _pending_drive_worker_thread.start()
+
+
 # ─── Public interface ─────────────────────────────────────────────────────────
 
 
@@ -1488,7 +1674,7 @@ def append_record(
     category: DocumentCategory,
     is_return: bool = False,
     drive_link: Optional[str] = None,
-) -> None:
+) -> list[dict[str, str | int]]:
     """
     Append *record* to the correct Google Sheets tab for *category*.
 
@@ -1499,20 +1685,29 @@ def append_record(
     """
     client = _get_client()
     if client is None:
-        return
+        return []
 
     with _lock:
         try:
             sh = _get_or_create_spreadsheet(client)
+            appended_targets: list[dict[str, str | int]] = []
 
             # Each spreadsheet is already monthly ("Muhasebe — Nisan 2026"),
             # so tabs use base names directly (e.g. "🧾 Faturalar").
             tab_name = _CATEGORY_TAB.get(category, "🧾 Faturalar")
             ws = _ensure_tab_exists(sh, tab_name)
             seq = _next_seq(ws)
+            row_number = len(ws.col_values(1)) + 1
             row = _build_row(record, category, seq, drive_link=drive_link)
             _retry_on_rate_limit(
                 lambda: ws.append_row(row, value_input_option="USER_ENTERED")
+            )
+            appended_targets.append(
+                _build_drive_link_target(
+                    spreadsheet_id=sh.id,
+                    tab_name=tab_name,
+                    row_number=row_number,
+                )
             )
             logger.info("Appended row #%d to '%s'.", seq, tab_name)
 
@@ -1520,11 +1715,21 @@ def append_record(
             if is_return and tab_name != "↩️ İadeler":
                 iade_ws = _ensure_tab_exists(sh, "↩️ İadeler")
                 iade_seq = _next_seq(iade_ws)
+                iade_row_number = len(iade_ws.col_values(1)) + 1
                 iade_row = _build_row(record, DocumentCategory.IADE, iade_seq, drive_link=drive_link)
                 _retry_on_rate_limit(
                     lambda: iade_ws.append_row(iade_row, value_input_option="USER_ENTERED")
                 )
+                appended_targets.append(
+                    _build_drive_link_target(
+                        spreadsheet_id=sh.id,
+                        tab_name="↩️ İadeler",
+                        row_number=iade_row_number,
+                    )
+                )
                 logger.info("Also logged iade row #%d.", iade_seq)
+
+            return appended_targets
 
         except Exception as exc:
             logger.error(
@@ -1534,6 +1739,7 @@ def append_record(
                 exc,
                 exc_info=True,
             )
+            return []
 
 
 def ensure_current_month_spreadsheet_ready() -> None:

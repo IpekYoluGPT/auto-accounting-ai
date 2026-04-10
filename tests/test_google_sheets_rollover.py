@@ -124,6 +124,8 @@ def test_app_startup_prepares_current_month_sheet_and_scheduler():
     with patch(
         "app.main.google_sheets.ensure_current_month_spreadsheet_ready"
     ) as ensure_mock, patch(
+        "app.main.google_sheets.process_pending_document_uploads"
+    ) as pending_mock, patch(
         "app.main.google_sheets.start_monthly_rollover_scheduler"
     ) as start_mock, patch(
         "app.main.google_sheets.stop_monthly_rollover_scheduler"
@@ -132,6 +134,7 @@ def test_app_startup_prepares_current_month_sheet_and_scheduler():
             pass
 
     ensure_mock.assert_called_once_with()
+    pending_mock.assert_called_once_with()
     start_mock.assert_called_once_with()
     stop_mock.assert_called_once_with()
 

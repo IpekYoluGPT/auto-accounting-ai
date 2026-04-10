@@ -26,6 +26,7 @@ logger = get_logger(__name__)
 async def lifespan(app: FastAPI):
     logger.info("Auto Accounting AI started.")
     google_sheets.ensure_current_month_spreadsheet_ready()
+    google_sheets.process_pending_document_uploads()
     google_sheets.start_monthly_rollover_scheduler()
     try:
         yield

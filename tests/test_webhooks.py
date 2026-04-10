@@ -280,6 +280,62 @@ def test_group_image_webhook_reacts_to_group_and_exports_group_metadata():
         assert reaction_mock.call_args_list[0].kwargs["recipient_type"] == "group"
 
 
+def test_image_webhook_queues_pending_drive_backfill_when_upload_fails():
+    record = BillRecord(
+        company_name="ABC Market",
+        total_amount=100.0,
+        currency="TRY",
+        source_message_id="wamid-1",
+        source_filename="media-1.jpg",
+        source_type="image",
+        confidence=0.91,
+    )
+    pending_targets = [
+        {
+            "spreadsheet_id": "sheet-123",
+            "tab_name": "🧾 Faturalar",
+            "row_number": 3,
+        }
+    ]
+
+    with TemporaryDirectory() as tmpdir:
+        client = TestClient(app)
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
+        ), patch(
+            "app.services.accounting.intake.bill_classifier.classify_image",
+            return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
+        ), patch(
+            "app.services.accounting.intake.doc_classifier.classify_document_type",
+            return_value=(DocumentCategory.FATURA, False),
+        ), patch(
+            "app.services.accounting.intake.gemini_extractor.extract_bills",
+            return_value=[record],
+        ), patch(
+            "app.services.accounting.intake.google_sheets.upload_document",
+            return_value=None,
+        ), patch(
+            "app.services.accounting.intake.google_sheets.append_record",
+            return_value=pending_targets,
+        ), patch(
+            "app.services.accounting.intake.google_sheets.queue_pending_document_upload",
+        ) as queue_mock, patch(
+            "app.routes.webhooks.whatsapp.send_text_message"
+        ) as send_mock, patch(
+            "app.routes.webhooks.whatsapp.send_reaction_message"
+        ) as reaction_mock:
+            response = client.post("/webhook", json=_image_payload())
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+        assert len(_read_export_rows(tmpdir)) == 1
+        send_mock.assert_not_called()
+        assert reaction_mock.call_count == 2
+        queue_mock.assert_called_once()
+        assert queue_mock.call_args.kwargs["targets"] == pending_targets
+        assert queue_mock.call_args.kwargs["source_message_id"] == "wamid-1"
+
+
 def test_bill_like_text_prompts_for_photo():
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
