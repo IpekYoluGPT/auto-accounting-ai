@@ -169,8 +169,8 @@ Degisken adlari kisa olabilir; Google Cloud tarafindaki processor "Name" alani i
 | Degisken | Aciklama | Varsayilan |
 |----------|----------|------------|
 | `GEMINI_CLASSIFIER_MODEL` | Siniflandirma modeli | `gemini-2.5-flash` |
-| `GEMINI_EXTRACTOR_MODEL` | Cikarim modeli | `gemini-2.5-flash` |
-| `GEMINI_VALIDATION_MODEL` | OCR fallback / validation modeli | `gemini-2.5-pro` |
+| `GEMINI_EXTRACTOR_MODEL` | Cikarim modeli | `gemini-3.1-pro-preview` |
+| `GEMINI_VALIDATION_MODEL` | OCR fallback / validation modeli | `gemini-3.1-pro-preview` |
 | `MANAGER_PHONE_NUMBER` | Elden odeme icin yonetici telefon numarasi | *(bos)* |
 | `WHATSAPP_GROUPS_ONLY` | Sadece grup mesajlarini isle | `true` |
 | `STORAGE_DIR` | Dosya depolama dizini | `./storage` |

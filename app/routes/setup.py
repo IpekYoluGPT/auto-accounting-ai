@@ -10,10 +10,12 @@ user's real Google account — something service accounts cannot do.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import BaseModel
 
 from app.config import settings
+from app.services.providers import google_sheets
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -27,6 +29,26 @@ _SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+
+
+class ResetSheetRequest(BaseModel):
+    spreadsheet_id: str | None = None
+
+
+def _verify_admin_token(request: Request) -> None:
+    expected = settings.periskope_tool_token.strip()
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="PERISKOPE_TOOL_TOKEN is not configured.",
+        )
+
+    auth_header = request.headers.get("authorization", "")
+    api_key_header = request.headers.get("x-api-key", "")
+    if auth_header == f"Bearer {expected}" or api_key_header == expected:
+        return
+
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid tool token.")
 
 
 def _get_redirect_uri(request: Request) -> str:
@@ -182,3 +204,18 @@ async def google_auth_callback(
         """,
         status_code=200,
     )
+
+
+@router.post("/reset-sheet")
+async def reset_sheet(request: Request, payload: ResetSheetRequest) -> dict[str, object]:
+    """Authenticated helper to clear test rows from the target spreadsheet."""
+    _verify_admin_token(request)
+
+    reset_count = google_sheets.reset_current_month_spreadsheet_data(
+        spreadsheet_id=payload.spreadsheet_id,
+    )
+    return {
+        "status": "ok",
+        "spreadsheet_id": payload.spreadsheet_id or settings.google_sheets_spreadsheet_id,
+        "tabs_reset": reset_count,
+    }

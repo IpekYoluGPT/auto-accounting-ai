@@ -1558,14 +1558,14 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_l
     ]
 
 
-def reset_current_month_spreadsheet_data() -> int:
+def reset_current_month_spreadsheet_data(*, spreadsheet_id: Optional[str] = None) -> int:
     """Clear current-month sheet data while preserving headers, totals, and formatting."""
     client = _get_client()
     if client is None:
         raise RuntimeError("Google Sheets client unavailable.")
 
     with _lock:
-        sh = _get_or_create_spreadsheet(client)
+        sh = client.open_by_key(spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
 
         for tab_name in _TABS:
             ws = _ensure_tab_exists(sh, tab_name)
@@ -1914,7 +1914,7 @@ def ensure_summary_tab_exists(spreadsheet_id: Optional[str] = None) -> None:
     if client is None:
         return
     try:
-        sh = _get_or_create_spreadsheet(client)
+        sh = client.open_by_key(spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
         _repair_monthly_spreadsheet_layout(sh)
         logger.info("📊 Özet tab ensured.")
     except Exception as exc:
