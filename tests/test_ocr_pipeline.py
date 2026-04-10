@@ -4,7 +4,7 @@ Tests for OCR preparation and deterministic extraction helpers.
 
 from unittest.mock import patch
 
-from app.models.ocr import OCRMediaMetadata, OCRParseBundle
+from app.models.ocr import OCRKeyValue, OCRMediaMetadata, OCRParseBundle, OCRTable, OCRTableCell
 from app.models.schemas import DocumentCategory
 from app.services.accounting import ocr
 
@@ -25,6 +25,27 @@ def _bundle(text: str, *, quality_score: float = 0.9) -> OCRParseBundle:
             height=1400,
             source_hash="hash1",
         ),
+    )
+
+
+def _table(rows: list[list[str]]) -> OCRTable:
+    cells: list[OCRTableCell] = []
+    for row_index, row in enumerate(rows):
+        for column_index, text in enumerate(row):
+            cells.append(
+                OCRTableCell(
+                    row_index=row_index,
+                    column_index=column_index,
+                    text=text,
+                    confidence=0.9,
+                )
+            )
+    return OCRTable(
+        page_number=1,
+        row_count=len(rows),
+        column_count=max((len(row) for row in rows), default=0),
+        cells=cells,
+        confidence=0.9,
     )
 
 
@@ -81,3 +102,65 @@ def test_assess_extraction_flags_multi_document_images():
 
     assert assessment.multi_document_suspected is True
     assert assessment.use_direct is False
+
+
+def test_detect_bill_from_ocr_accepts_material_slip_anchors():
+    bundle = _bundle(
+        "SOMAY PETROL SAN. VE TİC. LTD. ŞTİ.\n"
+        "VERESİYE SATIŞ SENEDİ\n"
+        "Miktarı\n"
+        "Malın Cinsi\n"
+        "Tutarı\n"
+        "Teslim Alan\n"
+        "1200\n"
+        "2300\n"
+        "4500"
+    )
+
+    assert ocr.detect_bill_from_ocr(bundle) is True
+
+
+def test_assess_extraction_sums_material_slip_table_total():
+    bundle = _bundle(
+        "SOMAY PETROL SAN. VE TİC. LTD. ŞTİ.\n"
+        "VERESİYE SATIŞ SENEDİ\n"
+        "No: 08979\n"
+        "Teslim Alan",
+    )
+    bundle.tables = [
+        _table(
+            [
+                ["Miktarı", "Malın Cinsi", "Fiyat", "Tutarı"],
+                ["300", "2m Mastar", "", "1200"],
+                ["100", "25 cm Pn16", "", "2300"],
+                ["100", "Sac 1.5", "", "1000"],
+                ["", "", "", "4500"],
+            ]
+        )
+    ]
+
+    assessment = ocr.assess_extraction(bundle, category_hint=DocumentCategory.MALZEME)
+
+    assert assessment.use_direct is True
+    assert assessment.record.company_name == "SOMAY PETROL SAN. VE TİC. LTD. ŞTİ."
+    assert assessment.record.document_number == "08979"
+    assert assessment.record.total_amount == 4500.0
+
+
+def test_assess_extraction_accepts_dekont_party_key_value():
+    bundle = _bundle(
+        "Banka Dekontu\n"
+        "Tarih: 09.04.2026\n"
+        "İşlem Tutarı: 1.500,00 TL\n"
+        "Açıklama: Kira ödemesi"
+    )
+    bundle.key_values = [
+        OCRKeyValue(key="Alıcı Adı", value="ÖZTÜRK GIDA LTD. ŞTİ.", confidence=0.93),
+    ]
+
+    assessment = ocr.assess_extraction(bundle, category_hint=DocumentCategory.ODEME_DEKONTU)
+
+    assert assessment.use_direct is True
+    assert assessment.record.company_name == "ÖZTÜRK GIDA LTD. ŞTİ."
+    assert assessment.record.total_amount == 1500.0
+    assert assessment.record.document_date == "2026-04-09"

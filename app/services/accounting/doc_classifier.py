@@ -109,11 +109,6 @@ def classify_document_type(
         Tuple of (DocumentCategory, is_return).
         Falls back to (BELIRSIZ, False) on any error.
     """
-    logger.info(
-        "Classifying document type with Gemini %s (%d bytes)",
-        settings.gemini_classifier_model,
-        len(image_bytes),
-    )
     if ocr_bundle is not None:
         detected_category, is_return = ocr.detect_category_from_ocr(ocr_bundle)
         if detected_category is not None:
@@ -123,6 +118,12 @@ def classify_document_type(
                 is_return,
             )
             return detected_category, is_return
+
+    logger.info(
+        "Classifying document type with Gemini %s (%d bytes)",
+        settings.gemini_classifier_model,
+        len(image_bytes),
+    )
 
     try:
         prompt = _CATEGORY_PROMPT

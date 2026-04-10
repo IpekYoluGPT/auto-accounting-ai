@@ -51,12 +51,14 @@ _CATEGORY_PATTERNS: tuple[tuple[DocumentCategory, re.Pattern[str]], ...] = (
     (DocumentCategory.IADE, re.compile(r"\biade\b|iptal|return", re.IGNORECASE)),
     (DocumentCategory.CEK, re.compile(r"\bçek\b|\bcek\b", re.IGNORECASE)),
     (DocumentCategory.ODEME_DEKONTU, re.compile(r"dekont|eft|fast|havale|iban|banka", re.IGNORECASE)),
-    (DocumentCategory.MALZEME, re.compile(r"irsaliye|sevk|teslim|hafriyat|malzeme", re.IGNORECASE)),
+    (DocumentCategory.MALZEME, re.compile(r"irsaliye|sevk|teslim|hafriyat|malzeme|veresiye|sat[ıi]ş\s+senedi|satis\s+senedi", re.IGNORECASE)),
     (DocumentCategory.FATURA, re.compile(r"e[\s-]*fatura|\bfatura\b|invoice", re.IGNORECASE)),
     (DocumentCategory.HARCAMA_FISI, re.compile(r"fi[şs]|pos|yazar\s*kasa|ökc|yakıt|market", re.IGNORECASE)),
 )
 _BILL_ANCHORS = re.compile(
-    r"\bfatura\b|fi[şs]|makbuz|dekont|irsaliye|çek|cek|kdv|vergi|toplam|ara toplam|genel toplam|ödeme|payment|receipt|invoice",
+    r"\bfatura\b|fi[şs]|makbuz|dekont|irsaliye|çek|cek|kdv|vergi|toplam|ara toplam|genel toplam|"
+    r"ödeme|payment|receipt|invoice|veresiye|sat[ıi]ş\s+senedi|satis\s+senedi|miktar[ıi]|"
+    r"mal[ıi]n cinsi|tutar[ıi]?|teslim alan|teslim eden",
     re.IGNORECASE,
 )
 _COMPANY_EXCLUDE = re.compile(
@@ -66,6 +68,42 @@ _COMPANY_EXCLUDE = re.compile(
 _TOTAL_KEYWORDS = ("genel toplam", "toplam", "ödenecek", "total")
 _SUBTOTAL_KEYWORDS = ("ara toplam", "kdvsiz", "matrah", "mal hizmet toplam")
 _VAT_KEYWORDS = ("kdv", "vat", "vergi")
+_DEKONT_TOTAL_KEYWORDS = (
+    "işlem tutarı",
+    "islem tutari",
+    "gönderilen tutar",
+    "gonderilen tutar",
+    "transfer tutarı",
+    "transfer tutari",
+    "havale tutarı",
+    "havale tutari",
+    "eft tutarı",
+    "eft tutari",
+    "fast tutarı",
+    "fast tutari",
+    "tutar",
+)
+_PARTY_KEYWORDS = (
+    "supplier",
+    "vendor",
+    "merchant",
+    "company",
+    "organization",
+    "name",
+    "alıcı",
+    "alici",
+    "recipient",
+    "receiver",
+    "gönderen",
+    "gonderen",
+    "sender",
+    "hesap sahibi",
+    "account holder",
+    "ünvan",
+    "unvan",
+    "adı soyadı",
+    "adi soyadi",
+)
 
 
 class OCRExtractionAssessment(BaseModel):
@@ -175,6 +213,10 @@ def assess_extraction(bundle: OCRParseBundle, category_hint: DocumentCategory | 
 
     identifiers = _extract_document_numbers(lines)
     total_amount = _extract_amount(lines, _TOTAL_KEYWORDS)
+    if total_amount is None and category_hint == DocumentCategory.ODEME_DEKONTU:
+        total_amount = _extract_amount(lines, _DEKONT_TOTAL_KEYWORDS)
+    if total_amount is None:
+        total_amount = _extract_total_from_tables(bundle)
     subtotal = _extract_amount(lines, _SUBTOTAL_KEYWORDS)
     vat_amount = _extract_amount(lines, _VAT_KEYWORDS, prefer_last=True)
     vat_rate = _extract_vat_rate(lines)
@@ -225,9 +267,14 @@ def assess_extraction(bundle: OCRParseBundle, category_hint: DocumentCategory | 
     reasons: list[str] = []
     if record.total_amount is None:
         reasons.append("missing total amount")
-    if record.document_date is None and category_hint != DocumentCategory.CEK:
+    if record.document_date is None and category_hint not in {DocumentCategory.CEK, DocumentCategory.MALZEME}:
         reasons.append("missing document date")
-    if not (record.company_name or record.document_number):
+    identity_present = bool(
+        record.company_name or record.document_number or record.invoice_number or record.receipt_number
+    )
+    if category_hint == DocumentCategory.ODEME_DEKONTU:
+        identity_present = identity_present or bool(record.description or record.tax_number)
+    if not identity_present:
         reasons.append("missing company name and document number")
     reasons.extend(consistency_reasons)
     if multi_document_suspected:
@@ -413,18 +460,37 @@ def _extract_company_name(bundle: OCRParseBundle, lines: list[str]) -> str | Non
         entity_type = entity.type.lower()
         if any(token in entity_type for token in ("supplier", "vendor", "merchant", "company", "organization", "name")):
             candidate = entity.mention_text.strip()
-            if candidate and not _COMPANY_EXCLUDE.search(candidate):
+            if _looks_like_party_name(candidate):
                 return candidate
+
+    for item in bundle.key_values:
+        key = (item.key or "").strip().lower()
+        candidate = (item.value or "").strip()
+        if candidate and any(token in key for token in _PARTY_KEYWORDS) and _looks_like_party_name(candidate):
+            return candidate
 
     for line in lines[:10]:
         digit_count = sum(ch.isdigit() for ch in line)
         alpha_count = sum(ch.isalpha() for ch in line)
         if alpha_count < 4 or digit_count > max(4, alpha_count // 2):
             continue
-        if _COMPANY_EXCLUDE.search(line):
+        if not _looks_like_party_name(line):
             continue
         return line
     return None
+
+
+def _looks_like_party_name(candidate: str) -> bool:
+    text = " ".join(candidate.split()).strip()
+    if not text or _COMPANY_EXCLUDE.search(text):
+        return False
+    letters = sum(ch.isalpha() for ch in text)
+    digits = sum(ch.isdigit() for ch in text)
+    if letters < 3:
+        return False
+    if digits > max(letters, 6):
+        return False
+    return True
 
 
 def _extract_tax_number(lines: list[str]) -> str | None:
@@ -546,21 +612,88 @@ def _extract_amount(lines: list[str], keywords: tuple[str, ...], *, prefer_last:
     return candidates[-1]
 
 
+def _extract_total_from_tables(bundle: OCRParseBundle) -> float | None:
+    for table in bundle.tables:
+        rows = _table_rows(table)
+        if not rows:
+            continue
+        header = [cell.strip().lower() for cell in rows[0]]
+        candidate_columns = [
+            index
+            for index, cell in enumerate(header)
+            if any(token in cell for token in ("tutar", "toplam", "amount"))
+        ]
+        if not candidate_columns:
+            candidate_columns = _numeric_table_columns(rows)
+
+        for column_index in candidate_columns:
+            values = [
+                parsed
+                for parsed in (
+                    parse_tr_number(row[column_index])
+                    for row in rows[1:]
+                    if len(row) > column_index
+                )
+                if parsed is not None
+            ]
+            resolved = _resolve_table_total(values)
+            if resolved is not None:
+                return resolved
+    return None
+
+
+def _numeric_table_columns(rows: list[list[str]]) -> list[int]:
+    column_count = max((len(row) for row in rows), default=0)
+    candidates: list[int] = []
+    for column_index in range(column_count):
+        numeric_hits = 0
+        for row in rows[1:]:
+            if len(row) <= column_index:
+                continue
+            if parse_tr_number(row[column_index]) is not None:
+                numeric_hits += 1
+        if numeric_hits >= 2:
+            candidates.append(column_index)
+    return candidates[-1:] if candidates else []
+
+
+def _resolve_table_total(values: list[float]) -> float | None:
+    if not values:
+        return None
+    if len(values) == 1:
+        return round(values[0], 2)
+    for index, value in enumerate(values):
+        others = values[:index] + values[index + 1 :]
+        if others and abs(round(sum(others), 2) - round(value, 2)) <= 1.0:
+            return round(value, 2)
+    return round(sum(values), 2)
+
+
 def _required_fields_present(record: BillRecord, category_hint: DocumentCategory | None) -> bool:
     if record.total_amount is None:
         return False
     if category_hint not in {DocumentCategory.CEK, DocumentCategory.MALZEME} and record.document_date is None:
         return False
-    if not (record.company_name or record.document_number or record.invoice_number or record.receipt_number):
+    identity_present = bool(
+        record.company_name or record.document_number or record.invoice_number or record.receipt_number
+    )
+    if category_hint == DocumentCategory.ODEME_DEKONTU:
+        identity_present = identity_present or bool(record.description or record.tax_number)
+    if not identity_present:
         return False
     return True
 
 
 def _completeness_score(record: BillRecord, category_hint: DocumentCategory | None) -> float:
+    identity_present = bool(
+        record.company_name or record.document_number or record.invoice_number or record.receipt_number
+    )
+    if category_hint == DocumentCategory.ODEME_DEKONTU:
+        identity_present = identity_present or bool(record.description or record.tax_number)
     checks = [
         record.total_amount is not None,
         record.document_date is not None or category_hint in {DocumentCategory.CEK, DocumentCategory.MALZEME},
-        bool(record.company_name or record.document_number or record.invoice_number or record.receipt_number),
+        identity_present,
         record.currency is not None,
     ]
     return sum(1 for check in checks if check) / len(checks)
