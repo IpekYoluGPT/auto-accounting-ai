@@ -5,6 +5,8 @@ Unit tests for Google Sheets retry-on-rate-limit logic.
 from __future__ import annotations
 
 import ssl
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -131,3 +133,80 @@ def test_upload_document_retries_transient_ssl_error(monkeypatch):
 
     assert link == "https://drive.google.com/file/d/test/view"
     assert call_state["count"] == 2
+
+
+def test_upload_document_serializes_concurrent_drive_requests(monkeypatch):
+    state = {"active": 0, "max_active": 0, "entered": 0}
+    state_lock = threading.Lock()
+    first_entered = threading.Event()
+    release_first = threading.Event()
+
+    class FakeCreateRequest:
+        def execute(self):
+            with state_lock:
+                state["entered"] += 1
+                state["active"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+                current_entry = state["entered"]
+
+            if current_entry == 1:
+                first_entered.set()
+                release_first.wait(timeout=2.0)
+
+            time.sleep(0.05)
+            with state_lock:
+                state["active"] -= 1
+            return {"webViewLink": "https://drive.google.com/file/d/test/view"}
+
+    class FakeFilesResource:
+        def create(self, **kwargs):
+            return FakeCreateRequest()
+
+    class FakeDriveService:
+        def files(self):
+            return FakeFilesResource()
+
+    monkeypatch.setattr(google_sheets.settings, "google_drive_parent_folder_id", "folder-1")
+    monkeypatch.setattr(
+        google_sheets,
+        "_get_oauth_drive_service",
+        lambda force_refresh=False: None,
+    )
+    monkeypatch.setattr(
+        google_sheets,
+        "_get_drive_service",
+        lambda force_refresh=False: FakeDriveService(),
+    )
+    monkeypatch.setattr(
+        google_sheets,
+        "_get_or_create_month_drive_folder",
+        lambda: "folder-1",
+    )
+
+    results: list[str | None] = []
+
+    def _run_upload(name: str) -> None:
+        results.append(
+            google_sheets.upload_document(
+                b"fake-image",
+                filename=name,
+                mime_type="image/jpeg",
+            )
+        )
+
+    thread1 = threading.Thread(target=_run_upload, args=("one.jpg",))
+    thread2 = threading.Thread(target=_run_upload, args=("two.jpg",))
+
+    thread1.start()
+    assert first_entered.wait(timeout=1.0)
+    thread2.start()
+    time.sleep(0.1)
+    release_first.set()
+    thread1.join(timeout=2.0)
+    thread2.join(timeout=2.0)
+
+    assert results == [
+        "https://drive.google.com/file/d/test/view",
+        "https://drive.google.com/file/d/test/view",
+    ]
+    assert state["max_active"] == 1

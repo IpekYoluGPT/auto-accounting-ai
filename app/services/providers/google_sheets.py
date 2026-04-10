@@ -177,6 +177,7 @@ _AMOUNT_COLUMNS = {
 }
 
 _lock = threading.Lock()
+_drive_upload_lock = threading.Lock()
 _gspread_client = None  # lazy-initialised
 _drive_service = None   # lazy-initialised (service account)
 _sheets_service = None  # lazy-initialised (Sheets API v4, service account)
@@ -595,41 +596,45 @@ def upload_document(
         logger.debug("GOOGLE_DRIVE_PARENT_FOLDER_ID not set; skipping Drive upload.")
         return None
 
-    use_oauth_drive = _get_oauth_drive_service() is not None
-    drive_getter = _get_oauth_drive_service if use_oauth_drive else _get_drive_service
-    if drive_getter() is None:
-        return None
+    # googleapiclient/httplib2 Drive service instances are not thread-safe.
+    # Serialising uploads avoids concurrent SSL reads that can crash the worker
+    # under bursty multi-image intake.
+    with _drive_upload_lock:
+        use_oauth_drive = _get_oauth_drive_service() is not None
+        drive_getter = _get_oauth_drive_service if use_oauth_drive else _get_drive_service
+        if drive_getter() is None:
+            return None
 
-    try:
-        import io
-        from googleapiclient.http import MediaIoBaseUpload
+        try:
+            import io
+            from googleapiclient.http import MediaIoBaseUpload
 
-        folder_id = _get_or_create_month_drive_folder()
-        file_meta: dict = {"name": filename}
-        if folder_id:
-            file_meta["parents"] = [folder_id]
+            folder_id = _get_or_create_month_drive_folder()
+            file_meta: dict = {"name": filename}
+            if folder_id:
+                file_meta["parents"] = [folder_id]
 
-        def _upload_once():
-            drive = drive_getter()
-            if drive is None:
-                raise RuntimeError("Drive service unavailable during upload.")
-            media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=False)
-            return drive.files().create(
-                body=file_meta,
-                media_body=media,
-                fields="id,webViewLink",
-                supportsAllDrives=True,
-            ).execute()
+            def _upload_once():
+                drive = drive_getter()
+                if drive is None:
+                    raise RuntimeError("Drive service unavailable during upload.")
+                media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=False)
+                return drive.files().create(
+                    body=file_meta,
+                    media_body=media,
+                    fields="id,webViewLink",
+                    supportsAllDrives=True,
+                ).execute()
 
-        uploaded = _retry_on_transient_drive_error(_upload_once)
+            uploaded = _retry_on_transient_drive_error(_upload_once)
 
-        link = uploaded.get("webViewLink", "")
-        logger.info("Uploaded '%s' to Drive folder '%s' → %s", filename, _month_drive_folder_name(), link)
-        return link
+            link = uploaded.get("webViewLink", "")
+            logger.info("Uploaded '%s' to Drive folder '%s' → %s", filename, _month_drive_folder_name(), link)
+            return link
 
-    except Exception as exc:
-        logger.error("Drive upload failed for '%s': %s", filename, exc, exc_info=True)
-        return None
+        except Exception as exc:
+            logger.error("Drive upload failed for '%s': %s", filename, exc, exc_info=True)
+            return None
 
 
 # ─── Registry helpers ─────────────────────────────────────────────────────────
