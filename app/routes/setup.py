@@ -208,11 +208,15 @@ async def reset_sheet(request: Request, payload: ResetSheetRequest) -> dict[str,
     """Authenticated helper to clear test rows from the target spreadsheet."""
     _verify_admin_token(request)
 
-    reset_count = google_sheets.reset_current_month_spreadsheet_data(
-        spreadsheet_id=payload.spreadsheet_id,
-    )
-    return {
-        "status": "ok",
-        "spreadsheet_id": payload.spreadsheet_id or settings.google_sheets_spreadsheet_id,
-        "tabs_reset": reset_count,
-    }
+    try:
+        reset_count = google_sheets.reset_current_month_spreadsheet_data(
+            spreadsheet_id=payload.spreadsheet_id,
+        )
+        return {
+            "status": "ok",
+            "spreadsheet_id": payload.spreadsheet_id or settings.google_sheets_spreadsheet_id,
+            "tabs_reset": reset_count,
+        }
+    except Exception as exc:
+        logger.error("Sheet reset failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
