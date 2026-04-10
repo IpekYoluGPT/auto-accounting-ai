@@ -262,3 +262,39 @@ def test_reset_current_month_spreadsheet_data_clears_tabs_and_reapplies_layout()
     setup_summary_mock.assert_called_once_with(fake_tabs["📊 Özet"], "Nisan 2026")
     assert setup_worksheet_mock.call_count == len(google_sheets._TABS) - 1
     mark_mock.assert_called_once_with(fake_sheet)
+
+
+def test_repair_monthly_spreadsheet_layout_rewrites_existing_tab_layouts():
+    fake_sheet = MagicMock()
+    fake_tabs: dict[str, MagicMock] = {}
+
+    def fake_ensure(_sheet, tab_name):
+        ws = MagicMock()
+        ws.col_count = 4
+        ws.row_count = 20
+        fake_tabs[tab_name] = ws
+        return ws
+
+    with patch(
+        "app.services.providers.google_sheets._ensure_tab_exists",
+        side_effect=fake_ensure,
+    ), patch(
+        "app.services.providers.google_sheets._setup_worksheet",
+    ) as setup_worksheet_mock, patch(
+        "app.services.providers.google_sheets._setup_summary_tab",
+    ) as setup_summary_mock, patch(
+        "app.services.providers.google_sheets._repair_drive_link_formulas",
+    ) as repair_drive_mock, patch(
+        "app.services.providers.google_sheets._mark_recently_prepared",
+    ) as mark_mock, patch(
+        "app.services.providers.google_sheets._month_label",
+        return_value="Nisan 2026",
+    ):
+        google_sheets._repair_monthly_spreadsheet_layout(fake_sheet)
+
+    for tab_name in list(google_sheets._TABS.keys())[1:]:
+        fake_tabs[tab_name].resize.assert_called_once()
+    assert setup_worksheet_mock.call_count == len(google_sheets._TABS) - 1
+    assert repair_drive_mock.call_count == len(google_sheets._TABS) - 1
+    setup_summary_mock.assert_called_once_with(fake_tabs["📊 Özet"], "Nisan 2026")
+    mark_mock.assert_called_once_with(fake_sheet)

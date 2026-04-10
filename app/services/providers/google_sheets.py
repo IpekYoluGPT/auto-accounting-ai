@@ -998,6 +998,18 @@ def _ensure_tab_total_row(ws, tab_name: str) -> None:
     ws.freeze(rows=2)
 
 
+def _ensure_worksheet_dimensions(ws, tab_name: str) -> None:
+    headers, _ = _TABS[tab_name]
+    target_cols = len(headers) + 2
+    target_rows = max(getattr(ws, "row_count", 0) or 0, 1000)
+
+    try:
+        if getattr(ws, "col_count", 0) < target_cols or getattr(ws, "row_count", 0) < target_rows:
+            ws.resize(rows=target_rows, cols=target_cols)
+    except Exception as exc:
+        logger.warning("Could not resize worksheet '%s': %s", tab_name, exc)
+
+
 def _repair_drive_link_formulas(ws, tab_name: str) -> None:
     drive_col = _drive_column_letter(tab_name)
     try:
@@ -1036,7 +1048,8 @@ def _repair_drive_link_formulas(ws, tab_name: str) -> None:
 def _repair_monthly_spreadsheet_layout(sh) -> None:
     for tab_name in list(_TABS.keys())[1:]:
         ws = _ensure_tab_exists(sh, tab_name)
-        _ensure_tab_total_row(ws, tab_name)
+        _ensure_worksheet_dimensions(ws, tab_name)
+        _setup_worksheet(ws, tab_name)
         _repair_drive_link_formulas(ws, tab_name)
 
     summary_ws = _ensure_tab_exists(sh, "📊 Özet")
