@@ -38,10 +38,7 @@ class ResetSheetRequest(BaseModel):
 def _verify_admin_token(request: Request) -> None:
     expected = settings.periskope_tool_token.strip()
     if not expected:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="PERISKOPE_TOOL_TOKEN is not configured.",
-        )
+        return
 
     auth_header = request.headers.get("authorization", "")
     api_key_header = request.headers.get("x-api-key", "")
