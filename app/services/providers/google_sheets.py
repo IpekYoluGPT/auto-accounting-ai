@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import shutil
 import ssl
 import threading
 import time
@@ -27,6 +28,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.config import settings
 from app.models.schemas import BillRecord, DocumentCategory
+from app.services.accounting.pipeline_context import PipelineContext, current_pipeline_context, namespace_storage_root, pipeline_context_scope
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -186,7 +188,7 @@ _gspread_client = None  # lazy-initialised
 _drive_service = None   # lazy-initialised (service account)
 _sheets_service = None  # lazy-initialised (Sheets API v4, service account)
 _creds = None           # service account credentials
-_drive_folder_cache: dict[str, str] = {}  # month_label → folder_id
+_drive_folder_cache: dict[str, str] = {}  # drive folder name → folder_id
 
 # OAuth2 user credentials — used ONLY for creating new files (spreadsheets).
 # Service accounts cannot create Workspace files (403 quota/permission error).
@@ -221,6 +223,24 @@ def _get_business_timezone():
 
 def _now() -> datetime:
     return datetime.now(_get_business_timezone())
+
+
+def _storage_root() -> Path:
+    path = namespace_storage_root(settings.storage_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _sandbox_name_prefix() -> str:
+    context = current_pipeline_context()
+    if context.is_production:
+        return ""
+    session = (context.session_id or context.normalized_namespace).strip()
+    return f"[SANDBOX {session}] "
+
+
+def _month_sheet_title() -> str:
+    return f"{_sandbox_name_prefix()}Muhasebe — {_month_label()}"
 
 
 def _next_month_rollover_at(now: datetime | None = None) -> datetime:
@@ -518,7 +538,7 @@ def _share_with_service_account(file_id: str, drive_service) -> None:
 
 
 def _month_drive_folder_name() -> str:
-    return f"Fişler — {_month_label()}"
+    return f"{_sandbox_name_prefix()}Fişler — {_month_label()}"
 
 
 def _get_or_create_month_drive_folder() -> Optional[str]:
@@ -532,9 +552,9 @@ def _get_or_create_month_drive_folder() -> Optional[str]:
     if not settings.google_drive_parent_folder_id:
         return settings.google_drive_parent_folder_id or None
 
-    label = _month_label()
-    if label in _drive_folder_cache:
-        return _drive_folder_cache[label]
+    folder_name = _month_drive_folder_name()
+    if folder_name in _drive_folder_cache:
+        return _drive_folder_cache[folder_name]
 
     # Prefer OAuth, fall back to service account
     oauth_drive = _get_oauth_drive_service()
@@ -564,7 +584,7 @@ def _get_or_create_month_drive_folder() -> Optional[str]:
         files = results.get("files", [])
         if files:
             folder_id = files[0]["id"]
-            _drive_folder_cache[label] = folder_id
+            _drive_folder_cache[folder_name] = folder_id
             return folder_id
 
         if create_drive is None:
@@ -578,7 +598,7 @@ def _get_or_create_month_drive_folder() -> Optional[str]:
         }
         folder = create_drive.files().create(body=meta, fields="id", supportsAllDrives=True).execute()
         folder_id = folder["id"]
-        _drive_folder_cache[label] = folder_id
+        _drive_folder_cache[folder_name] = folder_id
         logger.info("Created Drive subfolder '%s' (id=%s)", folder_name, folder_id)
 
         # If created via OAuth, share with service account so SA can also access it
@@ -661,31 +681,31 @@ def upload_document(
 
 
 def _registry_path() -> Path:
-    path = Path(settings.storage_dir) / "state" / "sheets_registry.json"
+    path = _storage_root() / "state" / "sheets_registry.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def _pending_drive_uploads_state_path() -> Path:
-    path = Path(settings.storage_dir) / "state" / "pending_drive_uploads.json"
+    path = _storage_root() / "state" / "pending_drive_uploads.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def _pending_drive_uploads_dir() -> Path:
-    path = Path(settings.storage_dir) / "state" / "pending_drive_uploads"
+    path = _storage_root() / "state" / "pending_drive_uploads"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def _pending_sheet_appends_state_path() -> Path:
-    path = Path(settings.storage_dir) / "state" / "pending_sheet_appends.json"
+    path = _storage_root() / "state" / "pending_sheet_appends.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def _pending_sheet_appends_dir() -> Path:
-    path = Path(settings.storage_dir) / "state" / "pending_sheet_appends"
+    path = _storage_root() / "state" / "pending_sheet_appends"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -1078,15 +1098,357 @@ def _repair_drive_link_formulas(ws, tab_name: str) -> None:
         logger.info("Repaired %d Drive link formula(s) on '%s'.", repaired, tab_name)
 
 
-def _repair_monthly_spreadsheet_layout(sh) -> None:
-    for tab_name in list(_TABS.keys())[1:]:
-        ws = _ensure_tab_exists(sh, tab_name)
-        _ensure_worksheet_dimensions(ws, tab_name)
-        _setup_worksheet(ws, tab_name)
-        _repair_drive_link_formulas(ws, tab_name)
+def _worksheet_has_visible_data(ws, tab_name: str) -> bool:
+    headers, _ = _TABS[tab_name]
+    last_col = _internal_row_id_column_letter(tab_name)
+    try:
+        rows = ws.get(f"A3:{last_col}")
+    except Exception:
+        return False
 
-    summary_ws = _ensure_tab_exists(sh, "📊 Özet")
-    _setup_summary_tab(summary_ws, _month_label())
+    visible_cols = len(headers)
+    for row in rows:
+        if any(str(cell or "").strip() for cell in row[:visible_cols]):
+            return True
+    return False
+
+
+def _archive_drifted_tab(sh, ws, tab_name: str) -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    base_title = f"{tab_name} MANUAL_DRIFT {timestamp}"
+    existing_titles = {worksheet.title for worksheet in sh.worksheets()}
+    archived_title = base_title[:100]
+    counter = 1
+    while archived_title in existing_titles:
+        suffix = f" {counter}"
+        archived_title = f"{base_title[:max(1, 100 - len(suffix))]}{suffix}"
+        counter += 1
+    ws.update_title(archived_title)
+    return archived_title
+
+
+def _backfill_internal_row_ids(ws, tab_name: str) -> int:
+    headers, _ = _TABS[tab_name]
+    hidden_col = _internal_row_id_column_letter(tab_name)
+    last_col = hidden_col
+    try:
+        rows = ws.get(f"A3:{last_col}")
+    except Exception:
+        return 0
+
+    repaired = 0
+    visible_cols = len(headers)
+    for row_number, row in enumerate(rows, start=3):
+        visible_values = row[:visible_cols]
+        hidden_value = str(row[visible_cols]).strip() if len(row) > visible_cols else ""
+        if not any(str(cell or "").strip() for cell in visible_values):
+            continue
+        if hidden_value:
+            continue
+        _retry_on_rate_limit(
+            lambda row_number=row_number: ws.update(
+                [[uuid4().hex]],
+                f"{hidden_col}{row_number}",
+                value_input_option="RAW",
+            )
+        )
+        repaired += 1
+    return repaired
+
+
+def _tab_headers_match(ws, tab_name: str) -> bool:
+    expected_headers, _ = _TABS[tab_name]
+    actual_headers = ws.row_values(1)[: len(expected_headers)]
+    return actual_headers == expected_headers
+
+
+def _tab_total_row_is_valid(ws, tab_name: str) -> bool:
+    headers, _ = _TABS[tab_name]
+    last_col = _col_letter(len(headers) - 1)
+    try:
+        rows = ws.get(f"A2:{last_col}2", value_render_option="FORMULA")
+    except Exception:
+        return False
+
+    row = rows[0] if rows else []
+    if not row or not _looks_like_total_row(row[0] if row else ""):
+        return False
+
+    total_formula = _build_tab_total_formula(tab_name)
+    if not total_formula:
+        return True
+
+    total_col_idx = ord(_TAB_TOTAL_COLUMNS[tab_name]) - ord("A")
+    actual_formula = str(row[total_col_idx]).strip() if len(row) > total_col_idx else ""
+    return actual_formula == total_formula
+
+
+def _summary_tab_is_valid(ws) -> bool:
+    try:
+        rows = ws.get("A1:B10", value_render_option="FORMULA")
+    except Exception:
+        return False
+
+    title = str(rows[0][0]).strip() if rows and rows[0] else ""
+    if not title.startswith("📊 ÖZET — "):
+        return False
+
+    expected_formulas = [_build_summary_formula(tab_name) for tab_name in list(_TABS.keys())[1:]]
+    expected_total = "=SUM(B2:B8)"
+    for index, formula in enumerate(expected_formulas, start=1):
+        row = rows[index] if len(rows) > index else []
+        actual_formula = str(row[1]).strip() if len(row) > 1 else ""
+        if actual_formula != formula:
+            return False
+
+    total_row = rows[9] if len(rows) > 9 else []
+    actual_total_formula = str(total_row[1]).strip() if len(total_row) > 1 else ""
+    return actual_total_formula == expected_total
+
+
+def _audit_summary_tab(sh, findings: list[dict[str, object]], *, repair: bool) -> None:
+    import gspread
+
+    try:
+        ws = sh.worksheet("📊 Özet")
+    except gspread.WorksheetNotFound:
+        findings.append({
+            "tab_name": "📊 Özet",
+            "code": "missing_tab",
+            "severity": "error",
+            "repaired": False,
+            "message": "Summary tab is missing.",
+        })
+        if repair:
+            ws = _ensure_tab_exists(sh, "📊 Özet")
+            _setup_summary_tab(ws, _month_label(), lightweight=True)
+            findings[-1]["repaired"] = True
+        return
+
+    if _summary_tab_is_valid(ws):
+        return
+
+    finding = {
+        "tab_name": "📊 Özet",
+        "code": "invalid_summary",
+        "severity": "error",
+        "repaired": False,
+        "message": "Summary formulas or title are invalid.",
+    }
+    findings.append(finding)
+    if repair:
+        _setup_summary_tab(ws, _month_label(), lightweight=True)
+        finding["repaired"] = True
+
+
+def _audit_data_tab(sh, tab_name: str, findings: list[dict[str, object]], *, repair: bool) -> None:
+    import gspread
+
+    try:
+        ws = sh.worksheet(tab_name)
+    except gspread.WorksheetNotFound:
+        findings.append({
+            "tab_name": tab_name,
+            "code": "missing_tab",
+            "severity": "error",
+            "repaired": False,
+            "message": "Data tab is missing.",
+        })
+        if repair:
+            _ensure_tab_exists(sh, tab_name)
+            findings[-1]["repaired"] = True
+        return
+
+    if not _tab_headers_match(ws, tab_name):
+        finding = {
+            "tab_name": tab_name,
+            "code": "header_drift",
+            "severity": "error",
+            "repaired": False,
+            "message": "Header row does not match the canonical layout.",
+        }
+        findings.append(finding)
+        if repair:
+            if _worksheet_has_visible_data(ws, tab_name):
+                finding["archived_to"] = _archive_drifted_tab(sh, ws, tab_name)
+                ws = _ensure_tab_exists(sh, tab_name)
+            else:
+                _setup_worksheet(ws, tab_name, lightweight=True)
+            finding["repaired"] = True
+
+    if not _tab_total_row_is_valid(ws, tab_name):
+        finding = {
+            "tab_name": tab_name,
+            "code": "invalid_total_row",
+            "severity": "error",
+            "repaired": False,
+            "message": "Total row is missing or corrupted.",
+        }
+        findings.append(finding)
+        if repair:
+            _ensure_tab_total_row(ws, tab_name)
+            finding["repaired"] = True
+
+    repaired_formulas_before = len(findings)
+    _repair_drive_link_formulas(ws, tab_name)
+    if len(findings) == repaired_formulas_before:
+        pass
+
+    repaired_row_ids = _backfill_internal_row_ids(ws, tab_name) if repair else 0
+    if repaired_row_ids:
+        findings.append({
+            "tab_name": tab_name,
+            "code": "missing_row_ids",
+            "severity": "warning",
+            "repaired": True,
+            "message": f"Backfilled {repaired_row_ids} hidden row id value(s).",
+            "count": repaired_row_ids,
+        })
+    elif not repair:
+        headers, _ = _TABS[tab_name]
+        hidden_col = _internal_row_id_column_letter(tab_name)
+        try:
+            rows = ws.get(f"A3:{hidden_col}")
+        except Exception:
+            rows = []
+        missing_count = 0
+        visible_cols = len(headers)
+        for row in rows:
+            visible_values = row[:visible_cols]
+            hidden_value = str(row[visible_cols]).strip() if len(row) > visible_cols else ""
+            if any(str(cell or "").strip() for cell in visible_values) and not hidden_value:
+                missing_count += 1
+        if missing_count:
+            findings.append({
+                "tab_name": tab_name,
+                "code": "missing_row_ids",
+                "severity": "warning",
+                "repaired": False,
+                "message": f"{missing_count} row(s) are missing hidden row ids.",
+                "count": missing_count,
+            })
+
+
+def _audit_spreadsheet_layout(sh, *, repair: bool = False, target_tabs: set[str] | None = None) -> list[dict[str, object]]:
+    findings: list[dict[str, object]] = []
+    canonical_titles = set(_TABS.keys())
+    titles_to_check = [tab_name for tab_name in _TABS if target_tabs is None or tab_name in target_tabs]
+
+    existing_titles = {worksheet.title for worksheet in sh.worksheets()}
+    for orphan_title in sorted(existing_titles - canonical_titles):
+        findings.append({
+            "tab_name": orphan_title,
+            "code": "orphan_tab",
+            "severity": "warning",
+            "repaired": False,
+            "message": "Found a non-canonical worksheet title.",
+        })
+
+    for tab_name in titles_to_check:
+        if tab_name == "📊 Özet":
+            _audit_summary_tab(sh, findings, repair=repair)
+            continue
+        _audit_data_tab(sh, tab_name, findings, repair=repair)
+
+    return findings
+
+
+def queue_status() -> dict[str, int]:
+    return {
+        "pending_sheet_appends": len(_load_pending_sheet_appends()),
+        "pending_drive_uploads": len(_load_pending_drive_uploads()),
+    }
+
+
+def audit_current_month_spreadsheet(*, spreadsheet_id: Optional[str] = None, repair: bool = False) -> dict[str, object]:
+    client = _get_client()
+    if client is None:
+        raise RuntimeError("Google Sheets client unavailable.")
+
+    with _lock:
+        sh = client.open_by_key(spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
+        findings = _audit_spreadsheet_layout(sh, repair=repair)
+        return {
+            "spreadsheet_id": sh.id,
+            "month_key": _month_key(),
+            "findings": findings,
+            "queue": queue_status(),
+        }
+
+
+def apply_test_drift(
+    *,
+    action: str,
+    spreadsheet_id: Optional[str] = None,
+    tab_name: str | None = None,
+    replacement_name: str | None = None,
+    row_count: int = 5,
+) -> dict[str, object]:
+    client = _get_client()
+    if client is None:
+        raise RuntimeError("Google Sheets client unavailable.")
+
+    with _lock:
+        sh = client.open_by_key(spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
+        target_tab = tab_name or "🧾 Faturalar"
+
+        if action == "delete_summary_tab":
+            ws = sh.worksheet("📊 Özet")
+            sh.del_worksheet(ws)
+            return {"spreadsheet_id": sh.id, "action": action, "applied": True, "tab_name": "📊 Özet"}
+
+        if action == "rename_data_tab":
+            ws = sh.worksheet(target_tab)
+            new_name = (replacement_name or f"{target_tab} RENAMED").strip()[:100]
+            ws.update_title(new_name)
+            return {"spreadsheet_id": sh.id, "action": action, "applied": True, "tab_name": target_tab, "replacement_name": new_name}
+
+        if action == "corrupt_total_row":
+            ws = sh.worksheet(target_tab)
+            total_col = _TAB_TOTAL_COLUMNS[target_tab]
+            ws.update([["BROKEN"]], "A2", value_input_option="RAW")
+            ws.update([[""]], f"{total_col}2", value_input_option="RAW")
+            return {"spreadsheet_id": sh.id, "action": action, "applied": True, "tab_name": target_tab}
+
+        if action == "corrupt_header_row":
+            ws = sh.worksheet(target_tab)
+            headers = list(_TABS[target_tab][0])
+            headers[0] = "BROKEN"
+            ws.update([headers], "A1", value_input_option="RAW")
+            return {"spreadsheet_id": sh.id, "action": action, "applied": True, "tab_name": target_tab}
+
+        if action == "clear_hidden_row_ids":
+            ws = sh.worksheet(target_tab)
+            hidden_col = _internal_row_id_column_letter(target_tab)
+            end_row = max(3, row_count + 2)
+            _retry_on_rate_limit(lambda: ws.batch_clear([f"{hidden_col}3:{hidden_col}{end_row}"]))
+            return {"spreadsheet_id": sh.id, "action": action, "applied": True, "tab_name": target_tab, "row_count": row_count}
+
+        if action == "reorder_rows":
+            ws = sh.worksheet(target_tab)
+            last_col = _internal_row_id_column_letter(target_tab)
+            end_row = max(3, row_count + 2)
+            rows = ws.get(f"A3:{last_col}{end_row}")
+            if len(rows) < 2:
+                return {"spreadsheet_id": sh.id, "action": action, "applied": False, "tab_name": target_tab, "row_count": len(rows)}
+            reordered = list(reversed(rows))
+            ws.update(reordered, "A3", value_input_option="USER_ENTERED")
+            return {"spreadsheet_id": sh.id, "action": action, "applied": True, "tab_name": target_tab, "row_count": len(reordered)}
+
+        raise ValueError(f"Unsupported drift action: {action}")
+
+
+def clear_current_namespace_storage() -> dict[str, int]:
+    state_counts = queue_status()
+    storage_root = _storage_root()
+    if storage_root.exists():
+        shutil.rmtree(storage_root)
+    storage_root.mkdir(parents=True, exist_ok=True)
+    return state_counts
+
+
+def _repair_monthly_spreadsheet_layout(sh) -> None:
+    _audit_spreadsheet_layout(sh, repair=True)
     _mark_recently_prepared(sh)
 
 
@@ -1268,7 +1630,7 @@ def _find_existing_spreadsheet_in_drive(title: str) -> Optional[str]:
     try:
         # Search in the monthly subfolder first, then in the parent folder
         for parent_id in [
-            _drive_folder_cache.get(_month_label()),
+            _drive_folder_cache.get(_month_drive_folder_name()),
             settings.google_drive_parent_folder_id,
         ]:
             if not parent_id:
@@ -1356,6 +1718,17 @@ def _get_or_create_spreadsheet(client):
     """
     registry = _load_registry()
     month_key = _month_key()
+    override_spreadsheet_id = (current_pipeline_context().spreadsheet_id_override or "").strip()
+
+    if override_spreadsheet_id:
+        try:
+            sh = client.open_by_key(override_spreadsheet_id)
+            registry[month_key] = override_spreadsheet_id
+            _save_registry(registry)
+            logger.info("Using context spreadsheet override for %s.", month_key)
+            return sh
+        except Exception as exc:
+            logger.warning("Context spreadsheet override inaccessible (%s); will retry.", exc)
 
     # 1. Registry hit for this month
     if month_key in registry:
@@ -1371,7 +1744,7 @@ def _get_or_create_spreadsheet(client):
     registry.pop("permanent", None)
 
     # 2. Configured spreadsheet from env
-    if settings.google_sheets_spreadsheet_id:
+    if current_pipeline_context().is_production and settings.google_sheets_spreadsheet_id:
         try:
             sh = client.open_by_key(settings.google_sheets_spreadsheet_id)
             registry[month_key] = settings.google_sheets_spreadsheet_id
@@ -1383,7 +1756,7 @@ def _get_or_create_spreadsheet(client):
 
     # 3. Search Drive for an existing spreadsheet with the expected title
     #    (guards against duplicates from previous half-failed creations)
-    title = f"Muhasebe — {_month_label()}"
+    title = _month_sheet_title()
     sheet_id = _find_existing_spreadsheet_in_drive(title)
 
     if sheet_id:
@@ -1921,6 +2294,9 @@ def _pending_drive_upload_worker() -> None:
 
 
 def start_pending_drive_upload_worker() -> None:
+    if not current_pipeline_context().is_production:
+        return
+
     global _pending_drive_worker_thread
 
     with _pending_drive_worker_lock:
@@ -1959,11 +2335,15 @@ def _has_pending_sheet_appends() -> bool:
 
 
 def _registered_spreadsheet_id_for_month(target_month_key: str) -> Optional[str]:
+    context = current_pipeline_context()
+    if context.spreadsheet_id_override:
+        return context.spreadsheet_id_override
+
     registry = _load_registry()
     spreadsheet_id = registry.get(target_month_key)
     if spreadsheet_id:
         return spreadsheet_id
-    if target_month_key == _month_key() and settings.google_sheets_spreadsheet_id:
+    if context.is_production and target_month_key == _month_key() and settings.google_sheets_spreadsheet_id:
         return settings.google_sheets_spreadsheet_id
     return None
 
@@ -2244,6 +2624,7 @@ def process_pending_sheet_appends(*, max_items: int | None = None) -> int:
 
             with _lock:
                 sh = client.open_by_key(spreadsheet_id)
+                _audit_spreadsheet_layout(sh, repair=True, target_tabs={tab_name, "📊 Özet"})
                 ws = _ensure_tab_exists(sh, tab_name)
                 existing_row_numbers = _existing_row_numbers_by_pending_id(
                     ws,
@@ -2353,6 +2734,9 @@ def _pending_sheet_append_worker() -> None:
 
 
 def start_pending_sheet_append_worker() -> None:
+    if not current_pipeline_context().is_production:
+        return
+
     global _pending_sheet_worker_thread
 
     with _pending_sheet_worker_lock:
@@ -2443,7 +2827,7 @@ def append_record(
         return []
 
 
-def ensure_current_month_spreadsheet_ready() -> None:
+def ensure_current_month_spreadsheet_ready() -> str | None:
     """
     Proactively prepare the current month's spreadsheet.
 
@@ -2453,7 +2837,7 @@ def ensure_current_month_spreadsheet_ready() -> None:
     client = _get_client()
     if client is None:
         logger.debug("Google Sheets monthly rollover check skipped; client unavailable.")
-        return
+        return None
 
     with _lock:
         try:
@@ -2463,8 +2847,10 @@ def ensure_current_month_spreadsheet_ready() -> None:
             else:
                 _repair_monthly_spreadsheet_layout(sh)
             logger.info("Google Sheets monthly spreadsheet is ready for %s.", _month_key())
+            return sh.id
         except Exception as exc:
             logger.warning("Could not prepare current month's spreadsheet: %s", exc)
+            return None
 
 
 def _monthly_rollover_worker(stop_event: threading.Event) -> None:
@@ -2476,6 +2862,9 @@ def _monthly_rollover_worker(stop_event: threading.Event) -> None:
 
 
 def start_monthly_rollover_scheduler() -> None:
+    if not current_pipeline_context().is_production:
+        return
+
     global _rollover_thread, _rollover_stop_event
 
     with _rollover_lock:

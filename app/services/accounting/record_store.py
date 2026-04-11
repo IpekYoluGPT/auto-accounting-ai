@@ -18,6 +18,7 @@ from typing import Iterator, Mapping
 from app.config import settings
 from app.models.schemas import BillRecord
 from app.services.accounting.exporter import COLUMN_MAP, TURKISH_HEADERS, record_to_row
+from app.services.accounting.pipeline_context import PipelineContext, namespace_storage_root, pipeline_context_scope
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -33,14 +34,20 @@ else:
     import fcntl
 
 
+def _storage_root() -> Path:
+    path = namespace_storage_root(settings.storage_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _exports_dir() -> Path:
-    path = Path(settings.storage_dir) / "exports"
+    path = _storage_root() / "exports"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def _state_dir() -> Path:
-    path = Path(settings.storage_dir) / "state"
+    path = _storage_root() / "state"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -358,140 +365,155 @@ def is_message_processed(message_id: str | None) -> bool:
             return message_id in _load_processed_ids_unlocked()
 
 
-def claim_message_processing(message_id: str | None) -> bool:
+def claim_message_processing(message_id: str | None, *, context: PipelineContext | None = None) -> bool:
     """Claim a message ID so only one worker processes it at a time."""
-    if not message_id:
-        return True
-
-    with _PERSIST_LOCK:
-        with _interprocess_lock():
-            processed_ids = _load_processed_ids_unlocked()
-            if message_id in processed_ids:
-                logger.info("Skipping already completed message id=%s", message_id)
-                return False
-
-            inflight = _purge_stale_inflight_unlocked(_load_inflight_unlocked())
-            if message_id in inflight:
-                logger.info("Skipping already claimed message id=%s", message_id)
-                return False
-
-            inflight[message_id] = datetime.now(timezone.utc).isoformat()
-            _write_inflight_unlocked(inflight)
-            logger.info("Claimed message id=%s for processing", message_id)
+    with pipeline_context_scope(context):
+        if not message_id:
             return True
 
-
-def mark_message_handled(message_id: str | None, *, outcome: str) -> None:
-    """Mark a non-export flow as fully handled and suppress duplicate reprocessing."""
-    if not message_id:
-        return
-
-    with _PERSIST_LOCK:
-        with _interprocess_lock():
-            processed_ids = _load_processed_ids_unlocked()
-            if message_id in processed_ids:
-                return
-
-            inflight = _purge_stale_inflight_unlocked(_load_inflight_unlocked())
-            inflight.pop(message_id, None)
-            _write_inflight_unlocked(inflight)
-            _append_processed_id_unlocked(message_id)
-            logger.info("Marked message id=%s as handled (%s)", message_id, outcome)
-
-
-def release_message_processing(message_id: str | None) -> None:
-    """Release an in-flight claim so the message can be retried later."""
-    if not message_id:
-        return
-
-    with _PERSIST_LOCK:
-        with _interprocess_lock():
-            inflight = _purge_stale_inflight_unlocked(_load_inflight_unlocked())
-            if inflight.pop(message_id, None) is not None:
-                _write_inflight_unlocked(inflight)
-                logger.info("Released in-flight claim for message id=%s", message_id)
-
-
-def should_send_warning(recipient: str | None, warning_key: str) -> bool:
-    """Throttle repetitive user warnings by recipient and warning type."""
-    if not recipient or not warning_key:
-        return True
-
-    bucket = f"{recipient}:{warning_key}"
-    now = datetime.now(timezone.utc)
-
-    with _PERSIST_LOCK:
-        with _interprocess_lock():
-            warning_state = _purge_stale_warnings_unlocked(_load_warning_state_unlocked())
-            last_sent_raw = warning_state.get(bucket)
-            if last_sent_raw:
-                try:
-                    last_sent = datetime.fromisoformat(last_sent_raw)
-                except ValueError:
-                    last_sent = None
-                else:
-                    if last_sent.tzinfo is None:
-                        last_sent = last_sent.replace(tzinfo=timezone.utc)
-
-                if last_sent is not None and now - last_sent < _WARNING_THROTTLE_TTL:
-                    logger.info("Skipping throttled warning bucket=%s", bucket)
+        with _PERSIST_LOCK:
+            with _interprocess_lock():
+                processed_ids = _load_processed_ids_unlocked()
+                if message_id in processed_ids:
+                    logger.info("Skipping already completed message id=%s", message_id)
                     return False
 
-            warning_state[bucket] = now.isoformat()
-            _write_warning_state_unlocked(warning_state)
+                inflight = _purge_stale_inflight_unlocked(_load_inflight_unlocked())
+                if message_id in inflight:
+                    logger.info("Skipping already claimed message id=%s", message_id)
+                    return False
+
+                inflight[message_id] = datetime.now(timezone.utc).isoformat()
+                _write_inflight_unlocked(inflight)
+                logger.info("Claimed message id=%s for processing", message_id)
+                return True
+
+
+def mark_message_handled(
+    message_id: str | None,
+    *,
+    outcome: str,
+    context: PipelineContext | None = None,
+) -> None:
+    """Mark a non-export flow as fully handled and suppress duplicate reprocessing."""
+    with pipeline_context_scope(context):
+        if not message_id:
+            return
+
+        with _PERSIST_LOCK:
+            with _interprocess_lock():
+                processed_ids = _load_processed_ids_unlocked()
+                if message_id in processed_ids:
+                    return
+
+                inflight = _purge_stale_inflight_unlocked(_load_inflight_unlocked())
+                inflight.pop(message_id, None)
+                _write_inflight_unlocked(inflight)
+                _append_processed_id_unlocked(message_id)
+                logger.info("Marked message id=%s as handled (%s)", message_id, outcome)
+
+
+def release_message_processing(message_id: str | None, *, context: PipelineContext | None = None) -> None:
+    """Release an in-flight claim so the message can be retried later."""
+    with pipeline_context_scope(context):
+        if not message_id:
+            return
+
+        with _PERSIST_LOCK:
+            with _interprocess_lock():
+                inflight = _purge_stale_inflight_unlocked(_load_inflight_unlocked())
+                if inflight.pop(message_id, None) is not None:
+                    _write_inflight_unlocked(inflight)
+                    logger.info("Released in-flight claim for message id=%s", message_id)
+
+
+def should_send_warning(
+    recipient: str | None,
+    warning_key: str,
+    *,
+    context: PipelineContext | None = None,
+) -> bool:
+    """Throttle repetitive user warnings by recipient and warning type."""
+    with pipeline_context_scope(context):
+        if not recipient or not warning_key:
             return True
 
+        bucket = f"{recipient}:{warning_key}"
+        now = datetime.now(timezone.utc)
 
-def persist_record_once(record: BillRecord) -> bool:
+        with _PERSIST_LOCK:
+            with _interprocess_lock():
+                warning_state = _purge_stale_warnings_unlocked(_load_warning_state_unlocked())
+                last_sent_raw = warning_state.get(bucket)
+                if last_sent_raw:
+                    try:
+                        last_sent = datetime.fromisoformat(last_sent_raw)
+                    except ValueError:
+                        last_sent = None
+                    else:
+                        if last_sent.tzinfo is None:
+                            last_sent = last_sent.replace(tzinfo=timezone.utc)
+
+                    if last_sent is not None and now - last_sent < _WARNING_THROTTLE_TTL:
+                        logger.info("Skipping throttled warning bucket=%s", bucket)
+                        return False
+
+                warning_state[bucket] = now.isoformat()
+                _write_warning_state_unlocked(warning_state)
+                return True
+
+
+def persist_record_once(record: BillRecord, *, context: PipelineContext | None = None) -> bool:
     """
     Append the record to the daily CSV once.
 
     Returns False when the message was already processed successfully.
     """
-    with _PERSIST_LOCK:
-        with _interprocess_lock():
-            processed_ids = _load_processed_ids_unlocked()
-            seen_fingerprints = _load_content_fingerprints_unlocked()
-            message_id = record.source_message_id
-            record_fingerprints = _content_fingerprints(record)
-            if message_id and message_id in processed_ids:
-                logger.info("Skipping duplicate export for message id=%s", message_id)
-                inflight = _purge_stale_inflight_unlocked(_load_inflight_unlocked())
-                inflight.pop(message_id, None)
-                _write_inflight_unlocked(inflight)
-                return False
+    with pipeline_context_scope(context):
+        with _PERSIST_LOCK:
+            with _interprocess_lock():
+                processed_ids = _load_processed_ids_unlocked()
+                seen_fingerprints = _load_content_fingerprints_unlocked()
+                message_id = record.source_message_id
+                record_fingerprints = _content_fingerprints(record)
+                if message_id and message_id in processed_ids:
+                    logger.info("Skipping duplicate export for message id=%s", message_id)
+                    inflight = _purge_stale_inflight_unlocked(_load_inflight_unlocked())
+                    inflight.pop(message_id, None)
+                    _write_inflight_unlocked(inflight)
+                    return False
 
-            duplicate_fingerprints = sorted(record_fingerprints & seen_fingerprints)
-            if duplicate_fingerprints:
-                logger.info(
-                    "Skipping duplicate content for message id=%s via fingerprint=%s",
-                    message_id,
-                    duplicate_fingerprints[0],
-                )
-                inflight = _purge_stale_inflight_unlocked(_load_inflight_unlocked())
-                inflight.pop(message_id, None)
-                _write_inflight_unlocked(inflight)
-                return False
+                duplicate_fingerprints = sorted(record_fingerprints & seen_fingerprints)
+                if duplicate_fingerprints:
+                    logger.info(
+                        "Skipping duplicate content for message id=%s via fingerprint=%s",
+                        message_id,
+                        duplicate_fingerprints[0],
+                    )
+                    inflight = _purge_stale_inflight_unlocked(_load_inflight_unlocked())
+                    inflight.pop(message_id, None)
+                    _write_inflight_unlocked(inflight)
+                    return False
 
-            filepath = _exports_dir() / f"records_{date.today().isoformat()}.csv"
-            write_header = not filepath.exists()
-            with filepath.open("a", encoding="utf-8-sig", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=TURKISH_HEADERS)
-                if write_header:
-                    writer.writeheader()
-                writer.writerow(record_to_row(record))
+                filepath = _exports_dir() / f"records_{date.today().isoformat()}.csv"
+                write_header = not filepath.exists()
+                with filepath.open("a", encoding="utf-8-sig", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=TURKISH_HEADERS)
+                    if write_header:
+                        writer.writeheader()
+                    writer.writerow(record_to_row(record))
 
-            if record_fingerprints:
-                _append_content_fingerprints_unlocked(record_fingerprints)
+                if record_fingerprints:
+                    _append_content_fingerprints_unlocked(record_fingerprints)
 
-            if message_id:
-                inflight = _purge_stale_inflight_unlocked(_load_inflight_unlocked())
-                inflight.pop(message_id, None)
-                _write_inflight_unlocked(inflight)
-                _append_processed_id_unlocked(message_id)
+                if message_id:
+                    inflight = _purge_stale_inflight_unlocked(_load_inflight_unlocked())
+                    inflight.pop(message_id, None)
+                    _write_inflight_unlocked(inflight)
+                    _append_processed_id_unlocked(message_id)
 
-            logger.info("Record appended to %s", filepath)
-            return True
+                logger.info("Record appended to %s", filepath)
+                return True
 
 
 def find_export_rows(
@@ -499,33 +521,35 @@ def find_export_rows(
     source_message_id: str | None = None,
     chat_id: str | None = None,
     limit: int = 5,
+    context: PipelineContext | None = None,
 ) -> list[Mapping[str, str]]:
     """Return the latest exported rows matching a source message ID or chat."""
-    if not source_message_id and not chat_id:
-        return []
+    with pipeline_context_scope(context):
+        if not source_message_id and not chat_id:
+            return []
 
-    matches: list[Mapping[str, str]] = []
-    group_column = COLUMN_MAP["source_group_id"]
-    sender_column = COLUMN_MAP["source_sender_id"]
-    message_column = COLUMN_MAP["source_message_id"]
+        matches: list[Mapping[str, str]] = []
+        group_column = COLUMN_MAP["source_group_id"]
+        sender_column = COLUMN_MAP["source_sender_id"]
+        message_column = COLUMN_MAP["source_message_id"]
 
-    with _PERSIST_LOCK:
-        export_files = sorted(_exports_dir().glob("records_*.csv"), reverse=True)
-        for filepath in export_files:
-            with filepath.open("r", encoding="utf-8-sig", newline="") as handle:
-                rows = list(csv.DictReader(handle))
+        with _PERSIST_LOCK:
+            export_files = sorted(_exports_dir().glob("records_*.csv"), reverse=True)
+            for filepath in export_files:
+                with filepath.open("r", encoding="utf-8-sig", newline="") as handle:
+                    rows = list(csv.DictReader(handle))
 
-            for row in reversed(rows):
-                if source_message_id and row.get(message_column) == source_message_id:
-                    matches.append(dict(row))
-                elif chat_id:
-                    is_group_chat = chat_id.endswith("@g.us")
-                    if is_group_chat and row.get(group_column) == chat_id:
+                for row in reversed(rows):
+                    if source_message_id and row.get(message_column) == source_message_id:
                         matches.append(dict(row))
-                    elif not is_group_chat and row.get(sender_column) == chat_id:
-                        matches.append(dict(row))
+                    elif chat_id:
+                        is_group_chat = chat_id.endswith("@g.us")
+                        if is_group_chat and row.get(group_column) == chat_id:
+                            matches.append(dict(row))
+                        elif not is_group_chat and row.get(sender_column) == chat_id:
+                            matches.append(dict(row))
 
-                if len(matches) >= limit:
-                    return matches
+                    if len(matches) >= limit:
+                        return matches
 
-    return matches
+        return matches

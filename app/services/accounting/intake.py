@@ -29,6 +29,7 @@ from app.services.accounting import (
     media_prep,
     record_store,
 )
+from app.services.accounting.pipeline_context import PipelineContext, current_pipeline_context, pipeline_context_scope
 from app.services.providers import google_sheets
 from app.utils.logging import get_logger
 
@@ -171,89 +172,93 @@ def process_incoming_message(
     filename: str | None = None,
     source_type: str | None = None,
     attachment_url: str | None = None,
-) -> None:
+    context: PipelineContext | None = None,
+) -> str:
     """Run the full intake flow for one inbound message."""
-    logger.info(
-        "Processing %s message id=%s type=%s sender=%s chat_id=%s chat_type=%s",
-        route.platform,
-        message_id,
-        msg_type,
-        route.sender_id,
-        route.chat_id,
-        route.chat_type,
-    )
+    with pipeline_context_scope(context):
+        logger.info(
+            "Processing %s message id=%s type=%s sender=%s chat_id=%s chat_type=%s namespace=%s",
+            route.platform,
+            message_id,
+            msg_type,
+            route.sender_id,
+            route.chat_id,
+            route.chat_type,
+            current_pipeline_context().normalized_namespace,
+        )
 
-    if not record_store.claim_message_processing(message_id):
-        logger.info("Message id=%s already completed or in-flight; skipping duplicate.", message_id)
-        return
+        if not record_store.claim_message_processing(message_id):
+            logger.info("Message id=%s already completed or in-flight; skipping duplicate.", message_id)
+            return "duplicate_message"
 
-    try:
-        if settings.whatsapp_groups_only and route.chat_type != "group":
-            outcome = _handle_disabled_individual_chat(route, send_text)
-            record_store.mark_message_handled(message_id, outcome=outcome)
-            return
+        try:
+            if settings.whatsapp_groups_only and route.chat_type != "group":
+                outcome = _handle_disabled_individual_chat(route, send_text)
+                record_store.mark_message_handled(message_id, outcome=outcome)
+                return outcome
 
-        if msg_type == "text":
-            # Manager text → attempt elden ödeme extraction first
-            if _is_manager(route.sender_id):
-                outcome = _handle_manager_text(
-                    text=text or "",
+            if msg_type == "text":
+                if _is_manager(route.sender_id):
+                    outcome = _handle_manager_text(
+                        text=text or "",
+                        route=route,
+                        send_text=send_text,
+                        message_id=message_id,
+                    )
+                else:
+                    outcome = _handle_text(text or "", route, send_text)
+                record_store.mark_message_handled(message_id, outcome=outcome)
+                return outcome
+
+            if msg_type in {"image", "document"}:
+                if fetch_media is None or not mime_type or not filename or not source_type:
+                    outcome = _handle_media_failure(
+                        route,
+                        send_text,
+                        send_reaction,
+                        message=MSG_MEDIA_FETCH_ERROR,
+                        reason="missing media configuration",
+                        outcome="missing_media_configuration",
+                    )
+                    record_store.mark_message_handled(message_id, outcome=outcome)
+                    logger.warning("Missing media configuration for message id=%s", message_id)
+                    return outcome
+
+                outcome = _handle_media(
+                    message_id=message_id,
                     route=route,
                     send_text=send_text,
-                    message_id=message_id,
+                    send_reaction=send_reaction,
+                    fetch_media=fetch_media,
+                    mime_type=mime_type,
+                    filename=filename,
+                    source_type=source_type,
+                    attachment_url=attachment_url,
                 )
-            else:
-                outcome = _handle_text(text or "", route, send_text)
-            record_store.mark_message_handled(message_id, outcome=outcome)
-            return
+                if outcome in _RETRYABLE_MEDIA_OUTCOMES:
+                    record_store.release_message_processing(message_id)
+                else:
+                    record_store.mark_message_handled(message_id, outcome=outcome)
+                return outcome
 
-        if msg_type in {"image", "document"}:
-            if fetch_media is None or not mime_type or not filename or not source_type:
-                _handle_media_failure(
+            logger.info("Unsupported message type '%s'; skipping.", msg_type)
+            record_store.mark_message_handled(message_id, outcome="unsupported_message_type")
+            return "unsupported_message_type"
+
+        except Exception as exc:
+            logger.error("Unhandled error processing message %s: %s", message_id, exc, exc_info=True)
+            record_store.release_message_processing(message_id)
+            if msg_type in {"image", "document"}:
+                return _handle_media_failure(
                     route,
                     send_text,
                     send_reaction,
-                    message=MSG_MEDIA_FETCH_ERROR,
-                    reason="missing media configuration",
-                    outcome="missing_media_configuration",
+                    message=MSG_ERROR,
+                    reason="fatal processing error",
+                    outcome="fatal_processing_error",
                 )
-                record_store.mark_message_handled(message_id, outcome="missing_media_configuration")
-                logger.warning("Missing media configuration for message id=%s", message_id)
-                return
-
-            outcome = _handle_media(
-                message_id=message_id,
-                route=route,
-                send_text=send_text,
-                send_reaction=send_reaction,
-                fetch_media=fetch_media,
-                mime_type=mime_type,
-                filename=filename,
-                source_type=source_type,
-                attachment_url=attachment_url,
-            )
-            if outcome in _RETRYABLE_MEDIA_OUTCOMES:
-                record_store.release_message_processing(message_id)
-            else:
-                record_store.mark_message_handled(message_id, outcome=outcome)
-            return
-
-        logger.info("Unsupported message type '%s'; skipping.", msg_type)
-        record_store.mark_message_handled(message_id, outcome="unsupported_message_type")
-
-    except Exception as exc:
-        logger.error("Unhandled error processing message %s: %s", message_id, exc, exc_info=True)
-        record_store.release_message_processing(message_id)
-        if msg_type in {"image", "document"}:
-            _handle_media_failure(
-                route,
-                send_text,
-                send_reaction,
-                message=MSG_ERROR,
-                reason="fatal processing error",
-            )
-        else:
             _safe_send_text_message(route, MSG_ERROR, reason="fatal processing error", send_text=send_text)
+            return "fatal_processing_error"
 
 
 # ─── Text handlers ────────────────────────────────────────────────────────────
@@ -507,6 +512,14 @@ def _handle_media(
 def _safe_send_text_message(
     route: MessageRoute, text: str, *, reason: str, send_text: SendTextFn
 ) -> None:
+    if current_pipeline_context().disable_outbound_messages:
+        logger.info(
+            "Skipping outbound text in namespace=%s for chat_id=%s reason=%s",
+            current_pipeline_context().normalized_namespace,
+            route.chat_id,
+            reason,
+        )
+        return
     try:
         send_text(route, text)
     except Exception as exc:
@@ -528,6 +541,14 @@ def _safe_send_reaction(
     reason: str,
     send_reaction: SendReactionFn | None,
 ) -> None:
+    if current_pipeline_context().disable_outbound_messages:
+        logger.info(
+            "Skipping outbound reaction in namespace=%s for chat_id=%s reason=%s",
+            current_pipeline_context().normalized_namespace,
+            route.chat_id,
+            reason,
+        )
+        return
     if send_reaction is None:
         return
     try:

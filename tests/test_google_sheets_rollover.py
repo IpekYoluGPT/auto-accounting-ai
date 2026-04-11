@@ -269,5 +269,5 @@ def test_ensure_current_month_spreadsheet_ready_skips_immediate_repair_for_recen
     ) as repair_mock:
         result = google_sheets.ensure_current_month_spreadsheet_ready()
 
-    assert result is None
+    assert result == "sheet-123"
     repair_mock.assert_not_called()

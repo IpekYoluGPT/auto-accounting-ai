@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from app.services.accounting.pipeline_context import pipeline_context_scope, sandbox_context
 from app.services.providers import google_sheets
 from app.services.providers.google_sheets import _retry_on_rate_limit
 
@@ -616,3 +617,80 @@ def test_append_record_skips_pending_payload_when_storage_budget_is_exceeded(tmp
     assert len(items) == 1
     assert items[0]["document_payload_path"] == ""
     assert list((Path(tmp_path) / "state" / "pending_sheet_appends").glob("*.bin")) == []
+
+
+def test_google_sheets_paths_are_namespaced_for_sandbox(tmp_path, monkeypatch):
+    monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
+
+    production_registry = google_sheets._registry_path()
+    assert production_registry == Path(tmp_path) / "state" / "sheets_registry.json"
+
+    with pipeline_context_scope(sandbox_context(session_id="alpha")):
+        sandbox_registry = google_sheets._registry_path()
+        sandbox_sheet_queue = google_sheets._pending_sheet_appends_state_path()
+        sandbox_drive_folder = google_sheets._month_drive_folder_name()
+
+    assert sandbox_registry == Path(tmp_path) / "sandboxes" / "sandbox-alpha" / "state" / "sheets_registry.json"
+    assert sandbox_sheet_queue == Path(tmp_path) / "sandboxes" / "sandbox-alpha" / "state" / "pending_sheet_appends.json"
+    assert sandbox_drive_folder.startswith("[SANDBOX alpha] Fişler — ")
+
+
+def test_start_pending_sheet_worker_is_noop_in_sandbox(monkeypatch):
+    thread_started = {"count": 0}
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            thread_started["count"] += 1
+
+        def start(self):
+            thread_started["count"] += 100
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(google_sheets, "_pending_sheet_worker_thread", None)
+    monkeypatch.setattr(google_sheets.threading, "Thread", FakeThread)
+
+    with pipeline_context_scope(sandbox_context(session_id="alpha")):
+        google_sheets.start_pending_sheet_append_worker()
+
+    assert thread_started["count"] == 0
+
+
+def test_process_pending_sheet_appends_repairs_target_tabs_before_append(tmp_path, monkeypatch):
+    monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
+    monkeypatch.setattr(google_sheets.settings, "google_sheets_spreadsheet_id", "sheet-batch-audit")
+
+    record = google_sheets.BillRecord(
+        company_name="ABC Market",
+        total_amount=100.0,
+        currency="TRY",
+        source_message_id="wamid-sheet-audit",
+        document_date="2026-04-11",
+        confidence=0.91,
+    )
+
+    monkeypatch.setattr(google_sheets, "_get_client", lambda: object())
+    monkeypatch.setattr(google_sheets, "start_pending_sheet_append_worker", lambda: None)
+    google_sheets.append_record(
+        record,
+        google_sheets.DocumentCategory.FATURA,
+        drive_link="https://drive.google.com/file/d/test/view",
+    )
+
+    fake_ws = MagicMock()
+    fake_ws.get.return_value = []
+    fake_ws.col_values.return_value = ["#", "TOPLAM"]
+    fake_sheet = MagicMock()
+    fake_sheet.worksheet.return_value = fake_ws
+    fake_client = MagicMock()
+    fake_client.open_by_key.return_value = fake_sheet
+
+    audit_calls = []
+    monkeypatch.setattr(google_sheets, "_get_client", lambda: fake_client)
+    monkeypatch.setattr(google_sheets, "_audit_spreadsheet_layout", lambda sh, repair=False, target_tabs=None: audit_calls.append((sh, repair, target_tabs)) or [])
+
+    processed = google_sheets.process_pending_sheet_appends()
+
+    assert processed == 1
+    assert audit_calls == [(fake_sheet, True, {"🧾 Faturalar", "📊 Özet"})]
