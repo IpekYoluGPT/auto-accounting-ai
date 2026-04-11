@@ -1455,6 +1455,22 @@ def _return_source_label(category: DocumentCategory | None) -> str:
     return labels.get(category or DocumentCategory.BELIRSIZ, "Belirsiz")
 
 
+def _sender_display_name(record: BillRecord) -> str:
+    for candidate in (record.sender_name, record.source_sender_name):
+        if candidate is None:
+            continue
+        normalized = str(candidate).strip()
+        if not normalized:
+            continue
+        if normalized.endswith("@c.us") or normalized.endswith("@g.us"):
+            continue
+        compact = normalized.replace(" ", "").replace("+", "").replace("-", "").replace("(", "").replace(")", "")
+        if compact.isdigit():
+            continue
+        return normalized
+    return ""
+
+
 def _build_row(
     record: BillRecord,
     category: DocumentCategory,
@@ -1484,7 +1500,7 @@ def _build_row(
             _safe(r.document_date), _safe(r.document_time),
             _safe(r.company_name),
             _safe(r.document_number or r.invoice_number),
-            _safe(r.source_sender_id),
+            _sender_display_name(r),
             _safe(r.description),
             _safe(r.total_amount),
             _safe(r.currency or "TRY"),

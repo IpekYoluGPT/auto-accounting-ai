@@ -47,6 +47,7 @@ class TestNormalizeRecord:
             "vat_rate": 18.0,
             "vat_amount": 18.0,
             "total_amount": 118.0,
+            "sender_name": None,
             "payment_method": "Kredi Kartı",
             "expense_category": "Ofis",
             "description": "Ofis malzemeleri",
@@ -106,6 +107,10 @@ class TestNormalizeRecord:
     def test_empty_string_becomes_none(self):
         record = _normalize_record(self._raw(company_name=""))
         assert record.company_name is None
+
+    def test_sender_name_is_preserved(self):
+        record = _normalize_record(self._raw(sender_name="Ahmet Yılmaz"))
+        assert record.sender_name == "Ahmet Yılmaz"
 
 
 class TestExtractBill:
@@ -195,6 +200,30 @@ class TestExtractBill:
         assert "Belge muhtemelen bir iade/iptal niteligi tasiyor." in prompt
         assert "Goruntude yaklasik 3 ayri belge bekleniyor." in prompt
         assert "El yazili hafriyat/malzeme formu" in prompt
+        assert "never copy company names" in mock_generate.call_args.kwargs["system_instruction"]
+
+    def test_dekont_prompt_requests_name_not_phone_for_sender(self, monkeypatch):
+        monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
+        expected = AIMultiExtractionResult(
+            documents=[AIExtractionResult(company_name="Banka", sender_name="Ahmet Yılmaz", currency="TRY", confidence=0.8)]
+        )
+
+        with patch(
+            "app.services.accounting.gemini_extractor.gemini_client.generate_structured_content",
+            return_value=expected,
+        ) as mock_generate:
+            extract_bills(
+                b"fake_image",
+                mime_type="image/jpeg",
+                source_message_id="msg-dekont-1",
+                source_filename="dekont.jpg",
+                source_type="image",
+                category_hint=DocumentCategory.ODEME_DEKONTU,
+            )
+
+        prompt = mock_generate.call_args.kwargs["prompt"]
+        assert "sender_name alanina sadece gonderen kisi/firma adini yaz" in prompt
+        assert "telefon, IBAN, hesap numarasi" in prompt
 
     def test_multi_document_extraction(self, monkeypatch):
         monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")

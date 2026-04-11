@@ -26,6 +26,7 @@ Rules:
 - If multiple documents are present, return one object per distinct document sorted left-to-right, then top-to-bottom.
 - Do not merge separate documents into one record.
 - For return documents, extract the values exactly as shown; do not flip signs unless the document itself shows a negative or return amount.
+- Examples and category hints are pattern guidance only; never copy company names, people names, amounts, serial numbers, or wording from prior examples.
 """
 
 _EXTRACTION_PROMPT = """Extract bookkeeping fields from this Turkish business document image or PDF.
@@ -44,7 +45,8 @@ _CATEGORY_SPECIFIC_INSTRUCTIONS: dict[DocumentCategory, str] = {
 - company_name alanina gorunur banka, odeme kurumu veya baskin karsi taraf adini yaz.
 - document_number alanina referans / islem / dekont numarasini koy.
 - total_amount transfer edilen nihai tutardir.
-- description alanina alici, gonderen veya islem aciklamasini kisa ve yararli bicimde koy.""",
+- sender_name alanina sadece gonderen kisi/firma adini yaz; telefon, IBAN, hesap numarasi, referans veya aciklama yazma. Isim gorunmuyorsa null birak.
+- description alanina alici veya islem aciklamasini kisa ve yararli bicimde koy.""",
     DocumentCategory.HARCAMA_FISI: """Belge ailesi: HARCAMA FISI.
 - company_name satici isletmedir.
 - receipt_number icin once Fis No, yoksa Belge No kullan.
@@ -119,6 +121,7 @@ def _normalize_record(raw: dict) -> BillRecord:
         vat_rate=_safe_float(raw.get("vat_rate")),
         vat_amount=_safe_float(raw.get("vat_amount")),
         total_amount=_safe_float(raw.get("total_amount")),
+        sender_name=_safe_str(raw.get("sender_name")),
         payment_method=_safe_str(raw.get("payment_method")),
         expense_category=_safe_str(raw.get("expense_category")),
         description=_safe_str(raw.get("description")),
@@ -138,6 +141,7 @@ def extract_bills(
     source_filename: Optional[str] = None,
     source_type: Optional[str] = None,
     source_sender_id: Optional[str] = None,
+    source_sender_name: Optional[str] = None,
     source_group_id: Optional[str] = None,
     source_chat_type: Optional[str] = None,
     *,
@@ -190,6 +194,7 @@ def extract_bills(
         record.source_filename = source_filename
         record.source_type = source_type
         record.source_sender_id = source_sender_id
+        record.source_sender_name = source_sender_name
         record.source_group_id = source_group_id
         record.source_chat_type = source_chat_type
         records.append(record)
@@ -210,6 +215,7 @@ def extract_bill(
     source_filename: Optional[str] = None,
     source_type: Optional[str] = None,
     source_sender_id: Optional[str] = None,
+    source_sender_name: Optional[str] = None,
     source_group_id: Optional[str] = None,
     source_chat_type: Optional[str] = None,
     *,
@@ -223,6 +229,7 @@ def extract_bill(
         source_filename=source_filename,
         source_type=source_type,
         source_sender_id=source_sender_id,
+        source_sender_name=source_sender_name,
         source_group_id=source_group_id,
         source_chat_type=source_chat_type,
         category_hint=category_hint,

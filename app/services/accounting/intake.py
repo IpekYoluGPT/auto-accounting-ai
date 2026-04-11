@@ -129,6 +129,7 @@ class MessageRoute:
     chat_id: str
     chat_type: Literal["individual", "group"]
     recipient_type: str
+    sender_name: str | None = None
     group_id: str | None = None
     reply_to_message_id: str | None = None
 
@@ -312,6 +313,7 @@ def _handle_manager_text(
         description=description or text[:200],
         source_message_id=message_id,
         source_sender_id=route.sender_id,
+        source_sender_name=route.sender_name,
         source_group_id=route.group_id,
         source_chat_type=route.chat_type,
         source_type="manager_text",
@@ -438,6 +440,7 @@ def _handle_media(
             source_filename=filename,
             source_type=source_type,
             source_sender_id=route.sender_id,
+            source_sender_name=route.sender_name,
             source_group_id=route.group_id,
             source_chat_type=route.chat_type,
             category_hint=category,

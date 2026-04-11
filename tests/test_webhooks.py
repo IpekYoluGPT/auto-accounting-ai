@@ -21,6 +21,7 @@ def _image_payload(
     message_id: str = "wamid-1",
     *,
     sender: str = "905551112233",
+    sender_name: str | None = None,
     group_id: str | None = None,
 ) -> dict:
     message = {
@@ -33,6 +34,13 @@ def _image_payload(
     if group_id:
         message["group_id"] = group_id
 
+    value = {
+        "messaging_product": "whatsapp",
+        "messages": [message],
+    }
+    if sender_name:
+        value["contacts"] = [{"wa_id": sender, "profile": {"name": sender_name}}]
+
     return {
         "object": "whatsapp_business_account",
         "entry": [
@@ -41,10 +49,7 @@ def _image_payload(
                 "changes": [
                     {
                         "field": "messages",
-                        "value": {
-                            "messaging_product": "whatsapp",
-                            "messages": [message],
-                        },
+                        "value": value,
                     }
                 ],
             }
@@ -241,6 +246,41 @@ def test_happy_path_image_webhook_writes_csv_and_reacts():
         assert reaction_mock.call_args_list[0].kwargs["recipient_type"] == "individual"
 
 
+def test_meta_contact_name_is_forwarded_to_extractor():
+    with TemporaryDirectory() as tmpdir:
+        client = TestClient(app)
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
+        ), patch(
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(DocumentCategory.ODEME_DEKONTU, confidence=0.95),
+        ), patch(
+            "app.services.accounting.intake.gemini_extractor.extract_bills",
+            return_value=[
+                BillRecord(
+                    company_name="Yapi Kredi",
+                    total_amount=100.0,
+                    currency="TRY",
+                    source_message_id="wamid-1",
+                )
+            ],
+        ) as extract_mock, patch(
+            "app.services.accounting.intake.google_sheets.upload_document",
+            return_value="https://drive.google.com/file/d/test/view",
+        ), patch(
+            "app.routes.webhooks.whatsapp.send_text_message"
+        ), patch(
+            "app.routes.webhooks.whatsapp.send_reaction_message"
+        ):
+            response = client.post(
+                "/webhook",
+                json=_image_payload(sender_name="Ahmet Yılmaz"),
+            )
+
+        assert response.status_code == 200
+        assert extract_mock.call_args.kwargs["source_sender_name"] == "Ahmet Yılmaz"
+
+
 def test_group_image_webhook_reacts_to_group_and_exports_group_metadata():
     record = BillRecord(
         company_name="ABC Market",
@@ -290,6 +330,7 @@ def test_group_image_webhook_reacts_to_group_and_exports_group_metadata():
             source_filename="media-1.jpg",
             source_type="image",
             source_sender_id="905551112233",
+            source_sender_name=None,
             source_group_id="group-123",
             source_chat_type="group",
             category_hint=DocumentCategory.FATURA,
@@ -686,6 +727,7 @@ def test_document_webhook_defaults_pdf_metadata():
             source_filename="media-doc-1.pdf",
             source_type="document",
             source_sender_id="905551112233",
+            source_sender_name=None,
             source_group_id=None,
             source_chat_type="individual",
             category_hint=DocumentCategory.FATURA,

@@ -52,16 +52,21 @@ async def receive_webhook(
 
     for entry in payload.entry:
         for change in entry.changes:
+            contact_names = {
+                contact.wa_id: (contact.profile or {}).get("name")
+                for contact in (change.value.contacts or [])
+                if contact.wa_id
+            }
             messages = change.value.messages or []
             for message in messages:
-                background_tasks.add_task(_process_message, message)
+                background_tasks.add_task(_process_message, message, contact_names.get(message.from_))
 
     return {"status": "ok"}
 
 
-def _process_message(message) -> None:
+def _process_message(message, sender_name: str | None = None) -> None:
     """Process a single WhatsApp message in the background."""
-    route = _resolve_message_route(message)
+    route = _resolve_message_route(message, sender_name=sender_name)
     if message.type == "text":
         process_incoming_message(
             message_id=message.id,
@@ -108,7 +113,7 @@ def _process_message(message) -> None:
     )
 
 
-def _resolve_message_route(message) -> MessageRoute:
+def _resolve_message_route(message, sender_name: str | None = None) -> MessageRoute:
     """Map an inbound message to the outbound chat target and export metadata."""
     group_id = (message.group_id or "").strip() or None
     if group_id:
@@ -118,6 +123,7 @@ def _resolve_message_route(message) -> MessageRoute:
             chat_id=group_id,
             chat_type="group",
             recipient_type="group",
+            sender_name=sender_name,
             group_id=group_id,
             reply_to_message_id=message.id,
         )
@@ -128,6 +134,7 @@ def _resolve_message_route(message) -> MessageRoute:
         chat_id=message.from_,
         chat_type="individual",
         recipient_type="individual",
+        sender_name=sender_name,
         reply_to_message_id=message.id,
     )
 

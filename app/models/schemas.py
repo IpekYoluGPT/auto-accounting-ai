@@ -132,6 +132,10 @@ class PeriskopeMessage(BaseModel):
     has_media: Optional[bool] = False
     media: Optional[PeriskopeMedia] = None
     sender_phone: Optional[str] = None
+    sender_name: Optional[str] = None
+    push_name: Optional[str] = None
+    notify_name: Optional[str] = None
+    contact_name: Optional[str] = None
     quoted_message_id: Optional[str] = None
     timestamp: Optional[str] = None
     unique_id: Optional[str] = None
@@ -170,6 +174,7 @@ class PeriskopeCreateAccountingRecordRequest(BaseModel):
     source_filename: Optional[str] = None
     source_type: Optional[str] = "periskope_tool"
     source_sender_id: Optional[str] = None
+    source_sender_name: Optional[str] = None
     source_group_id: Optional[str] = None
     source_chat_type: Optional[Literal["individual", "group"]] = None
     company_name: Optional[str] = None
@@ -185,6 +190,7 @@ class PeriskopeCreateAccountingRecordRequest(BaseModel):
     vat_rate: Optional[float] = None
     vat_amount: Optional[float] = None
     total_amount: Optional[float] = None
+    sender_name: Optional[str] = None
     payment_method: Optional[str] = None
     expense_category: Optional[str] = None
     description: Optional[str] = None
@@ -230,6 +236,7 @@ class BillRecord(BaseModel):
     vat_rate: Optional[float] = None
     vat_amount: Optional[float] = None
     total_amount: Optional[float] = None
+    sender_name: Optional[str] = None
 
     # Classification
     payment_method: Optional[str] = None
@@ -244,6 +251,7 @@ class BillRecord(BaseModel):
     source_filename: Optional[str] = None
     source_type: Optional[str] = None
     source_sender_id: Optional[str] = None
+    source_sender_name: Optional[str] = None
     source_group_id: Optional[str] = None
     source_chat_type: Optional[Literal["individual", "group"]] = None
     # AI confidence
@@ -266,6 +274,7 @@ class AIExtractionResult(BaseModel):
     vat_rate: Optional[float] = None
     vat_amount: Optional[float] = None
     total_amount: Optional[float] = None
+    sender_name: Optional[str] = None
     payment_method: Optional[
         Literal["Nakit", "Kredi Karti", "Kredi Kartı", "Banka Transferi", "Diger", "Diğer"]
     ] = None

@@ -29,15 +29,6 @@ _JUNK_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
-_DOCUMENT_REASON_KEYWORDS = re.compile(
-    r"fatura|fi\u015f|makbuz|invoice|receipt|bill",
-    re.IGNORECASE,
-)
-
-_TEMPLATE_REASON_KEYWORDS = re.compile(
-    r"\u00f6rnek|sample|template|demo|demonstration",
-    re.IGNORECASE,
-)
 
 
 def classify_text(text: str) -> ClassificationResult:
@@ -73,26 +64,5 @@ def classify_image(
         confidence=analysis.confidence,
     )
 
-    if _should_accept_invoice_like_template(result):
-        logger.warning("Overriding classifier rejection for invoice-like template document.")
-        return ClassificationResult(
-            is_bill=True,
-            reason="invoice-like template override",
-            confidence=max(0.6, min(result.confidence, 0.85)),
-        )
-
     return result
 
-
-def _should_accept_invoice_like_template(result: ClassificationResult) -> bool:
-    if result.is_bill:
-        return False
-
-    reason = (result.reason or "").strip()
-    if not reason:
-        return False
-
-    return bool(
-        _DOCUMENT_REASON_KEYWORDS.search(reason)
-        and _TEMPLATE_REASON_KEYWORDS.search(reason)
-    )

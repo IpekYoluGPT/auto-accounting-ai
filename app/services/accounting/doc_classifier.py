@@ -53,6 +53,7 @@ Kurallar:
 - needs_retry alanini sadece belge ciddi bicimde bulanik, karanlik, kesik, kapali, asiri uzak veya parca parca ise true yap.
 - Bir iade belgesinde mumkunse temel belge ailesini sec ve is_return=true yap. Sadece belge ailesi gercekten anlasilamiyorsa category=iade kullan.
 - Birden fazla belge varsa document_count alaninda tahmini sayiyi ver.
+- Ornekler yalnizca belge turunu anlatir; onceki orneklerden sirket adi, kisi adi, tutar, belge numarasi veya metin kopyalama.
 """
 
 _ANALYSIS_PROMPT = """Bu medya muhasebe surecine girecek bir Turkce is belgesi olabilir. JSON dondur.

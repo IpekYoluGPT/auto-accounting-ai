@@ -46,6 +46,7 @@ def _periskope_image_message(
     message_id: str = "peri-msg-1",
     chat_id: str = "120363410789660631@g.us",
     sender_phone: str = "905456952965@c.us",
+    sender_name: str | None = None,
     from_me: bool = False,
 ) -> dict:
     return {
@@ -59,6 +60,7 @@ def _periskope_image_message(
         "has_media": True,
         "sender_phone": sender_phone,
         "author": sender_phone,
+        "sender_name": sender_name,
         "media": {
             "path": "/storage/v1/object/public/message-media/org-1/group/receipt-1",
             "filename": "receipt-1.jpg",
@@ -200,6 +202,39 @@ def test_periskope_group_image_webhook_exports_and_reacts():
         assert react_mock.call_count == 2
         assert react_mock.call_args_list[0].args == ("peri-msg-1", "⌛")
         assert react_mock.call_args_list[1].args == ("peri-msg-1", "✅")
+
+
+def test_periskope_sender_name_is_forwarded_to_extractor():
+    payload = _periskope_event(_periskope_image_message(sender_name="Ahmet Yılmaz"))
+    signature = _sign_payload(payload, "periskope-secret")
+
+    with TemporaryDirectory() as tmpdir:
+        client = TestClient(app)
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.routes.periskope.periskope.fetch_media",
+            return_value=b"fake-image",
+        ), patch(
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(DocumentCategory.ODEME_DEKONTU, confidence=0.96),
+        ), patch(
+            "app.services.accounting.intake.gemini_extractor.extract_bills",
+            return_value=[BillRecord(company_name="Yapi Kredi", total_amount=245.5, currency="TRY")],
+        ) as extract_mock, patch(
+            "app.services.accounting.intake.google_sheets.upload_document",
+            return_value="https://drive.google.com/file/d/test/view",
+        ), patch(
+            "app.routes.periskope.periskope.send_text_message",
+        ), patch(
+            "app.routes.periskope.periskope.react_to_message",
+        ):
+            response = client.post(
+                "/integrations/periskope/webhook",
+                json=payload,
+                headers={"x-periskope-signature": signature},
+            )
+
+        assert response.status_code == 200
+        assert extract_mock.call_args.kwargs["source_sender_name"] == "Ahmet Yılmaz"
 
 
 def test_periskope_react_to_message_accepts_204_empty_response(monkeypatch):

@@ -93,6 +93,7 @@ async def create_accounting_record_tool(
         vat_rate=payload.vat_rate,
         vat_amount=payload.vat_amount,
         total_amount=payload.total_amount,
+        sender_name=payload.sender_name,
         payment_method=payload.payment_method,
         expense_category=payload.expense_category,
         description=payload.description,
@@ -101,6 +102,7 @@ async def create_accounting_record_tool(
         source_filename=payload.source_filename,
         source_type=payload.source_type or "periskope_tool",
         source_sender_id=source_sender_id,
+        source_sender_name=payload.source_sender_name,
         source_group_id=source_group_id,
         source_chat_type=source_chat_type,
         confidence=payload.confidence,
@@ -202,15 +204,27 @@ def _process_periskope_message(message: PeriskopeMessage) -> None:
 def _resolve_periskope_route(message: PeriskopeMessage) -> MessageRoute:
     is_group = message.chat_id.endswith("@g.us")
     sender_id = message.sender_phone or message.author or message.from_ or message.chat_id
+    sender_name = _best_sender_name(message)
     return MessageRoute(
         platform="periskope",
         sender_id=sender_id,
         chat_id=message.chat_id,
         chat_type="group" if is_group else "individual",
         recipient_type="periskope",
+        sender_name=sender_name,
         group_id=message.chat_id if is_group else None,
         reply_to_message_id=message.message_id,
     )
+
+
+def _best_sender_name(message: PeriskopeMessage) -> str | None:
+    for candidate in (message.sender_name, message.contact_name, message.push_name, message.notify_name):
+        if not candidate:
+            continue
+        normalized = str(candidate).strip()
+        if normalized and not normalized.endswith("@c.us") and not normalized.endswith("@g.us"):
+            return normalized
+    return None
 
 
 def _send_periskope_text_message(route: MessageRoute, text: str) -> None:

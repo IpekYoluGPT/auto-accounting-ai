@@ -81,6 +81,49 @@ def test_elden_odeme_row_includes_drive_verification_cell():
     assert google_sheets._TABS["💵 Elden Ödemeler"][0][-1] == "📎 Belge"
 
 
+def test_dekont_row_prefers_sender_name_over_phone_number():
+    row = google_sheets._build_row(
+        BillRecord(
+            document_date="2026-04-09",
+            document_time="10:30",
+            company_name="Yapı Kredi",
+            document_number="REF-123",
+            description="Alıcı: Mehmet Demir",
+            total_amount=2500.0,
+            currency="TRY",
+            sender_name="Ahmet Yılmaz",
+            source_sender_name="Meta Profil",
+            source_sender_id="905551112233",
+        ),
+        DocumentCategory.ODEME_DEKONTU,
+        seq=1,
+        drive_link=None,
+    )
+
+    assert row[5] == "Ahmet Yılmaz"
+
+
+def test_dekont_row_falls_back_to_source_sender_name_but_not_phone_number():
+    row = google_sheets._build_row(
+        BillRecord(
+            document_date="2026-04-09",
+            document_time="10:30",
+            company_name="Yapı Kredi",
+            document_number="REF-123",
+            description="Alıcı: Mehmet Demir",
+            total_amount=2500.0,
+            currency="TRY",
+            source_sender_name="Ayşe Demir",
+            source_sender_id="905551112233",
+        ),
+        DocumentCategory.ODEME_DEKONTU,
+        seq=1,
+        drive_link=None,
+    )
+
+    assert row[5] == "Ayşe Demir"
+
+
 def test_repair_drive_link_formulas_rewrites_old_comma_separator():
     ws = MagicMock()
     ws.get.return_value = [
