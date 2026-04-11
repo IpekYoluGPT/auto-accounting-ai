@@ -266,6 +266,106 @@ def test_process_pending_document_uploads_backfills_missing_drive_links(tmp_path
     assert payload_files == []
 
 
+def test_process_pending_document_uploads_resolves_row_id_after_row_reorder(tmp_path, monkeypatch):
+    monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
+    monkeypatch.setattr(google_sheets, "start_pending_drive_upload_worker", lambda: None)
+
+    google_sheets.queue_pending_document_upload(
+        file_bytes=b"pending-payload",
+        filename="Dekont.pdf",
+        mime_type="application/pdf",
+        targets=[
+            {
+                "spreadsheet_id": "sheet-123",
+                "tab_name": "💳 Dekontlar",
+                "row_number": 7,
+                "row_id": "pending-row-id",
+            }
+        ],
+        source_message_id="wamid-pending-row-id",
+    )
+
+    fake_ws = MagicMock()
+    fake_ws.get.return_value = [["other-row"], ["pending-row-id"]]
+    fake_sheet = MagicMock()
+    fake_sheet.worksheet.return_value = fake_ws
+    fake_client = MagicMock()
+    fake_client.open_by_key.return_value = fake_sheet
+
+    monkeypatch.setattr(google_sheets, "_get_client", lambda: fake_client)
+    monkeypatch.setattr(
+        google_sheets,
+        "upload_document",
+        lambda file_bytes, filename, mime_type: "https://drive.google.com/file/d/pending/view",
+    )
+
+    processed = google_sheets.process_pending_document_uploads()
+
+    assert processed == 1
+    fake_ws.get.assert_called_once_with("L3:L")
+    fake_ws.update.assert_called_once_with(
+        [['=HYPERLINK("https://drive.google.com/file/d/pending/view";"📄 Görüntüle")']],
+        "K4",
+        value_input_option="USER_ENTERED",
+    )
+
+
+
+def test_process_pending_document_uploads_reuses_cached_drive_link_after_row_lookup_retry(tmp_path, monkeypatch):
+    monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
+    monkeypatch.setattr(google_sheets, "start_pending_drive_upload_worker", lambda: None)
+
+    google_sheets.queue_pending_document_upload(
+        file_bytes=b"pending-payload",
+        filename="Dekont.pdf",
+        mime_type="application/pdf",
+        targets=[
+            {
+                "spreadsheet_id": "sheet-123",
+                "tab_name": "💳 Dekontlar",
+                "row_number": 7,
+                "row_id": "pending-row-id",
+            }
+        ],
+        source_message_id="wamid-pending-retry",
+    )
+
+    fake_ws = MagicMock()
+    fake_sheet = MagicMock()
+    fake_sheet.worksheet.return_value = fake_ws
+    fake_client = MagicMock()
+    fake_client.open_by_key.return_value = fake_sheet
+    monkeypatch.setattr(google_sheets, "_get_client", lambda: fake_client)
+
+    upload_calls = {"count": 0}
+
+    def _upload_document(file_bytes, filename, mime_type):
+        upload_calls["count"] += 1
+        return "https://drive.google.com/file/d/pending/view"
+
+    monkeypatch.setattr(google_sheets, "upload_document", _upload_document)
+
+    fake_ws.get.return_value = []
+    processed = google_sheets.process_pending_document_uploads()
+    assert processed == 0
+    assert upload_calls["count"] == 1
+    pending_items = google_sheets._load_pending_drive_uploads()
+    assert len(pending_items) == 1
+    assert pending_items[0]["drive_link"] == "https://drive.google.com/file/d/pending/view"
+
+    fake_ws.get.return_value = [["pending-row-id"]]
+    processed = google_sheets.process_pending_document_uploads()
+
+    assert processed == 1
+    assert upload_calls["count"] == 1
+    fake_ws.update.assert_called_once_with(
+        [['=HYPERLINK("https://drive.google.com/file/d/pending/view";"📄 Görüntüle")']],
+        "K3",
+        value_input_option="USER_ENTERED",
+    )
+    assert google_sheets._load_pending_drive_uploads() == []
+
+
 
 def test_queue_pending_document_upload_merges_targets_for_same_message(tmp_path, monkeypatch):
     monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
@@ -275,14 +375,18 @@ def test_queue_pending_document_upload_merges_targets_for_same_message(tmp_path,
         file_bytes=b"doc-bytes",
         filename="Dekont.pdf",
         mime_type="application/pdf",
-        targets=[{"spreadsheet_id": "sheet-1", "tab_name": "💳 Dekontlar", "row_number": 3}],
+        targets=[
+            {"spreadsheet_id": "sheet-1", "tab_name": "💳 Dekontlar", "row_number": 3, "row_id": "row-dekont-1"}
+        ],
         source_message_id="wamid-merge-1",
     )
     google_sheets.queue_pending_document_upload(
         file_bytes=b"doc-bytes",
         filename="Dekont.pdf",
         mime_type="application/pdf",
-        targets=[{"spreadsheet_id": "sheet-1", "tab_name": "↩️ İadeler", "row_number": 5}],
+        targets=[
+            {"spreadsheet_id": "sheet-1", "tab_name": "↩️ İadeler", "row_number": 5, "row_id": "row-iade-1"}
+        ],
         source_message_id="wamid-merge-1",
     )
 
@@ -290,8 +394,8 @@ def test_queue_pending_document_upload_merges_targets_for_same_message(tmp_path,
     assert len(items) == 1
     assert items[0]["source_message_id"] == "wamid-merge-1"
     assert items[0]["targets"] == [
-        {"spreadsheet_id": "sheet-1", "tab_name": "💳 Dekontlar", "row_number": 3},
-        {"spreadsheet_id": "sheet-1", "tab_name": "↩️ İadeler", "row_number": 5},
+        {"spreadsheet_id": "sheet-1", "tab_name": "💳 Dekontlar", "row_number": 3, "row_id": "row-dekont-1"},
+        {"spreadsheet_id": "sheet-1", "tab_name": "↩️ İadeler", "row_number": 5, "row_id": "row-iade-1"},
     ]
 
 
@@ -387,7 +491,12 @@ def test_process_pending_sheet_appends_batches_rows_and_queues_drive_backfill(tm
     assert appended_rows[0][-1] == pending_id
     queue_mock.assert_called_once()
     assert queue_mock.call_args.kwargs["targets"] == [
-        {"spreadsheet_id": "sheet-batch-1", "tab_name": "🧾 Faturalar", "row_number": 3}
+        {
+            "spreadsheet_id": "sheet-batch-1",
+            "tab_name": "🧾 Faturalar",
+            "row_number": 3,
+            "row_id": pending_id,
+        }
     ]
     assert queue_mock.call_args.kwargs["source_message_id"] == "wamid-sheet-2"
     assert google_sheets._load_pending_sheet_appends() == []

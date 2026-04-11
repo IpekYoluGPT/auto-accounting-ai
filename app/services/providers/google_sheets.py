@@ -1673,12 +1673,22 @@ def _next_seq(ws) -> int:
         return 1
 
 
-def _build_drive_link_target(*, spreadsheet_id: str, tab_name: str, row_number: int) -> dict[str, str | int]:
-    return {
+def _build_drive_link_target(
+    *,
+    spreadsheet_id: str,
+    tab_name: str,
+    row_number: int,
+    row_id: str | None = None,
+) -> dict[str, str | int]:
+    target: dict[str, str | int] = {
         "spreadsheet_id": str(spreadsheet_id),
         "tab_name": tab_name,
         "row_number": int(row_number),
     }
+    normalized_row_id = (row_id or "").strip()
+    if normalized_row_id:
+        target["row_id"] = normalized_row_id
+    return target
 
 
 def _load_pending_drive_uploads() -> list[dict]:
@@ -1699,6 +1709,40 @@ def _save_pending_drive_uploads(items: list[dict]) -> None:
     )
 
 
+def _normalize_drive_link_target(target: dict[str, str | int]) -> dict[str, str | int]:
+    normalized: dict[str, str | int] = {
+        "spreadsheet_id": str(target["spreadsheet_id"]),
+        "tab_name": str(target["tab_name"]),
+        "row_number": int(target["row_number"]),
+    }
+    row_id = str(target.get("row_id") or "").strip()
+    if row_id:
+        normalized["row_id"] = row_id
+    return normalized
+
+
+def _drive_link_target_key(target: dict[str, str | int]) -> tuple[str, str, str, str | int]:
+    spreadsheet_id = str(target.get("spreadsheet_id") or "")
+    tab_name = str(target.get("tab_name") or "")
+    row_id = str(target.get("row_id") or "").strip()
+    if row_id:
+        return (spreadsheet_id, tab_name, "row_id", row_id)
+    return (spreadsheet_id, tab_name, "row_number", int(target.get("row_number") or 0))
+
+
+def _resolve_drive_link_target_row_number(ws, target: dict[str, str | int]) -> int:
+    tab_name = str(target["tab_name"])
+    row_id = str(target.get("row_id") or "").strip()
+    if row_id:
+        resolved = _existing_row_numbers_by_pending_id(ws, tab_name, {row_id}).get(row_id)
+        if resolved is None:
+            raise RuntimeError(
+                f"Pending Drive backfill row id '{row_id}' was not found in tab '{tab_name}'."
+            )
+        return resolved
+    return int(target["row_number"])
+
+
 def _write_drive_link_to_target(target: dict[str, str | int], drive_link: str) -> None:
     client = _get_client()
     if client is None:
@@ -1706,11 +1750,12 @@ def _write_drive_link_to_target(target: dict[str, str | int], drive_link: str) -
 
     spreadsheet_id = str(target["spreadsheet_id"])
     tab_name = str(target["tab_name"])
-    row_number = int(target["row_number"])
-    cell_a1 = f"{_drive_column_letter(tab_name)}{row_number}"
 
     sh = client.open_by_key(spreadsheet_id)
     ws = sh.worksheet(tab_name)
+    row_number = _resolve_drive_link_target_row_number(ws, target)
+    cell_a1 = f"{_drive_column_letter(tab_name)}{row_number}"
+
     _retry_on_rate_limit(
         lambda: ws.update([[_drive_cell(drive_link)]], cell_a1, value_input_option="USER_ENTERED")
     )
@@ -1727,14 +1772,7 @@ def queue_pending_document_upload(
     if not targets:
         return
 
-    normalized_targets = [
-        {
-            "spreadsheet_id": str(target["spreadsheet_id"]),
-            "tab_name": str(target["tab_name"]),
-            "row_number": int(target["row_number"]),
-        }
-        for target in targets
-    ]
+    normalized_targets = [_normalize_drive_link_target(target) for target in targets]
 
     with _pending_drive_uploads_lock:
         items = _load_pending_drive_uploads()
@@ -1746,19 +1784,11 @@ def queue_pending_document_upload(
                     and str(existing.get("mime_type") or "") == mime_type
                 ):
                     known_targets = {
-                        (
-                            str(target.get("spreadsheet_id") or ""),
-                            str(target.get("tab_name") or ""),
-                            int(target.get("row_number") or 0),
-                        )
+                        _drive_link_target_key(target)
                         for target in existing.get("targets", [])
                     }
                     for target in normalized_targets:
-                        target_key = (
-                            target["spreadsheet_id"],
-                            target["tab_name"],
-                            target["row_number"],
-                        )
+                        target_key = _drive_link_target_key(target)
                         if target_key not in known_targets:
                             existing.setdefault("targets", []).append(target)
                             known_targets.add(target_key)
@@ -1827,12 +1857,14 @@ def process_pending_document_uploads(*, max_items: int | None = None) -> int:
                 _save_pending_drive_uploads(items)
             continue
 
+        drive_link = str(item.get("drive_link") or "").strip()
         try:
-            drive_link = upload_document(
-                payload_path.read_bytes(),
-                filename=str(item.get("filename") or payload_path.name),
-                mime_type=str(item.get("mime_type") or "application/octet-stream"),
-            )
+            if not drive_link:
+                drive_link = upload_document(
+                    payload_path.read_bytes(),
+                    filename=str(item.get("filename") or payload_path.name),
+                    mime_type=str(item.get("mime_type") or "application/octet-stream"),
+                )
             if not drive_link:
                 raise RuntimeError("Drive upload returned no link.")
 
@@ -1860,6 +1892,8 @@ def process_pending_document_uploads(*, max_items: int | None = None) -> int:
                         continue
                     existing["attempts"] = int(existing.get("attempts", 0)) + 1
                     existing["last_error"] = str(exc)
+                    if drive_link:
+                        existing["drive_link"] = drive_link
                     break
                 _save_pending_drive_uploads(items)
             logger.warning(
@@ -2270,6 +2304,7 @@ def process_pending_sheet_appends(*, max_items: int | None = None) -> int:
                             spreadsheet_id=spreadsheet_id,
                             tab_name=tab_name,
                             row_number=row_number,
+                            row_id=item_id,
                         )
                     ],
                     source_message_id=str(item.get("source_message_id") or "") or None,
