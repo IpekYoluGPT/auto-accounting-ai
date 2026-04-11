@@ -439,6 +439,26 @@ def _retry_on_rate_limit(fn, *, max_retries: int = 5, base_delay: float = 5.0):
     return fn()
 
 
+def _open_spreadsheet_by_key(client, spreadsheet_id: str):
+    return _retry_on_rate_limit(lambda: client.open_by_key(spreadsheet_id))
+
+
+def _get_worksheet(sh, title: str):
+    return _retry_on_rate_limit(lambda: sh.worksheet(title))
+
+
+def _list_worksheets(sh):
+    return _retry_on_rate_limit(lambda: sh.worksheets())
+
+
+def _get_range_values(ws, range_name: str, **kwargs):
+    return _retry_on_rate_limit(lambda: ws.get(range_name, **kwargs))
+
+
+def _row_values(ws, row_number: int):
+    return _retry_on_rate_limit(lambda: ws.row_values(row_number))
+
+
 def _is_transient_drive_error(exc: Exception) -> bool:
     if isinstance(exc, (ssl.SSLError, BrokenPipeError, TimeoutError, ConnectionError)):
         return True
@@ -1097,7 +1117,7 @@ def _worksheet_has_visible_data(ws, tab_name: str) -> bool:
     headers, _ = _TABS[tab_name]
     last_col = _internal_row_id_column_letter(tab_name)
     try:
-        rows = ws.get(f"A3:{last_col}")
+        rows = _get_range_values(ws, f"A3:{last_col}")
     except Exception:
         return False
 
@@ -1111,7 +1131,7 @@ def _worksheet_has_visible_data(ws, tab_name: str) -> bool:
 def _archive_drifted_tab(sh, ws, tab_name: str) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     base_title = f"{tab_name} MANUAL_DRIFT {timestamp}"
-    existing_titles = {worksheet.title for worksheet in sh.worksheets()}
+    existing_titles = {worksheet.title for worksheet in _list_worksheets(sh)}
     archived_title = base_title[:100]
     counter = 1
     while archived_title in existing_titles:
@@ -1127,7 +1147,7 @@ def _backfill_internal_row_ids(ws, tab_name: str) -> int:
     hidden_col = _internal_row_id_column_letter(tab_name)
     last_col = hidden_col
     try:
-        rows = ws.get(f"A3:{last_col}")
+        rows = _get_range_values(ws, f"A3:{last_col}")
     except Exception:
         return 0
 
@@ -1153,7 +1173,7 @@ def _backfill_internal_row_ids(ws, tab_name: str) -> int:
 
 def _tab_headers_match(ws, tab_name: str) -> bool:
     expected_headers, _ = _TABS[tab_name]
-    actual_headers = ws.row_values(1)[: len(expected_headers)]
+    actual_headers = _row_values(ws, 1)[: len(expected_headers)]
     return actual_headers == expected_headers
 
 
@@ -1161,7 +1181,7 @@ def _tab_total_row_is_valid(ws, tab_name: str) -> bool:
     headers, _ = _TABS[tab_name]
     last_col = _col_letter(len(headers) - 1)
     try:
-        rows = ws.get(f"A2:{last_col}2", value_render_option="FORMULA")
+        rows = _get_range_values(ws, f"A2:{last_col}2", value_render_option="FORMULA")
     except Exception:
         return False
 
@@ -1180,7 +1200,7 @@ def _tab_total_row_is_valid(ws, tab_name: str) -> bool:
 
 def _summary_tab_is_valid(ws) -> bool:
     try:
-        rows = ws.get("A1:B10", value_render_option="FORMULA")
+        rows = _get_range_values(ws, "A1:B10", value_render_option="FORMULA")
     except Exception:
         return False
 
@@ -1205,7 +1225,7 @@ def _audit_summary_tab(sh, findings: list[dict[str, object]], *, repair: bool) -
     import gspread
 
     try:
-        ws = sh.worksheet("📊 Özet")
+        ws = _get_worksheet(sh, "📊 Özet")
     except gspread.WorksheetNotFound:
         findings.append({
             "tab_name": "📊 Özet",
@@ -1240,7 +1260,7 @@ def _audit_data_tab(sh, tab_name: str, findings: list[dict[str, object]], *, rep
     import gspread
 
     try:
-        ws = sh.worksheet(tab_name)
+        ws = _get_worksheet(sh, tab_name)
     except gspread.WorksheetNotFound:
         findings.append({
             "tab_name": tab_name,
@@ -1303,7 +1323,7 @@ def _audit_data_tab(sh, tab_name: str, findings: list[dict[str, object]], *, rep
         headers, _ = _TABS[tab_name]
         hidden_col = _internal_row_id_column_letter(tab_name)
         try:
-            rows = ws.get(f"A3:{hidden_col}")
+            rows = _get_range_values(ws, f"A3:{hidden_col}")
         except Exception:
             rows = []
         missing_count = 0
@@ -1329,7 +1349,7 @@ def _audit_spreadsheet_layout(sh, *, repair: bool = False, target_tabs: set[str]
     canonical_titles = set(_TABS.keys())
     titles_to_check = [tab_name for tab_name in _TABS if target_tabs is None or tab_name in target_tabs]
 
-    existing_titles = {worksheet.title for worksheet in sh.worksheets()}
+    existing_titles = {worksheet.title for worksheet in _list_worksheets(sh)}
     for orphan_title in sorted(existing_titles - canonical_titles):
         findings.append({
             "tab_name": orphan_title,
@@ -1361,7 +1381,7 @@ def audit_current_month_spreadsheet(*, spreadsheet_id: Optional[str] = None, rep
         raise RuntimeError("Google Sheets client unavailable.")
 
     with _lock:
-        sh = client.open_by_key(spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
+        sh = _open_spreadsheet_by_key(client, spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
         findings = _audit_spreadsheet_layout(sh, repair=repair)
         return {
             "spreadsheet_id": sh.id,
@@ -1384,46 +1404,46 @@ def apply_test_drift(
         raise RuntimeError("Google Sheets client unavailable.")
 
     with _lock:
-        sh = client.open_by_key(spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
+        sh = _open_spreadsheet_by_key(client, spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
         target_tab = tab_name or "🧾 Faturalar"
 
         if action == "delete_summary_tab":
-            ws = sh.worksheet("📊 Özet")
+            ws = _get_worksheet(sh, "📊 Özet")
             sh.del_worksheet(ws)
             return {"spreadsheet_id": sh.id, "action": action, "applied": True, "tab_name": "📊 Özet"}
 
         if action == "rename_data_tab":
-            ws = sh.worksheet(target_tab)
+            ws = _get_worksheet(sh, target_tab)
             new_name = (replacement_name or f"{target_tab} RENAMED").strip()[:100]
             ws.update_title(new_name)
             return {"spreadsheet_id": sh.id, "action": action, "applied": True, "tab_name": target_tab, "replacement_name": new_name}
 
         if action == "corrupt_total_row":
-            ws = sh.worksheet(target_tab)
+            ws = _get_worksheet(sh, target_tab)
             total_col = _TAB_TOTAL_COLUMNS[target_tab]
             ws.update([["BROKEN"]], "A2", value_input_option="RAW")
             ws.update([[""]], f"{total_col}2", value_input_option="RAW")
             return {"spreadsheet_id": sh.id, "action": action, "applied": True, "tab_name": target_tab}
 
         if action == "corrupt_header_row":
-            ws = sh.worksheet(target_tab)
+            ws = _get_worksheet(sh, target_tab)
             headers = list(_TABS[target_tab][0])
             headers[0] = "BROKEN"
             ws.update([headers], "A1", value_input_option="RAW")
             return {"spreadsheet_id": sh.id, "action": action, "applied": True, "tab_name": target_tab}
 
         if action == "clear_hidden_row_ids":
-            ws = sh.worksheet(target_tab)
+            ws = _get_worksheet(sh, target_tab)
             hidden_col = _internal_row_id_column_letter(target_tab)
             end_row = max(3, row_count + 2)
             _retry_on_rate_limit(lambda: ws.batch_clear([f"{hidden_col}3:{hidden_col}{end_row}"]))
             return {"spreadsheet_id": sh.id, "action": action, "applied": True, "tab_name": target_tab, "row_count": row_count}
 
         if action == "reorder_rows":
-            ws = sh.worksheet(target_tab)
+            ws = _get_worksheet(sh, target_tab)
             last_col = _internal_row_id_column_letter(target_tab)
             end_row = max(3, row_count + 2)
-            rows = ws.get(f"A3:{last_col}{end_row}")
+            rows = _get_range_values(ws, f"A3:{last_col}{end_row}")
             if len(rows) < 2:
                 return {"spreadsheet_id": sh.id, "action": action, "applied": False, "tab_name": target_tab, "row_count": len(rows)}
             reordered = list(reversed(rows))
@@ -2009,7 +2029,7 @@ def reset_current_month_spreadsheet_data(*, spreadsheet_id: Optional[str] = None
         raise RuntimeError("Google Sheets client unavailable.")
 
     with _lock:
-        sh = client.open_by_key(spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
+        sh = _open_spreadsheet_by_key(client, spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
         touched_tabs = 0
 
         for tab_name in _TABS:
@@ -2618,7 +2638,7 @@ def process_pending_sheet_appends(*, max_items: int | None = None) -> int:
             row_numbers: dict[str, int] = {}
 
             with _lock:
-                sh = client.open_by_key(spreadsheet_id)
+                sh = _open_spreadsheet_by_key(client, spreadsheet_id)
                 _audit_spreadsheet_layout(sh, repair=True, target_tabs={tab_name, "📊 Özet"})
                 ws = _ensure_tab_exists(sh, tab_name)
                 existing_row_numbers = _existing_row_numbers_by_pending_id(
@@ -2904,7 +2924,7 @@ def ensure_summary_tab_exists(spreadsheet_id: Optional[str] = None) -> None:
     if client is None:
         return
     try:
-        sh = client.open_by_key(spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
+        sh = _open_spreadsheet_by_key(client, spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
         _repair_monthly_spreadsheet_layout(sh)
         logger.info("📊 Özet tab ensured.")
     except Exception as exc:
