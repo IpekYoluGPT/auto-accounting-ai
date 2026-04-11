@@ -1235,8 +1235,7 @@ def _audit_summary_tab(sh, findings: list[dict[str, object]], *, repair: bool) -
             "message": "Summary tab is missing.",
         })
         if repair:
-            ws = _ensure_tab_exists(sh, "📊 Özet")
-            _setup_summary_tab(ws, _month_label(), lightweight=True)
+            _ensure_tab_exists(sh, "📊 Özet", lightweight=True)
             findings[-1]["repaired"] = True
         return
 
@@ -1270,7 +1269,7 @@ def _audit_data_tab(sh, tab_name: str, findings: list[dict[str, object]], *, rep
             "message": "Data tab is missing.",
         })
         if repair:
-            _ensure_tab_exists(sh, tab_name)
+            _ensure_tab_exists(sh, tab_name, lightweight=True)
             findings[-1]["repaired"] = True
         return
 
@@ -1286,7 +1285,7 @@ def _audit_data_tab(sh, tab_name: str, findings: list[dict[str, object]], *, rep
         if repair:
             if _worksheet_has_visible_data(ws, tab_name):
                 finding["archived_to"] = _archive_drifted_tab(sh, ws, tab_name)
-                ws = _ensure_tab_exists(sh, tab_name)
+                ws = _ensure_tab_exists(sh, tab_name, lightweight=True)
             else:
                 _setup_worksheet(ws, tab_name, lightweight=True)
             finding["repaired"] = True
@@ -1593,7 +1592,7 @@ def _monthly_tab_name(base_name: str) -> str:
     return f"{_month_label()} — {base_name}"
 
 
-def _ensure_tab_exists(sh, tab_name: str, base_name: str | None = None):
+def _ensure_tab_exists(sh, tab_name: str, base_name: str | None = None, *, lightweight: bool = False):
     """
     Return the worksheet for tab_name, creating it if missing.
 
@@ -1635,9 +1634,9 @@ def _ensure_tab_exists(sh, tab_name: str, base_name: str | None = None):
     )
 
     if lookup == "📊 Özet":
-        _setup_summary_tab(ws, _month_label())
+        _setup_summary_tab(ws, _month_label(), lightweight=lightweight)
     elif lookup in _TABS:
-        _setup_worksheet(ws, lookup)
+        _setup_worksheet(ws, lookup, lightweight=lightweight)
 
     return ws
 

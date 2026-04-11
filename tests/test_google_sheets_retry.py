@@ -707,3 +707,30 @@ def test_ensure_tab_total_row_rewrites_in_place_without_inserting_rows():
         value_input_option="USER_ENTERED",
     )
     fake_ws.insert_row.assert_not_called()
+
+
+
+def test_audit_missing_tab_repair_uses_lightweight_creation(monkeypatch):
+    import gspread
+
+    ensure_calls = []
+
+    def fake_ensure_tab_exists(_sh, tab_name, base_name=None, *, lightweight=False):
+        ensure_calls.append((tab_name, base_name, lightweight))
+        return object()
+
+    monkeypatch.setattr(google_sheets, "_ensure_tab_exists", fake_ensure_tab_exists)
+    monkeypatch.setattr(
+        google_sheets,
+        "_get_worksheet",
+        lambda _sh, _title: (_ for _ in ()).throw(gspread.WorksheetNotFound("missing")),
+    )
+
+    findings = []
+    google_sheets._audit_data_tab(object(), "🧾 Faturalar", findings, repair=True)
+    google_sheets._audit_summary_tab(object(), findings, repair=True)
+
+    assert ("🧾 Faturalar", None, True) in ensure_calls
+    assert ("📊 Özet", None, True) in ensure_calls
+    assert findings[0]["repaired"] is True
+    assert findings[1]["repaired"] is True
