@@ -19,7 +19,6 @@ def _record(message_id: str = "wamid-1") -> BillRecord:
         source_message_id=message_id,
         source_filename="receipt.jpg",
         source_type="image",
-        processing_method="LLM",
         source_sender_id="905551112233",
         source_group_id="group-123",
         source_chat_type="group",
@@ -51,7 +50,7 @@ def test_persist_record_once_writes_export_and_registry():
         assert rows[0]["Kaynak Gönderen ID"] == "905551112233"
         assert rows[0]["Kaynak Grup ID"] == "group-123"
         assert rows[0]["Sohbet Türü"] == "group"
-        assert rows[0]["İşleme"] == "LLM"
+        assert "İşleme" not in rows[0]
         assert registry_path.read_text(encoding="utf-8").splitlines() == ["wamid-1"]
 
 

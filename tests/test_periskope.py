@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.models.schemas import BillRecord, ClassificationResult, DocumentCategory
+from app.services.accounting.doc_classifier import DocumentAnalysis
 from app.services.providers import periskope as periskope_service
 
 
@@ -104,6 +105,29 @@ def _read_export_rows(storage_dir: str) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def _analysis(
+    category: DocumentCategory = DocumentCategory.FATURA,
+    *,
+    is_financial_document: bool = True,
+    is_return: bool = False,
+    document_count: int | None = None,
+    quality: str = "usable",
+    needs_retry: bool = False,
+    confidence: float = 0.95,
+    reason: str = "ok",
+) -> DocumentAnalysis:
+    return DocumentAnalysis(
+        is_financial_document=is_financial_document,
+        category=category,
+        is_return=is_return,
+        document_count=document_count if document_count is not None else (1 if is_financial_document else 0),
+        quality=quality,
+        needs_retry=needs_retry,
+        confidence=confidence,
+        reason=reason,
+    )
+
+
 @contextmanager
 def _patch_runtime_settings(
     tmpdir: str,
@@ -136,6 +160,7 @@ def test_periskope_group_image_webhook_exports_and_reacts():
         source_sender_id="905456952965@c.us",
         source_group_id="120363410789660631@g.us",
         source_chat_type="group",
+        document_date="2026-04-09",
         confidence=0.93,
     )
 
@@ -145,11 +170,8 @@ def test_periskope_group_image_webhook_exports_and_reacts():
             "app.routes.periskope.periskope.fetch_media",
             return_value=b"fake-image",
         ), patch(
-            "app.services.accounting.intake.bill_classifier.classify_image",
-            return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.96),
-        ), patch(
-            "app.services.accounting.intake.doc_classifier.classify_document_type",
-            return_value=(DocumentCategory.FATURA, False),
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(DocumentCategory.FATURA, confidence=0.96),
         ), patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             return_value=[record],
@@ -293,6 +315,7 @@ def test_periskope_webhook_accepts_event_type_with_current_attributes():
         source_sender_id="905456952965@c.us",
         source_group_id="120363410789660631@g.us",
         source_chat_type="group",
+        document_date="2026-04-09",
         confidence=0.91,
     )
 
@@ -302,11 +325,8 @@ def test_periskope_webhook_accepts_event_type_with_current_attributes():
             "app.routes.periskope.periskope.fetch_media",
             return_value=b"fake-image",
         ), patch(
-            "app.services.accounting.intake.bill_classifier.classify_image",
-            return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.96),
-        ), patch(
-            "app.services.accounting.intake.doc_classifier.classify_document_type",
-            return_value=(DocumentCategory.FATURA, False),
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(DocumentCategory.FATURA, confidence=0.96),
         ), patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             return_value=[record],
@@ -349,6 +369,7 @@ def test_periskope_webhook_accepts_null_has_media():
         source_sender_id="905456952965@c.us",
         source_group_id="120363410789660631@g.us",
         source_chat_type="group",
+        document_date="2026-04-09",
         confidence=0.89,
     )
 
@@ -358,11 +379,8 @@ def test_periskope_webhook_accepts_null_has_media():
             "app.routes.periskope.periskope.fetch_media",
             return_value=b"fake-image",
         ), patch(
-            "app.services.accounting.intake.bill_classifier.classify_image",
-            return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
-        ), patch(
-            "app.services.accounting.intake.doc_classifier.classify_document_type",
-            return_value=(DocumentCategory.FATURA, False),
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(DocumentCategory.FATURA, confidence=0.95),
         ), patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             return_value=[record],

@@ -7,9 +7,9 @@ from app.config import Settings
 
 def test_gemini_model_defaults():
     settings = Settings(_env_file=None)
-    assert settings.gemini_classifier_model == "gemini-2.5-flash"
-    assert settings.gemini_extractor_model == "gemini-3.1-pro-preview"
-    assert settings.gemini_validation_model == "gemini-3.1-pro-preview"
+    assert settings.gemini_classifier_model == "gemini-2.5-pro"
+    assert settings.gemini_extractor_model == "gemini-2.5-pro"
+    assert settings.gemini_validation_model == "gemini-2.5-pro"
     assert settings.whatsapp_groups_only is True
     assert settings.periskope_api_base_url == "https://api.periskope.app/v1"
     assert settings.periskope_media_base_url == "https://api.periskope.app"

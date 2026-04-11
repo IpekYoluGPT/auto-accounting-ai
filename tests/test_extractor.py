@@ -6,28 +6,8 @@ from unittest.mock import ANY, patch
 
 import pytest
 
-from app.models.ocr import OCRMediaMetadata, OCRParseBundle
-from app.models.schemas import AIExtractionResult, AIMultiExtractionResult, BillRecord
+from app.models.schemas import AIExtractionResult, AIMultiExtractionResult, BillRecord, DocumentCategory
 from app.services.accounting.gemini_extractor import _normalize_record, _parse_tr_number, extract_bill, extract_bills
-
-
-def _ocr_bundle(text: str, *, quality_score: float = 0.92) -> OCRParseBundle:
-    return OCRParseBundle(
-        text=text,
-        lines=[line for line in text.splitlines() if line],
-        quality_score=quality_score,
-        readability_score=quality_score,
-        text_char_count=len(text),
-        processor_used="form_parser",
-        metadata=OCRMediaMetadata(
-            mime_type="image/jpeg",
-            original_mime_type="image/jpeg",
-            byte_size=1024,
-            width=1200,
-            height=1600,
-            source_hash="ocr-hash",
-        ),
-    )
 
 
 class TestParseTrNumber:
@@ -54,9 +34,9 @@ class TestParseTrNumber:
 class TestNormalizeRecord:
     def _raw(self, **overrides) -> dict:
         base = {
-            "company_name": "Test \u015eirketi A.\u015e.",
+            "company_name": "Test Şirketi A.Ş.",
             "tax_number": "1234567890",
-            "tax_office": "Kad\u0131k\u00f6y",
+            "tax_office": "Kadıköy",
             "document_number": "DOC-001",
             "invoice_number": "FTR-2024-001",
             "receipt_number": None,
@@ -67,7 +47,7 @@ class TestNormalizeRecord:
             "vat_rate": 18.0,
             "vat_amount": 18.0,
             "total_amount": 118.0,
-            "payment_method": "Kredi Kart\u0131",
+            "payment_method": "Kredi Kartı",
             "expense_category": "Ofis",
             "description": "Ofis malzemeleri",
             "notes": None,
@@ -78,7 +58,7 @@ class TestNormalizeRecord:
 
     def test_basic_normalization(self):
         record = _normalize_record(self._raw())
-        assert record.company_name == "Test \u015eirketi A.\u015e."
+        assert record.company_name == "Test Şirketi A.Ş."
         assert record.total_amount == 118.0
         assert record.confidence == 0.95
 
@@ -143,7 +123,7 @@ class TestExtractBill:
         single_doc = AIExtractionResult(
             company_name="ABC Market",
             tax_number="9876543210",
-            tax_office="Be\u015fikta\u015f",
+            tax_office="Beşiktaş",
             document_number="FIS-001",
             receipt_number="FIS-001",
             document_date="2024-03-10",
@@ -155,7 +135,7 @@ class TestExtractBill:
             total_amount=100.0,
             payment_method="Nakit",
             expense_category="Yemek",
-            description="Market al\u0131\u015fveri\u015fi",
+            description="Market alışverişi",
             confidence=0.91,
         )
         expected = AIMultiExtractionResult(documents=[single_doc])
@@ -177,59 +157,21 @@ class TestExtractBill:
         assert record.total_amount == 100.0
         assert record.expense_category == "Yemek"
         assert record.source_message_id == "msg_123"
-        assert record.processing_method == "LLM"
         assert record.confidence == pytest.approx(0.91)
         mock_generate.assert_called_once_with(
             model="gemini-test-extractor",
             prompt=ANY,
+            system_instruction=ANY,
             response_schema=AIMultiExtractionResult,
             thinking_level="low",
             media_bytes=b"fake_image",
             mime_type="application/pdf",
         )
 
-    def test_direct_ocr_extraction_skips_gemini(self):
-        bundle = _ocr_bundle(
-            "ÖZTÜRK GIDA LTD. ŞTİ.\n"
-            "Tarih: 09.04.2026\n"
-            "Saat: 14:32\n"
-            "Fiş No: 004218\n"
-            "Ara Toplam: 1.250,00 TL\n"
-            "KDV %20: 250,00 TL\n"
-            "Genel Toplam: 1.500,00 TL\n"
-            "Ödeme: Nakit"
-        )
-
-        with patch("app.services.accounting.gemini_extractor.gemini_client.generate_structured_content") as mock_generate:
-            records = extract_bills(
-                b"fake_image",
-                mime_type="image/jpeg",
-                source_message_id="msg-ocr-1",
-                source_filename="receipt.jpg",
-                source_type="image",
-                ocr_bundle=bundle,
-            )
-
-        assert len(records) == 1
-        record = records[0]
-        assert record.company_name == "ÖZTÜRK GIDA LTD. ŞTİ."
-        assert record.document_date == "2026-04-09"
-        assert record.total_amount == pytest.approx(1500.0)
-        assert record.vat_amount == pytest.approx(250.0)
-        assert record.payment_method == "Nakit"
-        assert record.source_message_id == "msg-ocr-1"
-        assert record.processing_method == "OCR"
-        mock_generate.assert_not_called()
-
-    def test_ocr_validation_uses_validation_model(self, monkeypatch):
+    def test_category_hints_are_embedded_in_prompt(self, monkeypatch):
         monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
-        monkeypatch.setattr(
-            "app.services.accounting.gemini_extractor.settings.gemini_validation_model",
-            "gemini-2.5-pro-test",
-        )
-        bundle = _ocr_bundle("ABC\n123", quality_score=0.4)
         expected = AIMultiExtractionResult(
-            documents=[AIExtractionResult(company_name="Fallback Corp", total_amount=50.0, currency="TRY")]
+            documents=[AIExtractionResult(company_name="Saha Kum", currency="TRY", confidence=0.77)]
         )
 
         with patch(
@@ -239,17 +181,20 @@ class TestExtractBill:
             records = extract_bills(
                 b"fake_image",
                 mime_type="image/jpeg",
-                source_message_id="msg-ocr-2",
-                source_filename="receipt.jpg",
+                source_message_id="msg-hints-1",
+                source_filename="slip.jpg",
                 source_type="image",
-                ocr_bundle=bundle,
+                category_hint=DocumentCategory.MALZEME,
+                document_count_hint=3,
+                is_return_hint=True,
             )
 
         assert len(records) == 1
-        assert records[0].company_name == "Fallback Corp"
-        assert records[0].processing_method == "LLM"
-        assert mock_generate.call_args.kwargs["model"] == "gemini-2.5-pro-test"
-        assert "Deterministic OCR candidate" in mock_generate.call_args.kwargs["prompt"]
+        prompt = mock_generate.call_args.kwargs["prompt"]
+        assert "Belge ailesi ipucu: malzeme" in prompt
+        assert "Belge muhtemelen bir iade/iptal niteligi tasiyor." in prompt
+        assert "Goruntude yaklasik 3 ayri belge bekleniyor." in prompt
+        assert "El yazili hafriyat/malzeme formu" in prompt
 
     def test_multi_document_extraction(self, monkeypatch):
         monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
@@ -257,24 +202,9 @@ class TestExtractBill:
             "app.services.accounting.gemini_extractor.settings.gemini_extractor_model",
             "gemini-test-extractor",
         )
-        doc1 = AIExtractionResult(
-            company_name="Firma A",
-            total_amount=100.0,
-            currency="TRY",
-            confidence=0.9,
-        )
-        doc2 = AIExtractionResult(
-            company_name="Firma B",
-            total_amount=200.0,
-            currency="TRY",
-            confidence=0.88,
-        )
-        doc3 = AIExtractionResult(
-            company_name="Firma C",
-            total_amount=300.0,
-            currency="TRY",
-            confidence=0.85,
-        )
+        doc1 = AIExtractionResult(company_name="Firma A", total_amount=100.0, currency="TRY", confidence=0.9)
+        doc2 = AIExtractionResult(company_name="Firma B", total_amount=200.0, currency="TRY", confidence=0.88)
+        doc3 = AIExtractionResult(company_name="Firma C", total_amount=300.0, currency="TRY", confidence=0.85)
         expected = AIMultiExtractionResult(documents=[doc1, doc2, doc3])
 
         with patch(
@@ -293,11 +223,9 @@ class TestExtractBill:
         assert records[0].company_name == "Firma A"
         assert records[1].company_name == "Firma B"
         assert records[2].company_name == "Firma C"
-        # Sub-indices for dedup
         assert records[0].source_message_id == "msg_456__doc1"
         assert records[1].source_message_id == "msg_456__doc2"
         assert records[2].source_message_id == "msg_456__doc3"
-        assert all(record.processing_method == "LLM" for record in records)
 
     def test_generation_error_propagates(self, monkeypatch):
         monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")

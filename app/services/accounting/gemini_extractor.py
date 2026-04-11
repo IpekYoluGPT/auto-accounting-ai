@@ -1,5 +1,5 @@
 """
-Gemini-backed extraction with an OCR-first direct path.
+Gemini-backed extraction with category-aware prompts.
 """
 
 from __future__ import annotations
@@ -7,7 +7,6 @@ from __future__ import annotations
 from typing import Optional
 
 from app.config import settings
-from app.models.ocr import OCRParseBundle
 from app.models.schemas import AIMultiExtractionResult, BillRecord, DocumentCategory
 from app.services import gemini_client
 from app.services.accounting import ocr
@@ -15,40 +14,75 @@ from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-_EXTRACTION_PROMPT = """Extract bookkeeping fields from this Turkish invoice, receipt, or payment document.
-
-IMPORTANT: This image may contain MORE THAN ONE document (e.g. multiple cheques,
-receipts, or invoices side by side, stacked, or overlapping).
-Return one entry per DISTINCT document you can identify.
-If there is only one document, return a list with a single entry.
-
-Return only the requested schema.
-Use null for missing values.
-Normalize dates to YYYY-MM-DD, times to HH:MM, and Turkish decimal numbers to standard decimals.
-Default currency to TRY when it is not shown."""
-
-_OCR_VALIDATION_PROMPT = """Validate and extract bookkeeping fields from this Turkish financial document.
-
-You will receive:
-- the original media
-- OCR text
-- OCR key-value fields
-- OCR entities
-- OCR tables
-- a deterministic candidate record built from OCR
+_EXTRACTION_SYSTEM_INSTRUCTION = """You extract structured bookkeeping data from Turkish business documents.
 
 Rules:
-- Prefer explicit OCR-grounded values.
-- Do not invent numbers, tax IDs, or document IDs.
+- Use only information visible in the provided media.
 - Preserve Turkish characters exactly when visible.
-- Fix OCR mistakes only when the OCR evidence and arithmetic clearly support the correction.
-- Return multiple documents only if the image truly contains more than one distinct document.
-- Return only the schema."""
+- Do not invent tax IDs, document IDs, totals, company names, or dates.
+- When values are missing, return null.
+- Normalize dates to YYYY-MM-DD and times to HH:MM when clearly visible.
+- Convert Turkish formatted numbers to JSON numbers.
+- If multiple documents are present, return one object per distinct document sorted left-to-right, then top-to-bottom.
+- Do not merge separate documents into one record.
+- For return documents, extract the values exactly as shown; do not flip signs unless the document itself shows a negative or return amount.
+"""
+
+_EXTRACTION_PROMPT = """Extract bookkeeping fields from this Turkish business document image or PDF.
+
+This media may contain invoices, receipts, payment dekonts, cheques, delivery/material slips, or multiple documents in one photo.
+Return the requested schema only.
+Default currency to TRY when it is not shown."""
+
+_CATEGORY_SPECIFIC_INSTRUCTIONS: dict[DocumentCategory, str] = {
+    DocumentCategory.FATURA: """Belge ailesi: FATURA.
+- company_name satici / duzenleyen firmadir.
+- invoice_number icin once Fatura No, yoksa Belge No kullan.
+- subtotal, vat_rate, vat_amount ve total_amount alanlarini yalnizca acikca gorunuyorsa doldur.
+- description alanina kisa bir fatura ozeti yaz; payment_method sadece belgede acikca varsa doldur.""",
+    DocumentCategory.ODEME_DEKONTU: """Belge ailesi: ODEME DEKONTU.
+- company_name alanina gorunur banka, odeme kurumu veya baskin karsi taraf adini yaz.
+- document_number alanina referans / islem / dekont numarasini koy.
+- total_amount transfer edilen nihai tutardir.
+- description alanina alici, gonderen veya islem aciklamasini kisa ve yararli bicimde koy.""",
+    DocumentCategory.HARCAMA_FISI: """Belge ailesi: HARCAMA FISI.
+- company_name satici isletmedir.
+- receipt_number icin once Fis No, yoksa Belge No kullan.
+- total_amount fisteki nihai toplamdir.
+- description alanina kisa urun/hizmet ozeti yaz.""",
+    DocumentCategory.CEK: """Belge ailesi: CEK.
+- document_number cek seri / belge numarasidir.
+- company_name duzenleyen banka veya firma adidir.
+- document_date alanina vade tarihi gorunuyorsa onu yaz; aksi halde gorunur ana tarihi yaz.
+- notes alanina lehdar/alici gibi onemli serbest metni koy.""",
+    DocumentCategory.MALZEME: """Belge ailesi: MALZEME / IRSALIYE.
+- company_name tedarikci veya belge ust bilgisindeki firmadir.
+- document_number irsaliye / belge / form numarasidir.
+- description alanina malzeme cinsi veya malzeme listesinin kisa ozeti yaz.
+- notes alanina teslim yeri / santiye / aciklama gibi sahaya ait bilgileri yaz.
+- total_amount gorunmuyorsa null birak; sirf tahmin etmek icin hesap yapma.
+- expense_category alanina kisa belge turu ozeti yaz (ornegin 'Irsaliye', 'Teslim fisi', 'Veresiye senedi').""",
+    DocumentCategory.IADE: """Belge ailesi: IADE / IPTAL.
+- Mumkunse belgeyi esas aile mantigiyla oku ama iade niteliklerini koru.
+- description alaninda kisa iade ozeti kullan.
+- Gorunmeyen karsit kayit veya orijinal belge ayrintilarini uydurma.""",
+    DocumentCategory.BELIRSIZ: """Belge ailesi belirsiz.
+- Gorunen belge yapisina en yakin alanlari doldur.
+- Emin olmadigin alanlari null birak.""",
+    DocumentCategory.ELDEN_ODEME: """Belge ailesi: ELDEN ODEME.
+- Bu kategori medya belgeleri icin beklenmez; yine de gorunur odeme kaydi varsa en yakin alanlari doldur.""",
+}
+
+_EXTRACTION_EXAMPLES = """Kisa ornekler:
+1. El yazili hafriyat/malzeme formunda tutar gorunmuyorsa total_amount=null olabilir; description malzeme cinsi, notes teslim yeri olabilir.
+2. Ayni fotografta 3 cek varsa 3 ayri document dondur ve siralamayi soldan saga yap.
+3. Iade faturasinda iade oldugu acikca gorunuyorsa tutarlari goruldugu gibi cikar; normal faturaya cevirme."""
 
 
 def _parse_tr_number(value: str) -> Optional[float]:
     """Backward-compatible wrapper for tests."""
     return ocr.parse_tr_number(value)
+
 
 
 def _normalize_record(raw: dict) -> BillRecord:
@@ -92,9 +126,9 @@ def _normalize_record(raw: dict) -> BillRecord:
         source_message_id=_safe_str(raw.get("source_message_id")),
         source_filename=_safe_str(raw.get("source_filename")),
         source_type=_safe_str(raw.get("source_type")),
-        processing_method=_safe_str(raw.get("processing_method")),
         confidence=_safe_float(raw.get("confidence")),
     )
+
 
 
 def extract_bills(
@@ -107,47 +141,22 @@ def extract_bills(
     source_group_id: Optional[str] = None,
     source_chat_type: Optional[str] = None,
     *,
-    ocr_bundle: OCRParseBundle | None = None,
     category_hint: DocumentCategory | None = None,
+    document_count_hint: int | None = None,
+    is_return_hint: bool = False,
 ) -> list[BillRecord]:
     """
     Extract one or more bookkeeping records from media.
-
-    When a strong OCR bundle is present, returns a direct deterministic record
-    without calling Gemini. Otherwise, Gemini receives the media together with
-    OCR context and validates/fills the record(s).
     """
-    assessment = None
-    model_name = settings.gemini_extractor_model
-    prompt = _EXTRACTION_PROMPT
-
-    if ocr_bundle is not None:
-        assessment = ocr.assess_extraction(ocr_bundle, category_hint=category_hint)
-        if assessment.use_direct:
-            logger.info(
-                "Using direct OCR extraction for %s (score=%.2f quality=%.2f)",
-                source_message_id or source_filename or "document",
-                assessment.parse_score,
-                ocr_bundle.quality_score,
-            )
-            direct = assessment.record.model_copy(deep=True)
-            _attach_source_metadata(
-                direct,
-                source_message_id=source_message_id,
-                source_filename=source_filename,
-                source_type=source_type,
-                source_sender_id=source_sender_id,
-                source_group_id=source_group_id,
-                source_chat_type=source_chat_type,
-            )
-            direct.processing_method = "OCR"
-            return [direct]
-
-        model_name = settings.gemini_validation_model
-        prompt = _build_ocr_validation_prompt(ocr_bundle, assessment, category_hint)
-
     if not settings.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+    model_name = settings.gemini_extractor_model
+    prompt = _build_extraction_prompt(
+        category_hint=category_hint,
+        document_count_hint=document_count_hint,
+        is_return_hint=is_return_hint,
+    )
 
     logger.info(
         "Sending media (%d bytes, %s) to Gemini model %s for extraction",
@@ -159,6 +168,7 @@ def extract_bills(
     multi_result = gemini_client.generate_structured_content(
         model=model_name,
         prompt=prompt,
+        system_instruction=_EXTRACTION_SYSTEM_INSTRUCTION,
         response_schema=AIMultiExtractionResult,
         thinking_level="low",
         media_bytes=image_bytes,
@@ -182,7 +192,6 @@ def extract_bills(
         record.source_sender_id = source_sender_id
         record.source_group_id = source_group_id
         record.source_chat_type = source_chat_type
-        record.processing_method = "LLM"
         records.append(record)
 
     logger.info(
@@ -191,6 +200,7 @@ def extract_bills(
         ", ".join(f"{r.company_name or '?'}={r.total_amount}" for r in records),
     )
     return records
+
 
 
 def extract_bill(
@@ -203,7 +213,6 @@ def extract_bill(
     source_group_id: Optional[str] = None,
     source_chat_type: Optional[str] = None,
     *,
-    ocr_bundle: OCRParseBundle | None = None,
     category_hint: DocumentCategory | None = None,
 ) -> BillRecord:
     """Backward-compatible wrapper: returns the first extracted record."""
@@ -216,7 +225,6 @@ def extract_bill(
         source_sender_id=source_sender_id,
         source_group_id=source_group_id,
         source_chat_type=source_chat_type,
-        ocr_bundle=ocr_bundle,
         category_hint=category_hint,
     )
     if not records:
@@ -224,38 +232,33 @@ def extract_bill(
     return records[0]
 
 
-def _build_ocr_validation_prompt(
-    ocr_bundle: OCRParseBundle,
-    assessment: ocr.OCRExtractionAssessment,
-    category_hint: DocumentCategory | None,
-) -> str:
-    category_text = category_hint.value if category_hint is not None else "unknown"
-    multi_doc_text = "yes" if assessment.multi_document_suspected else "no"
-    return (
-        f"{_OCR_VALIDATION_PROMPT}\n\n"
-        f"Category hint: {category_text}\n"
-        f"Multiple documents suspected: {multi_doc_text}\n"
-        f"OCR quality score: {ocr_bundle.quality_score}\n"
-        f"OCR parse score: {assessment.parse_score}\n"
-        f"OCR parse reasons: {', '.join(assessment.reasons) or 'none'}\n\n"
-        f"Deterministic OCR candidate:\n{ocr.serialize_candidate_record(assessment.record)}\n\n"
-        f"OCR bundle:\n{ocr.serialize_ocr_bundle(ocr_bundle)}"
-    )
 
-
-def _attach_source_metadata(
-    record: BillRecord,
+def _build_extraction_prompt(
     *,
-    source_message_id: Optional[str],
-    source_filename: Optional[str],
-    source_type: Optional[str],
-    source_sender_id: Optional[str],
-    source_group_id: Optional[str],
-    source_chat_type: Optional[str],
-) -> None:
-    record.source_message_id = source_message_id
-    record.source_filename = source_filename
-    record.source_type = source_type
-    record.source_sender_id = source_sender_id
-    record.source_group_id = source_group_id
-    record.source_chat_type = source_chat_type
+    category_hint: DocumentCategory | None,
+    document_count_hint: int | None,
+    is_return_hint: bool,
+) -> str:
+    category = category_hint or DocumentCategory.BELIRSIZ
+    category_instructions = _CATEGORY_SPECIFIC_INSTRUCTIONS.get(
+        category,
+        _CATEGORY_SPECIFIC_INSTRUCTIONS[DocumentCategory.BELIRSIZ],
+    )
+    count_text = (
+        f"Goruntude yaklasik {document_count_hint} ayri belge bekleniyor."
+        if document_count_hint and document_count_hint > 1
+        else "Tek belge de olabilir, birden fazla belge de olabilir."
+    )
+    return_text = (
+        "Belge muhtemelen bir iade/iptal niteligi tasiyor."
+        if is_return_hint
+        else "Iade ipucu yok."
+    )
+    return (
+        f"{_EXTRACTION_PROMPT}\n\n"
+        f"Belge ailesi ipucu: {category.value}\n"
+        f"{return_text}\n"
+        f"{count_text}\n\n"
+        f"{category_instructions}\n\n"
+        f"{_EXTRACTION_EXAMPLES}"
+    )

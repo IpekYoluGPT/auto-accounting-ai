@@ -2,9 +2,8 @@
 Shared inbound accounting intake pipeline for Meta and Periskope messages.
 
 Flow for media messages:
-  1. bill_classifier  — is this a financial document at all?
-  2. doc_classifier   — which of the 6 categories?
-  3. gemini_extractor — extract structured fields
+  1. doc_classifier   — financial-doc triage + category + return detection
+  2. gemini_extractor — extract structured fields
   4. record_store     — persist to daily CSV (dedup by message_id)
   5. google_sheets    — append to the correct Sheets tab
 
@@ -25,7 +24,7 @@ from app.services.accounting import (
     bill_classifier,
     doc_classifier,
     gemini_extractor,
-    ocr,
+    media_prep,
     record_store,
 )
 from app.services.providers import google_sheets
@@ -88,8 +87,12 @@ MSG_MEDIA_EMPTY_EXTRACTION = (
     "Lütfen daha net bir fotoğraf gönderin."
 )
 MSG_MEDIA_TEMPORARY_UPSTREAM_ERROR = (
-    "Belge alındı ancak OCR/AI servisi şu anda yoğun veya geçici olarak erişilemiyor. "
+    "Belge alındı ancak AI servisi şu anda yoğun veya geçici olarak erişilemiyor. "
     "Lütfen 1-2 dakika sonra aynı görseli tekrar gönderin."
+)
+MSG_MEDIA_RETRY_QUALITY = (
+    "Belge çok belirsiz veya eksik görünüyor. "
+    "Lütfen tek belge içeren daha net ve tam bir fotoğraf/PDF gönderin."
 )
 
 REACTION_PROCESSING = "⌛"
@@ -312,7 +315,6 @@ def _handle_manager_text(
         source_group_id=route.group_id,
         source_chat_type=route.chat_type,
         source_type="manager_text",
-        processing_method="LLM",
         confidence=0.9,
     )
 
@@ -371,45 +373,41 @@ def _handle_media(
             outcome="media_fetch_failed",
         )
 
-    prepared = ocr.prepare_document(raw_bytes, mime_type=mime_type)
+    prepared = media_prep.prepare_media(raw_bytes, mime_type=mime_type)
     working_bytes = prepared.media_bytes
     working_mime_type = prepared.mime_type
-    ocr_bundle = prepared.ocr_bundle
     if prepared.warnings:
         logger.info(
-            "Media prepared for OCR: message_id=%s warnings=%s",
+            "Media prepared for Gemini: message_id=%s warnings=%s",
             message_id,
             prepared.warnings,
         )
 
-    # Step 1: Is this a financial document at all?
     try:
-        if ocr_bundle is not None:
-            classification = bill_classifier.classify_image(
-                working_bytes,
-                mime_type=working_mime_type,
-                ocr_bundle=ocr_bundle,
-            )
-        else:
-            classification = bill_classifier.classify_image(working_bytes, mime_type=working_mime_type)
+        analysis = doc_classifier.analyze_document(working_bytes, mime_type=working_mime_type)
     except Exception as exc:
-        logger.warning("Failed to classify media for message id=%s: %s", message_id, exc)
+        logger.warning("Failed to analyze media for message id=%s: %s", message_id, exc)
         return _handle_media_failure(
             route,
             send_text,
             send_reaction,
             message=_message_for_media_exception(exc, MSG_MEDIA_CLASSIFICATION_ERROR),
-            reason="media classification failed",
+            reason="media analysis failed",
             outcome="classification_failed",
         )
     logger.info(
-        "Image classification: is_bill=%s confidence=%.2f reason=%s",
-        classification.is_bill,
-        classification.confidence,
-        (classification.reason or "")[:120],
+        "Document analysis: financial=%s category=%s is_return=%s count=%d quality=%s retry=%s confidence=%.2f reason=%s",
+        analysis.is_financial_document,
+        analysis.category.value,
+        analysis.is_return,
+        analysis.document_count,
+        analysis.quality,
+        analysis.needs_retry,
+        analysis.confidence,
+        (analysis.reason or "")[:120],
     )
 
-    if not classification.is_bill:
+    if not analysis.is_financial_document:
         return _handle_media_failure(
             route,
             send_text,
@@ -419,43 +417,33 @@ def _handle_media(
             outcome="warned_non_bill_media",
         )
 
-    # Step 2: Which category?
-    try:
-        if ocr_bundle is not None:
-            category, is_return = doc_classifier.classify_document_type(
-                working_bytes,
-                mime_type=working_mime_type,
-                ocr_bundle=ocr_bundle,
-            )
-        else:
-            category, is_return = doc_classifier.classify_document_type(working_bytes, mime_type=working_mime_type)
-    except Exception as exc:
-        logger.warning("Failed to classify document type for message id=%s: %s", message_id, exc)
+    if analysis.needs_retry and analysis.quality == "unusable":
         return _handle_media_failure(
             route,
             send_text,
             send_reaction,
-            message=_message_for_media_exception(exc, MSG_MEDIA_CATEGORY_ERROR),
-            reason="document type classification failed",
+            message=MSG_MEDIA_RETRY_QUALITY,
+            reason="media quality retry required",
             outcome="category_failed",
         )
 
-    # Step 3: Extract structured fields (may return multiple documents)
+    category = analysis.category
+    is_return = analysis.is_return
+
     try:
-        extract_kwargs = {
-            "image_bytes": working_bytes,
-            "mime_type": working_mime_type,
-            "source_message_id": message_id,
-            "source_filename": filename,
-            "source_type": source_type,
-            "source_sender_id": route.sender_id,
-            "source_group_id": route.group_id,
-            "source_chat_type": route.chat_type,
-        }
-        if ocr_bundle is not None:
-            extract_kwargs["ocr_bundle"] = ocr_bundle
-            extract_kwargs["category_hint"] = category
-        records = gemini_extractor.extract_bills(**extract_kwargs)
+        records = gemini_extractor.extract_bills(
+            image_bytes=working_bytes,
+            mime_type=working_mime_type,
+            source_message_id=message_id,
+            source_filename=filename,
+            source_type=source_type,
+            source_sender_id=route.sender_id,
+            source_group_id=route.group_id,
+            source_chat_type=route.chat_type,
+            category_hint=category,
+            document_count_hint=analysis.document_count if analysis.document_count > 1 else None,
+            is_return_hint=is_return,
+        )
     except Exception as exc:
         logger.warning("Failed to extract bills for message id=%s: %s", message_id, exc)
         return _handle_media_failure(
@@ -467,25 +455,23 @@ def _handle_media(
             outcome="extraction_failed",
         )
 
-    if not records:
-        logger.warning("Gemini returned zero documents for message id=%s", message_id)
+    valid_records = [record for record in records if _record_meets_minimum_fields(record, category)]
+    if not valid_records:
+        logger.warning("Gemini returned no usable documents for message id=%s", message_id)
         return _handle_media_failure(
             route,
             send_text,
             send_reaction,
-            message=MSG_MEDIA_EMPTY_EXTRACTION,
+            message=MSG_MEDIA_RETRY_QUALITY if analysis.needs_retry else MSG_MEDIA_EMPTY_EXTRACTION,
             reason="empty extraction",
             outcome="empty_extraction",
         )
 
-    # Store the source document in Drive so accounting can verify the original.
     drive_link = google_sheets.upload_document(raw_bytes, filename=filename, mime_type=mime_type)
 
-    # Step 4 & 5: Persist and write each record to Sheets
     persisted_count = 0
     pending_drive_targets: list[dict[str, str | int]] = []
-    details_lines: list[str] = []
-    for record in records:
+    for record in valid_records:
         persisted = record_store.persist_record_once(record)
         if not persisted:
             continue
@@ -498,10 +484,6 @@ def _handle_media(
         )
         if not drive_link:
             pending_drive_targets.extend(appended_targets)
-        details_lines.append(
-            f"  • {record.company_name or 'Bilinmiyor'}: "
-            f"{record.total_amount or '?'} {record.currency or 'TRY'}"
-        )
 
     if persisted_count == 0:
         _safe_send_reaction(route, REACTION_SUCCESS, reason="already exported reaction", send_reaction=send_reaction)
@@ -589,6 +571,24 @@ def _send_throttled_warning(
         return False
     _safe_send_text_message(route, text, reason=reason, send_text=send_text)
     return True
+
+
+def _record_meets_minimum_fields(record: BillRecord, category: DocumentCategory) -> bool:
+    has_identity = bool(record.company_name or record.document_number or record.invoice_number or record.receipt_number)
+    has_total = record.total_amount is not None
+    has_date = bool(record.document_date)
+
+    if category == DocumentCategory.MALZEME:
+        return bool(record.description and (has_identity or record.notes))
+    if category == DocumentCategory.CEK:
+        return has_total and bool(record.document_number or record.company_name or record.document_date)
+    if category == DocumentCategory.ODEME_DEKONTU:
+        return has_total and has_date and bool(has_identity or record.description)
+    if category in {DocumentCategory.FATURA, DocumentCategory.HARCAMA_FISI, DocumentCategory.BELIRSIZ, DocumentCategory.IADE}:
+        return has_total and has_date and has_identity
+    if category == DocumentCategory.ELDEN_ODEME:
+        return has_total and bool(record.description)
+    return has_total and has_identity
 
 
 def _message_for_media_exception(exc: Exception, default_message: str) -> str:

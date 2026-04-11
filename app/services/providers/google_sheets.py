@@ -41,39 +41,39 @@ _TABS: dict[str, tuple[list[str], dict]] = {
     "🧾 Faturalar": (
         ["#", "Tarih", "Saat", "Firma Adı", "Vergi No", "Vergi Dairesi",
          "Fatura No", "KDVsiz Tutar", "KDV %", "KDV Tutarı", "GENEL TOPLAM",
-         "Ödeme Yöntemi", "Gider Kategorisi", "Açıklama", "Notlar", "İşleme", "📎 Belge"],
+         "Ödeme Yöntemi", "Gider Kategorisi", "Açıklama", "Notlar", "📎 Belge"],
         {"red": 0.16, "green": 0.38, "blue": 0.74},
     ),
     "💳 Dekontlar": (
         ["#", "Tarih", "Saat", "Banka / Firma", "Referans No",
-         "Gönderen", "Alıcı / Açıklama", "TUTAR", "Para Birimi", "Notlar", "İşleme", "📎 Belge"],
+         "Gönderen", "Alıcı / Açıklama", "TUTAR", "Para Birimi", "Notlar", "📎 Belge"],
         {"red": 0.13, "green": 0.55, "blue": 0.13},
     ),
     "⛽ Harcama Fişleri": (
         ["#", "Tarih", "Saat", "Firma", "Fiş No", "Vergi No",
          "KDVsiz", "KDV %", "KDV", "TOPLAM", "Ödeme", "Kategori",
-         "Açıklama", "Plaka", "İşleme", "📎 Belge"],
+         "Açıklama", "Plaka", "📎 Belge"],
         {"red": 0.90, "green": 0.49, "blue": 0.13},
     ),
     "📝 Çekler": (
         ["#", "Çek / Belge No", "Düzenleyen Firma", "Vergi No",
          "Lehdar (Alıcı)", "Vade Tarihi", "TUTAR", "Para Birimi",
-         "Açıklama", "İşleme", "📎 Belge"],
+         "Açıklama", "📎 Belge"],
         {"red": 0.76, "green": 0.09, "blue": 0.09},
     ),
     "💵 Elden Ödemeler": (
-        ["#", "Tarih", "Saat", "Alıcı / Açıklama", "TUTAR", "Para Birimi", "Kaydeden", "İşleme", "📎 Belge"],
+        ["#", "Tarih", "Saat", "Alıcı / Açıklama", "TUTAR", "Para Birimi", "Kaydeden", "📎 Belge"],
         {"red": 0.46, "green": 0.11, "blue": 0.64},
     ),
     "🏗️ Malzeme": (
         ["#", "Tarih", "Firma", "İrsaliye / Belge No", "Malzeme Cinsi",
          "Miktar", "Birim", "Teslim Yeri", "Plaka", "Tutar",
-         "Açıklama", "İşleme", "📎 Belge"],
+         "Açıklama", "📎 Belge"],
         {"red": 0.47, "green": 0.27, "blue": 0.08},
     ),
     "↩️ İadeler": (
         ["#", "Tarih", "Belge Türü", "Firma", "Belge No",
-         "TUTAR", "Para Birimi", "Açıklama", "İşleme", "📎 Belge"],
+         "TUTAR", "Para Birimi", "Açıklama", "📎 Belge"],
         {"red": 0.44, "green": 0.44, "blue": 0.44},
     ),
 }
@@ -153,7 +153,6 @@ _COL_WIDTHS: dict[str, int] = {
     "Açıklama": 260,
     "Alıcı / Açıklama": 240,
     "Notlar": 200,
-    "İşleme": 90,
     "Malzeme Cinsi": 220,
     "Teslim Yeri": 180,
     "Plaka": 75,
@@ -1440,7 +1439,28 @@ def _drive_cell(drive_link: Optional[str]) -> str:
     return ""
 
 
-def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_link: Optional[str] = None) -> list:
+def _return_source_label(category: DocumentCategory | None) -> str:
+    labels = {
+        DocumentCategory.FATURA: "Fatura",
+        DocumentCategory.ODEME_DEKONTU: "Ödeme Dekontu",
+        DocumentCategory.HARCAMA_FISI: "Harcama Fişi",
+        DocumentCategory.CEK: "Çek",
+        DocumentCategory.ELDEN_ODEME: "Elden Ödeme",
+        DocumentCategory.MALZEME: "Malzeme / İrsaliye",
+        DocumentCategory.IADE: "İade",
+        DocumentCategory.BELIRSIZ: "Belirsiz",
+    }
+    return labels.get(category or DocumentCategory.BELIRSIZ, "Belirsiz")
+
+
+def _build_row(
+    record: BillRecord,
+    category: DocumentCategory,
+    seq: int,
+    drive_link: Optional[str] = None,
+    *,
+    return_source_category: DocumentCategory | None = None,
+) -> list:
     r = record
 
     if category == DocumentCategory.FATURA:
@@ -1452,7 +1472,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_l
             _safe(r.subtotal), _safe(r.vat_rate), _safe(r.vat_amount),
             _safe(r.total_amount),
             _safe(r.payment_method), _safe(r.expense_category),
-            _safe(r.description), _safe(r.notes), _safe(r.processing_method),
+            _safe(r.description), _safe(r.notes),
             _drive_cell(drive_link),
         ]
 
@@ -1466,7 +1486,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_l
             _safe(r.description),
             _safe(r.total_amount),
             _safe(r.currency or "TRY"),
-            _safe(r.notes), _safe(r.processing_method),
+            _safe(r.notes),
             _drive_cell(drive_link),
         ]
 
@@ -1487,7 +1507,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_l
             _safe(r.total_amount),
             _safe(r.payment_method), _safe(r.expense_category),
             _safe(r.description),
-            plaka, _safe(r.processing_method),
+            plaka,
             _drive_cell(drive_link),
         ]
 
@@ -1500,7 +1520,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_l
             _safe(r.document_date),
             _safe(r.total_amount),
             _safe(r.currency or "TRY"),
-            _safe(r.description), _safe(r.processing_method),
+            _safe(r.description),
             _drive_cell(drive_link),
         ]
 
@@ -1512,7 +1532,6 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_l
             _safe(r.total_amount),
             _safe(r.currency or "TRY"),
             _safe(r.source_sender_id),
-            _safe(r.processing_method),
             _drive_cell(drive_link),
         ]
 
@@ -1527,7 +1546,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_l
             _safe(r.notes),
             "",
             _safe(r.total_amount),
-            _safe(r.expense_category), _safe(r.processing_method),
+            _safe(r.expense_category),
             _drive_cell(drive_link),
         ]
 
@@ -1535,12 +1554,12 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_l
         return [
             seq,
             _safe(r.document_date),
-            _safe(r.expense_category),
+            _return_source_label(return_source_category),
             _safe(r.company_name),
             _safe(r.document_number or r.invoice_number),
             _safe(r.total_amount),
             _safe(r.currency or "TRY"),
-            _safe(r.description), _safe(r.processing_method),
+            _safe(r.description),
             _drive_cell(drive_link),
         ]
 
@@ -1553,7 +1572,7 @@ def _build_row(record: BillRecord, category: DocumentCategory, seq: int, drive_l
         _safe(r.subtotal), _safe(r.vat_rate), _safe(r.vat_amount),
         _safe(r.total_amount),
         _safe(r.payment_method), _safe(r.expense_category),
-        _safe(r.description), _safe(r.notes), _safe(r.processing_method),
+        _safe(r.description), _safe(r.notes),
         _drive_cell(drive_link),
     ]
 
@@ -1811,7 +1830,13 @@ def append_record(
                 iade_ws = _ensure_tab_exists(sh, "↩️ İadeler")
                 iade_seq = _next_seq(iade_ws)
                 iade_row_number = len(iade_ws.col_values(1)) + 1
-                iade_row = _build_row(record, DocumentCategory.IADE, iade_seq, drive_link=drive_link)
+                iade_row = _build_row(
+                    record,
+                    DocumentCategory.IADE,
+                    iade_seq,
+                    drive_link=drive_link,
+                    return_source_category=category,
+                )
                 _retry_on_rate_limit(
                     lambda: iade_ws.append_row(iade_row, value_input_option="USER_ENTERED")
                 )

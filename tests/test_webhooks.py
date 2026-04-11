@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.models.schemas import BillRecord, ClassificationResult, DocumentCategory
+from app.services.accounting.doc_classifier import DocumentAnalysis
 
 
 def _image_payload(
@@ -133,6 +134,29 @@ def _read_export_rows(storage_dir: str) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def _analysis(
+    category: DocumentCategory = DocumentCategory.FATURA,
+    *,
+    is_financial_document: bool = True,
+    is_return: bool = False,
+    document_count: int | None = None,
+    quality: str = "usable",
+    needs_retry: bool = False,
+    confidence: float = 0.95,
+    reason: str = "ok",
+) -> DocumentAnalysis:
+    return DocumentAnalysis(
+        is_financial_document=is_financial_document,
+        category=category,
+        is_return=is_return,
+        document_count=document_count if document_count is not None else (1 if is_financial_document else 0),
+        quality=quality,
+        needs_retry=needs_retry,
+        confidence=confidence,
+        reason=reason,
+    )
+
+
 @contextmanager
 def _patch_runtime_settings(tmpdir: str, *, groups_only: bool = False):
     with patch("app.routes.webhooks.settings.storage_dir", tmpdir), patch(
@@ -181,6 +205,7 @@ def test_happy_path_image_webhook_writes_csv_and_reacts():
         source_message_id="wamid-1",
         source_filename="media-1.jpg",
         source_type="image",
+        document_date="2026-04-09",
         confidence=0.91,
     )
 
@@ -189,11 +214,8 @@ def test_happy_path_image_webhook_writes_csv_and_reacts():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ), patch(
-            "app.services.accounting.intake.bill_classifier.classify_image",
-            return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
-        ), patch(
-            "app.services.accounting.intake.doc_classifier.classify_document_type",
-            return_value=(DocumentCategory.FATURA, False),
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(DocumentCategory.FATURA, confidence=0.95),
         ), patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             return_value=[record],
@@ -230,6 +252,7 @@ def test_group_image_webhook_reacts_to_group_and_exports_group_metadata():
         source_sender_id="905551112233",
         source_group_id="group-123",
         source_chat_type="group",
+        document_date="2026-04-09",
         confidence=0.91,
     )
 
@@ -238,11 +261,8 @@ def test_group_image_webhook_reacts_to_group_and_exports_group_metadata():
         with _patch_runtime_settings(tmpdir, groups_only=True), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ), patch(
-            "app.services.accounting.intake.bill_classifier.classify_image",
-            return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
-        ), patch(
-            "app.services.accounting.intake.doc_classifier.classify_document_type",
-            return_value=(DocumentCategory.FATURA, False),
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(DocumentCategory.FATURA, confidence=0.95),
         ), patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             return_value=[record],
@@ -272,6 +292,9 @@ def test_group_image_webhook_reacts_to_group_and_exports_group_metadata():
             source_sender_id="905551112233",
             source_group_id="group-123",
             source_chat_type="group",
+            category_hint=DocumentCategory.FATURA,
+            document_count_hint=None,
+            is_return_hint=False,
         )
         send_mock.assert_not_called()
         assert reaction_mock.call_count == 2
@@ -288,6 +311,7 @@ def test_image_webhook_queues_pending_drive_backfill_when_upload_fails():
         source_message_id="wamid-1",
         source_filename="media-1.jpg",
         source_type="image",
+        document_date="2026-04-09",
         confidence=0.91,
     )
     pending_targets = [
@@ -303,11 +327,8 @@ def test_image_webhook_queues_pending_drive_backfill_when_upload_fails():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ), patch(
-            "app.services.accounting.intake.bill_classifier.classify_image",
-            return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
-        ), patch(
-            "app.services.accounting.intake.doc_classifier.classify_document_type",
-            return_value=(DocumentCategory.FATURA, False),
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(DocumentCategory.FATURA, confidence=0.95),
         ), patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             return_value=[record],
@@ -438,6 +459,7 @@ def test_duplicate_delivery_writes_only_one_export_row():
         source_message_id="wamid-1",
         source_filename="media-1.jpg",
         source_type="image",
+        document_date="2026-04-09",
         confidence=0.91,
     )
 
@@ -446,11 +468,8 @@ def test_duplicate_delivery_writes_only_one_export_row():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ) as fetch_mock, patch(
-            "app.services.accounting.intake.bill_classifier.classify_image",
-            return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
-        ), patch(
-            "app.services.accounting.intake.doc_classifier.classify_document_type",
-            return_value=(DocumentCategory.FATURA, False),
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(DocumentCategory.FATURA, confidence=0.95),
         ) as classify_mock, patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             return_value=[record],
@@ -482,7 +501,7 @@ def test_classification_failure_sends_error_and_writes_no_row():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ), patch(
-            "app.services.accounting.intake.bill_classifier.classify_image",
+            "app.services.accounting.intake.doc_classifier.analyze_document",
             side_effect=RuntimeError("classifier down"),
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
@@ -506,7 +525,7 @@ def test_classification_failure_503_sends_temporary_upstream_message():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ), patch(
-            "app.services.accounting.intake.bill_classifier.classify_image",
+            "app.services.accounting.intake.doc_classifier.analyze_document",
             side_effect=RuntimeError("503 UNAVAILABLE"),
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
@@ -518,7 +537,7 @@ def test_classification_failure_503_sends_temporary_upstream_message():
         assert response.status_code == 200
         assert _read_export_rows(tmpdir) == []
         send_mock.assert_called_once()
-        assert "ocr/ai servisi" in send_mock.call_args.args[1].lower()
+        assert "ai servisi" in send_mock.call_args.args[1].lower()
         assert reaction_mock.call_count == 2
         assert [call.args[2] for call in reaction_mock.call_args_list] == ["⌛", "⚠️"]
 
@@ -529,11 +548,8 @@ def test_extraction_failure_sends_error_and_writes_no_row():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ), patch(
-            "app.services.accounting.intake.bill_classifier.classify_image",
-            return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
-        ), patch(
-            "app.services.accounting.intake.doc_classifier.classify_document_type",
-            return_value=(DocumentCategory.FATURA, False),
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(DocumentCategory.FATURA, confidence=0.95),
         ), patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             side_effect=RuntimeError("extractor down"),
@@ -558,8 +574,14 @@ def test_non_bill_image_is_skipped_without_export():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ), patch(
-            "app.services.accounting.intake.bill_classifier.classify_image",
-            return_value=ClassificationResult(is_bill=False, reason="meme", confidence=0.97),
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(
+                DocumentCategory.BELIRSIZ,
+                is_financial_document=False,
+                document_count=0,
+                confidence=0.97,
+                reason="meme",
+            ),
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
         ) as send_mock, patch(
@@ -596,8 +618,14 @@ def test_repeated_non_bill_images_always_get_terminal_reply():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ), patch(
-            "app.services.accounting.intake.bill_classifier.classify_image",
-            return_value=ClassificationResult(is_bill=False, reason="meme", confidence=0.97),
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(
+                DocumentCategory.BELIRSIZ,
+                is_financial_document=False,
+                document_count=0,
+                confidence=0.97,
+                reason="meme",
+            ),
         ), patch(
             "app.routes.webhooks.whatsapp.send_text_message"
         ) as send_mock, patch(
@@ -623,6 +651,7 @@ def test_document_webhook_defaults_pdf_metadata():
         source_message_id="wamid-doc-1",
         source_filename="media-doc-1.pdf",
         source_type="document",
+        document_date="2026-04-09",
         confidence=0.89,
     )
 
@@ -631,11 +660,8 @@ def test_document_webhook_defaults_pdf_metadata():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-pdf"
         ), patch(
-            "app.services.accounting.intake.bill_classifier.classify_image",
-            return_value=ClassificationResult(is_bill=True, reason="document", confidence=0.94),
-        ), patch(
-            "app.services.accounting.intake.doc_classifier.classify_document_type",
-            return_value=(DocumentCategory.FATURA, False),
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(DocumentCategory.FATURA, confidence=0.94, reason="document"),
         ) as classify_mock, patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             return_value=[record],
@@ -662,6 +688,9 @@ def test_document_webhook_defaults_pdf_metadata():
             source_sender_id="905551112233",
             source_group_id=None,
             source_chat_type="individual",
+            category_hint=DocumentCategory.FATURA,
+            document_count_hint=None,
+            is_return_hint=False,
         )
         send_mock.assert_not_called()
         assert reaction_mock.call_count == 2
@@ -677,6 +706,7 @@ def test_send_failure_does_not_abort_export():
         source_message_id="wamid-1",
         source_filename="media-1.jpg",
         source_type="image",
+        document_date="2026-04-09",
         confidence=0.91,
     )
 
@@ -685,11 +715,8 @@ def test_send_failure_does_not_abort_export():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ), patch(
-            "app.services.accounting.intake.bill_classifier.classify_image",
-            return_value=ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
-        ), patch(
-            "app.services.accounting.intake.doc_classifier.classify_document_type",
-            return_value=(DocumentCategory.FATURA, False),
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(DocumentCategory.FATURA, confidence=0.95),
         ), patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             return_value=[record],
@@ -719,6 +746,7 @@ def test_failed_attempt_releases_claim_and_allows_retry():
         source_message_id="wamid-retry-1",
         source_filename="media-1.jpg",
         source_type="image",
+        document_date="2026-04-09",
         confidence=0.9,
     )
 
@@ -727,14 +755,11 @@ def test_failed_attempt_releases_claim_and_allows_retry():
         with _patch_runtime_settings(tmpdir), patch(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
         ), patch(
-            "app.services.accounting.intake.bill_classifier.classify_image",
+            "app.services.accounting.intake.doc_classifier.analyze_document",
             side_effect=[
                 RuntimeError("classifier down"),
-                ClassificationResult(is_bill=True, reason="ok", confidence=0.95),
+                _analysis(DocumentCategory.FATURA, confidence=0.95),
             ],
-        ), patch(
-            "app.services.accounting.intake.doc_classifier.classify_document_type",
-            return_value=(DocumentCategory.FATURA, False),
         ), patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             return_value=[record],

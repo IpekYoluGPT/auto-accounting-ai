@@ -246,8 +246,6 @@ class BillRecord(BaseModel):
     source_sender_id: Optional[str] = None
     source_group_id: Optional[str] = None
     source_chat_type: Optional[Literal["individual", "group"]] = None
-    processing_method: Optional[Literal["OCR", "LLM"]] = None
-
     # AI confidence
     confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
