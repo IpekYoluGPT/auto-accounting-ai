@@ -1375,20 +1375,38 @@ def queue_status() -> dict[str, int]:
     }
 
 
-def audit_current_month_spreadsheet(*, spreadsheet_id: Optional[str] = None, repair: bool = False) -> dict[str, object]:
+def audit_current_month_spreadsheet(
+    *,
+    spreadsheet_id: Optional[str] = None,
+    repair: bool = False,
+    target_tabs: set[str] | None = None,
+) -> dict[str, object]:
     client = _get_client()
     if client is None:
         raise RuntimeError("Google Sheets client unavailable.")
 
     with _lock:
         sh = _open_spreadsheet_by_key(client, spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
-        findings = _audit_spreadsheet_layout(sh, repair=repair)
+        findings = _audit_spreadsheet_layout(sh, repair=repair, target_tabs=target_tabs)
         return {
             "spreadsheet_id": sh.id,
             "month_key": _month_key(),
             "findings": findings,
             "queue": queue_status(),
         }
+
+
+def recommended_audit_tabs_for_test_drift(*, action: str, tab_name: str | None = None) -> list[str]:
+    target_tab = tab_name or "🧾 Faturalar"
+    if action == "delete_summary_tab":
+        return ["📊 Özet"]
+    if action == "rename_data_tab":
+        return [target_tab, "📊 Özet"]
+    if action == "corrupt_total_row":
+        return [target_tab, "📊 Özet"]
+    if action in {"corrupt_header_row", "clear_hidden_row_ids", "reorder_rows"}:
+        return [target_tab]
+    return [target_tab, "📊 Özet"]
 
 
 def apply_test_drift(

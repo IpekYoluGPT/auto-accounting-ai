@@ -427,20 +427,24 @@ async def sandbox_audit(
     request: Request,
     session_id: str = Query(...),
     repair: bool = Query(default=True),
+    tab_name: list[str] | None = Query(default=None),
 ) -> dict[str, object]:
     _verify_admin_token(request)
 
     try:
         context, spreadsheet_id = _require_existing_sandbox_context(session_id)
+        target_tabs = {tab for tab in (tab_name or []) if tab}
         with pipeline_context_scope(context):
             report = google_sheets.audit_current_month_spreadsheet(
                 spreadsheet_id=spreadsheet_id,
                 repair=repair,
+                target_tabs=target_tabs or None,
             )
         return {
             "status": "ok",
             "session_id": context.session_id,
             **report,
+            "audited_tabs": sorted(target_tabs) if target_tabs else None,
             "sheet_url": _sandbox_sheet_url(spreadsheet_id),
         }
     except HTTPException:
@@ -464,10 +468,15 @@ async def sandbox_drift(request: Request, payload: SandboxDriftRequest) -> dict[
                 replacement_name=payload.replacement_name,
                 row_count=payload.row_count,
             )
+            recommended_audit_tabs = google_sheets.recommended_audit_tabs_for_test_drift(
+                action=payload.action,
+                tab_name=payload.tab_name,
+            )
         return {
             "status": "ok",
             "session_id": context.session_id,
             **details,
+            "recommended_audit_tabs": recommended_audit_tabs,
             "sheet_url": _sandbox_sheet_url(spreadsheet_id),
         }
     except HTTPException:

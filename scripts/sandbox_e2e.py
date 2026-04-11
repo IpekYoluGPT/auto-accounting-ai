@@ -16,7 +16,7 @@ from PIL import Image, ImageDraw, ImageFont
 def _http_json(method: str, base_url: str, path: str, *, token: str | None = None, payload: dict | None = None, query: dict | None = None) -> dict:
     url = base_url.rstrip("/") + path
     if query:
-        url += "?" + parse.urlencode(query)
+        url += "?" + parse.urlencode(query, doseq=True)
 
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = request.Request(url, data=data, method=method.upper())
@@ -158,7 +158,12 @@ def main() -> int:
     for drift in drifts:
         payload = {"session_id": session_id, **drift}
         applied = _http_json("POST", args.base_url, "/setup/sandbox/drift", token=args.token, payload=payload)
-        audit = _http_json("GET", args.base_url, "/setup/sandbox/audit", token=args.token, query={"session_id": session_id, "repair": "true"})
+        audit_query = {
+            "session_id": session_id,
+            "repair": "true",
+            "tab_name": applied.get("recommended_audit_tabs") or [],
+        }
+        audit = _http_json("GET", args.base_url, "/setup/sandbox/audit", token=args.token, query=audit_query)
         drift_results.append({"drift": applied, "audit": audit})
 
     final_audit = _http_json("GET", args.base_url, "/setup/sandbox/audit", token=args.token, query={"session_id": session_id, "repair": "true"})

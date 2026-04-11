@@ -241,3 +241,31 @@ def test_sandbox_audit_returns_404_for_unknown_session():
             )
 
     assert response.status_code == 404
+
+
+def test_sandbox_audit_passes_target_tabs_to_google_sheets():
+    context = sandbox_context(session_id="alpha")
+    with _lifespan_patches(), patch(
+        "app.routes.setup.settings.periskope_tool_token",
+        "secret-token",
+    ), patch(
+        "app.routes.setup._require_existing_sandbox_context",
+        return_value=(context, "sandbox-sheet-1"),
+    ), patch(
+        "app.routes.setup.google_sheets.audit_current_month_spreadsheet",
+        return_value={"spreadsheet_id": "sandbox-sheet-1", "month_key": "2026-04", "findings": [], "queue": {"pending_sheet_appends": 0, "pending_drive_uploads": 0}},
+    ) as audit_mock:
+        with TestClient(app) as client:
+            response = client.get(
+                "/setup/sandbox/audit",
+                params=[("session_id", "alpha"), ("repair", "true"), ("tab_name", "🧾 Faturalar"), ("tab_name", "📊 Özet")],
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+    assert response.status_code == 200
+    assert response.json()["audited_tabs"] == ["📊 Özet", "🧾 Faturalar"]
+    audit_mock.assert_called_once_with(
+        spreadsheet_id="sandbox-sheet-1",
+        repair=True,
+        target_tabs={"🧾 Faturalar", "📊 Özet"},
+    )
