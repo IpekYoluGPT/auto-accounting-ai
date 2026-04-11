@@ -2,8 +2,14 @@
 Application configuration loaded from environment variables.
 """
 
+import os
+
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _default_storage_dir() -> str:
+    return os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip() or "./storage"
 
 
 class Settings(BaseSettings):
@@ -86,7 +92,8 @@ class Settings(BaseSettings):
     manager_phone_number: str = ""
 
     # Storage
-    storage_dir: str = "./storage"
+    storage_dir: str = Field(default_factory=_default_storage_dir)
+    pending_payload_storage_limit_mb: int = 192
 
     # Logging
     log_level: str = "INFO"

@@ -5,7 +5,9 @@ Tests for application settings defaults.
 from app.config import Settings
 
 
-def test_gemini_model_defaults():
+def test_gemini_model_defaults(monkeypatch):
+    monkeypatch.delenv("STORAGE_DIR", raising=False)
+    monkeypatch.delenv("RAILWAY_VOLUME_MOUNT_PATH", raising=False)
     settings = Settings(_env_file=None)
     assert settings.gemini_classifier_model == "gemini-2.5-pro"
     assert settings.gemini_extractor_model == "gemini-2.5-pro"
@@ -18,6 +20,8 @@ def test_gemini_model_defaults():
     assert settings.ocr_min_text_chars == 60
     assert settings.ocr_min_parse_score == 0.72
     assert settings.ocr_min_quality_score == 0.45
+    assert settings.storage_dir == "./storage"
+    assert settings.pending_payload_storage_limit_mb == 192
 
 
 def test_environment_overrides_are_applied(monkeypatch):
@@ -56,3 +60,13 @@ def test_short_document_ai_env_aliases_are_accepted(monkeypatch):
 
     assert settings.google_document_ai_form_processor_id == "form-short"
     assert settings.google_document_ai_ocr_processor_id == "ocr-short"
+
+
+
+def test_railway_volume_mount_path_becomes_default_storage_dir(monkeypatch):
+    monkeypatch.delenv("STORAGE_DIR", raising=False)
+    monkeypatch.setenv("RAILWAY_VOLUME_MOUNT_PATH", "/data/railway-volume")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.storage_dir == "/data/railway-volume"

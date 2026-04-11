@@ -332,6 +332,8 @@ def test_append_record_queues_pending_sheet_appends_and_starts_worker(tmp_path, 
     assert [item["tab_name"] for item in items] == ["🧾 Faturalar", "↩️ İadeler"]
     assert [item["category"] for item in items] == ["fatura", "iade"]
     assert all(item["spreadsheet_id"] == "sheet-queue-1" for item in items)
+    payload_paths = {item["document_payload_path"] for item in items}
+    assert len(payload_paths) == 1
     assert all(Path(item["document_payload_path"]).exists() for item in items)
 
 
@@ -434,3 +436,35 @@ def test_process_pending_sheet_appends_retries_rate_limited_batch(tmp_path, monk
     assert items[0]["attempts"] == 1
     assert "429" in items[0]["last_error"]
     assert float(items[0]["next_attempt_at"]) > 0
+
+
+
+def test_append_record_skips_pending_payload_when_storage_budget_is_exceeded(tmp_path, monkeypatch):
+    monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
+    monkeypatch.setattr(google_sheets.settings, "google_sheets_spreadsheet_id", "sheet-budget-1")
+    monkeypatch.setattr(google_sheets.settings, "pending_payload_storage_limit_mb", 1)
+    monkeypatch.setattr(google_sheets, "_get_client", lambda: object())
+    monkeypatch.setattr(google_sheets, "start_pending_sheet_append_worker", lambda: None)
+
+    record = google_sheets.BillRecord(
+        company_name="ABC Market",
+        total_amount=100.0,
+        currency="TRY",
+        source_message_id="wamid-budget-1",
+        document_date="2026-04-11",
+        confidence=0.91,
+    )
+
+    google_sheets.append_record(
+        record,
+        google_sheets.DocumentCategory.FATURA,
+        drive_link=None,
+        pending_document_bytes=b"x" * (2 * 1024 * 1024),
+        pending_document_filename="big.jpg",
+        pending_document_mime_type="image/jpeg",
+    )
+
+    items = google_sheets._load_pending_sheet_appends()
+    assert len(items) == 1
+    assert items[0]["document_payload_path"] == ""
+    assert list((Path(tmp_path) / "state" / "pending_sheet_appends").glob("*.bin")) == []

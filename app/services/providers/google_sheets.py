@@ -14,6 +14,7 @@ Backwards-compatible: plain-name tabs are renamed to emoji versions on first acc
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import ssl
 import threading
@@ -1949,6 +1950,88 @@ def _resolve_pending_sheet_spreadsheet_id(*, client=None, month_key: Optional[st
         return None
 
 
+def _pending_payload_storage_limit_bytes() -> int:
+    limit_mb = max(int(settings.pending_payload_storage_limit_mb), 0)
+    return limit_mb * 1024 * 1024
+
+
+def _pending_payload_storage_usage_bytes() -> int:
+    total = 0
+    seen_paths: set[str] = set()
+    for directory in (_pending_sheet_appends_dir(), _pending_drive_uploads_dir()):
+        for path in directory.glob("*.bin"):
+            try:
+                resolved = str(path.resolve())
+            except Exception:
+                resolved = str(path)
+            if resolved in seen_paths or not path.exists():
+                continue
+            seen_paths.add(resolved)
+            total += path.stat().st_size
+    return total
+
+
+def _shared_pending_sheet_payload_path(
+    *,
+    source_message_id: str | None,
+    filename: str | None,
+    mime_type: str | None,
+) -> Path:
+    key = "|".join([
+        (source_message_id or "").strip(),
+        (filename or "").strip(),
+        (mime_type or "").strip(),
+    ])
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return _pending_sheet_appends_dir() / f"{digest}.bin"
+
+
+def _get_or_create_shared_pending_sheet_payload(
+    *,
+    source_message_id: str | None,
+    filename: str | None,
+    mime_type: str | None,
+    payload_bytes: bytes,
+) -> str:
+    payload_path = _shared_pending_sheet_payload_path(
+        source_message_id=source_message_id,
+        filename=filename,
+        mime_type=mime_type,
+    )
+    if payload_path.exists():
+        return str(payload_path)
+
+    payload_size = len(payload_bytes)
+    storage_limit = _pending_payload_storage_limit_bytes()
+    current_usage = _pending_payload_storage_usage_bytes()
+    if storage_limit and (current_usage + payload_size) > storage_limit:
+        logger.error(
+            "Skipping pending sheet payload for message id=%s because payload queue budget would exceed %d MB (current=%d bytes, incoming=%d bytes).",
+            source_message_id or "?",
+            settings.pending_payload_storage_limit_mb,
+            current_usage,
+            payload_size,
+        )
+        return ""
+
+    payload_path.write_bytes(payload_bytes)
+    return str(payload_path)
+
+
+def _cleanup_pending_sheet_payload_if_unused(payload_path_raw: str) -> None:
+    if not payload_path_raw:
+        return
+
+    payload_path = Path(payload_path_raw)
+    with _pending_sheet_appends_lock:
+        still_referenced = any(
+            str(item.get("document_payload_path") or "") == payload_path_raw
+            for item in _load_pending_sheet_appends()
+        )
+    if not still_referenced:
+        payload_path.unlink(missing_ok=True)
+
+
 def _queue_pending_sheet_append_item(
     *,
     record: BillRecord,
@@ -1962,10 +2045,12 @@ def _queue_pending_sheet_append_item(
 ) -> dict:
     payload_path = ""
     if document_payload:
-        payload_id = uuid4().hex
-        payload = _pending_sheet_appends_dir() / f"{payload_id}.bin"
-        payload.write_bytes(document_payload)
-        payload_path = str(payload)
+        payload_path = _get_or_create_shared_pending_sheet_payload(
+            source_message_id=record.source_message_id,
+            filename=document_filename,
+            mime_type=document_mime_type,
+            payload_bytes=document_payload,
+        )
 
     month_key = _month_key()
     return {
@@ -2156,19 +2241,19 @@ def process_pending_sheet_appends(*, max_items: int | None = None) -> int:
                         lambda: ws.append_rows(rows, value_input_option="USER_ENTERED")
                     )
 
+            payloads_to_cleanup: set[str] = set()
             for item in batch:
                 item_id = str(item.get("id") or "")
                 row_number = row_numbers.get(item_id)
                 if row_number is None:
                     raise RuntimeError(f"Queued sheet append {item_id} has no resolved row number.")
 
+                payload_path_raw = str(item.get("document_payload_path") or "")
                 if str(item.get("drive_link") or "").strip():
-                    payload_path_raw = str(item.get("document_payload_path") or "")
                     if payload_path_raw:
-                        Path(payload_path_raw).unlink(missing_ok=True)
+                        payloads_to_cleanup.add(payload_path_raw)
                     continue
 
-                payload_path_raw = str(item.get("document_payload_path") or "")
                 if not payload_path_raw:
                     continue
 
@@ -2189,9 +2274,11 @@ def process_pending_sheet_appends(*, max_items: int | None = None) -> int:
                     ],
                     source_message_id=str(item.get("source_message_id") or "") or None,
                 )
-                payload_path.unlink(missing_ok=True)
+                payloads_to_cleanup.add(payload_path_raw)
 
             _remove_pending_sheet_appends({str(item.get("id") or "") for item in batch})
+            for payload_path_raw in payloads_to_cleanup:
+                _cleanup_pending_sheet_payload_if_unused(payload_path_raw)
             processed += len(batch)
             logger.info(
                 "Processed %d queued sheet append(s) into %s/%s.",

@@ -3,6 +3,7 @@ FastAPI application entry point.
 """
 
 import csv
+import os
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
@@ -25,6 +26,24 @@ logger = get_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Auto Accounting AI started.")
+    railway_volume_mount_path = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+    if os.getenv("RAILWAY_SERVICE_ID"):
+        storage_path = Path(settings.storage_dir).resolve()
+        if not railway_volume_mount_path:
+            logger.warning(
+                "Railway volume mount path is not configured; storage at %s will be ephemeral.",
+                storage_path,
+            )
+        else:
+            volume_path = Path(railway_volume_mount_path).resolve()
+            if storage_path != volume_path and volume_path not in storage_path.parents:
+                logger.warning(
+                    "STORAGE_DIR=%s is outside Railway volume mount path %s; queue persistence will not survive redeploys.",
+                    storage_path,
+                    volume_path,
+                )
+            else:
+                logger.info("Using Railway volume-backed storage at %s.", storage_path)
     google_sheets.ensure_current_month_spreadsheet_ready()
     google_sheets.process_pending_sheet_appends()
     google_sheets.process_pending_document_uploads()
