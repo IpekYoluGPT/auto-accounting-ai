@@ -46,13 +46,13 @@ def test_next_seq_ignores_header_and_total_rows():
     assert google_sheets._next_seq(ws) == 4
 
 
-def test_ensure_tab_total_row_inserts_row_when_existing_data_starts_on_row_two():
+def test_ensure_tab_total_row_rewrites_row_two_when_existing_data_starts_on_row_two():
     ws = MagicMock()
     ws.row_values.return_value = ["1", "2026-04-01", "ABC"]
 
     google_sheets._ensure_tab_total_row(ws, "🧾 Faturalar")
 
-    ws.insert_row.assert_called_once()
+    ws.insert_row.assert_not_called()
     ws.update.assert_called_once_with(
         [google_sheets._total_row_values("🧾 Faturalar")],
         "A2",

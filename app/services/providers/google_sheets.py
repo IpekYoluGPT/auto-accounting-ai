@@ -1025,15 +1025,10 @@ def _setup_summary_tab(ws, month_label: str, *, lightweight: bool = False) -> No
 def _ensure_tab_total_row(ws, tab_name: str) -> None:
     headers, _ = _TABS[tab_name]
     last_col = _col_letter(len(headers) - 1)
-    row_two = ws.row_values(2)
-    if row_two:
-        first_cell = row_two[0] if row_two else ""
-    else:
-        first_cell = ""
 
-    if row_two and not _looks_like_total_row(first_cell):
-        ws.insert_row([""] * len(headers), index=2, value_input_option="RAW")
-
+    # Row 2 is reserved for the canonical TOPLAM row. Rewriting it in place is
+    # safer than inserting a new row after manual edits, because insertion can
+    # shift real data rows and intermittently fail against live Sheets.
     ws.update([_total_row_values(tab_name)], "A2", value_input_option="USER_ENTERED")
     ws.format(f"A2:{last_col}2", {
         "backgroundColor": {"red": 0.96, "green": 0.96, "blue": 0.96},

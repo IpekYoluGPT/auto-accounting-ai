@@ -694,3 +694,16 @@ def test_process_pending_sheet_appends_repairs_target_tabs_before_append(tmp_pat
 
     assert processed == 1
     assert audit_calls == [(fake_sheet, True, {"🧾 Faturalar", "📊 Özet"})]
+
+
+def test_ensure_tab_total_row_rewrites_in_place_without_inserting_rows():
+    fake_ws = MagicMock()
+
+    google_sheets._ensure_tab_total_row(fake_ws, "🧾 Faturalar")
+
+    fake_ws.update.assert_called_once_with(
+        [google_sheets._total_row_values("🧾 Faturalar")],
+        "A2",
+        value_input_option="USER_ENTERED",
+    )
+    fake_ws.insert_row.assert_not_called()
