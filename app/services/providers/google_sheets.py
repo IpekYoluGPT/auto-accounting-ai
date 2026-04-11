@@ -1420,9 +1420,11 @@ def _bootstrap_spreadsheet_tabs(sh) -> None:
 # ─── Row builders ─────────────────────────────────────────────────────────────
 
 
-def _safe(v) -> str:
+def _safe(v):
     if v is None:
         return ""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return v
     return str(v)
 
 

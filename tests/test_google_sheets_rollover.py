@@ -75,6 +75,7 @@ def test_elden_odeme_row_includes_drive_verification_cell():
         drive_link="https://drive.google.com/file/d/example/view",
     )
 
+    assert row[4] == 1500.0
     assert row[-2] == "905551112233"
     assert row[-1] == '=HYPERLINK("https://drive.google.com/file/d/example/view";"📄 Görüntüle")'
     assert google_sheets._TABS["💵 Elden Ödemeler"][0][-1] == "📎 Belge"
