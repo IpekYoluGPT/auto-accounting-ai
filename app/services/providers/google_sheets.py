@@ -1635,25 +1635,31 @@ def _build_row(
 
 
 def reset_current_month_spreadsheet_data(*, spreadsheet_id: Optional[str] = None) -> int:
-    """Clear current-month sheet data while preserving headers, totals, and formatting."""
+    """Clear current-month data rows while preserving headers, formulas, and formatting."""
     client = _get_client()
     if client is None:
         raise RuntimeError("Google Sheets client unavailable.")
 
     with _lock:
         sh = client.open_by_key(spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
+        touched_tabs = 0
 
         for tab_name in _TABS:
             ws = _ensure_tab_exists(sh, tab_name)
-            ws.clear()
+            touched_tabs += 1
             if tab_name == "📊 Özet":
-                _setup_summary_tab(ws, _month_label())
-            else:
-                _setup_worksheet(ws, tab_name)
+                continue
+
+            clear_range = f"A3:{_internal_row_id_column_letter(tab_name)}{max(int(getattr(ws, 'row_count', 1000) or 1000), 1000)}"
+            _retry_on_rate_limit(lambda ws=ws, clear_range=clear_range: ws.batch_clear([clear_range]))
 
         _mark_recently_prepared(sh)
-        logger.info("Reset current-month spreadsheet data for %s (sheet=%s).", _month_key(), sh.id)
-        return len(_TABS)
+        logger.info(
+            "Cleared current-month spreadsheet data rows for %s (sheet=%s).",
+            _month_key(),
+            sh.id,
+        )
+        return touched_tabs
 
 
 def _next_seq(ws) -> int:

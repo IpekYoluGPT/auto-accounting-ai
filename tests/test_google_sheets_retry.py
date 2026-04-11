@@ -548,6 +548,45 @@ def test_process_pending_sheet_appends_retries_rate_limited_batch(tmp_path, monk
 
 
 
+def test_reset_current_month_spreadsheet_data_clears_only_data_rows(monkeypatch):
+    fake_summary_ws = MagicMock()
+    fake_summary_ws.row_count = 1000
+    fake_tab_wss = {}
+    for tab_name in google_sheets._TABS:
+        if tab_name == "📊 Özet":
+            continue
+        ws = MagicMock()
+        ws.row_count = 1234
+        fake_tab_wss[tab_name] = ws
+
+    fake_sheet = MagicMock()
+    fake_sheet.id = "sheet-reset-1"
+    fake_client = MagicMock()
+    fake_client.open_by_key.return_value = fake_sheet
+
+    def _ensure_tab_exists(sh, tab_name, base_name=None):
+        assert sh is fake_sheet
+        if tab_name == "📊 Özet":
+            return fake_summary_ws
+        return fake_tab_wss[tab_name]
+
+    recent_marks = []
+    monkeypatch.setattr(google_sheets, "_get_client", lambda: fake_client)
+    monkeypatch.setattr(google_sheets, "_ensure_tab_exists", _ensure_tab_exists)
+    monkeypatch.setattr(google_sheets, "_mark_recently_prepared", lambda sh: recent_marks.append(sh.id))
+
+    touched_tabs = google_sheets.reset_current_month_spreadsheet_data(spreadsheet_id="sheet-reset-1")
+
+    assert touched_tabs == len(google_sheets._TABS)
+    fake_client.open_by_key.assert_called_once_with("sheet-reset-1")
+    fake_summary_ws.batch_clear.assert_not_called()
+    for tab_name, ws in fake_tab_wss.items():
+        ws.batch_clear.assert_called_once_with(
+            [f"A3:{google_sheets._internal_row_id_column_letter(tab_name)}1234"]
+        )
+    assert recent_marks == ["sheet-reset-1"]
+
+
 def test_append_record_skips_pending_payload_when_storage_budget_is_exceeded(tmp_path, monkeypatch):
     monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
     monkeypatch.setattr(google_sheets.settings, "google_sheets_spreadsheet_id", "sheet-budget-1")
