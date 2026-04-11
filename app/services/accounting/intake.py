@@ -477,34 +477,25 @@ def _handle_media(
     drive_link = google_sheets.upload_document(raw_bytes, filename=filename, mime_type=mime_type)
 
     persisted_count = 0
-    pending_drive_targets: list[dict[str, str | int]] = []
     for record in valid_records:
         record.source_media_sha256 = media_sha256
         persisted = record_store.persist_record_once(record)
         if not persisted:
             continue
         persisted_count += 1
-        appended_targets = google_sheets.append_record(
+        google_sheets.append_record(
             record,
             category,
             is_return=is_return,
             drive_link=drive_link,
+            pending_document_bytes=None if drive_link else raw_bytes,
+            pending_document_filename=None if drive_link else filename,
+            pending_document_mime_type=None if drive_link else mime_type,
         )
-        if not drive_link:
-            pending_drive_targets.extend(appended_targets)
 
     if persisted_count == 0:
         _safe_send_reaction(route, REACTION_SUCCESS, reason="already exported reaction", send_reaction=send_reaction)
         return "already_exported"
-
-    if not drive_link and pending_drive_targets:
-        google_sheets.queue_pending_document_upload(
-            file_bytes=raw_bytes,
-            filename=filename,
-            mime_type=mime_type,
-            targets=pending_drive_targets,
-            source_message_id=message_id,
-        )
 
     _safe_send_reaction(route, REACTION_SUCCESS, reason="success reaction", send_reaction=send_reaction)
     return "exported"

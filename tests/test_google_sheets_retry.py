@@ -264,3 +264,173 @@ def test_process_pending_document_uploads_backfills_missing_drive_links(tmp_path
     assert google_sheets._load_pending_drive_uploads() == []
     payload_files = list((Path(tmp_path) / "state" / "pending_drive_uploads").glob("*"))
     assert payload_files == []
+
+
+
+def test_queue_pending_document_upload_merges_targets_for_same_message(tmp_path, monkeypatch):
+    monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
+    monkeypatch.setattr(google_sheets, "start_pending_drive_upload_worker", lambda: None)
+
+    google_sheets.queue_pending_document_upload(
+        file_bytes=b"doc-bytes",
+        filename="Dekont.pdf",
+        mime_type="application/pdf",
+        targets=[{"spreadsheet_id": "sheet-1", "tab_name": "💳 Dekontlar", "row_number": 3}],
+        source_message_id="wamid-merge-1",
+    )
+    google_sheets.queue_pending_document_upload(
+        file_bytes=b"doc-bytes",
+        filename="Dekont.pdf",
+        mime_type="application/pdf",
+        targets=[{"spreadsheet_id": "sheet-1", "tab_name": "↩️ İadeler", "row_number": 5}],
+        source_message_id="wamid-merge-1",
+    )
+
+    items = google_sheets._load_pending_drive_uploads()
+    assert len(items) == 1
+    assert items[0]["source_message_id"] == "wamid-merge-1"
+    assert items[0]["targets"] == [
+        {"spreadsheet_id": "sheet-1", "tab_name": "💳 Dekontlar", "row_number": 3},
+        {"spreadsheet_id": "sheet-1", "tab_name": "↩️ İadeler", "row_number": 5},
+    ]
+
+
+def test_append_record_queues_pending_sheet_appends_and_starts_worker(tmp_path, monkeypatch):
+    monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
+    monkeypatch.setattr(google_sheets.settings, "google_sheets_spreadsheet_id", "sheet-queue-1")
+    monkeypatch.setattr(google_sheets, "_get_client", lambda: object())
+
+    worker_started = {"count": 0}
+
+    def _start_worker():
+        worker_started["count"] += 1
+
+    monkeypatch.setattr(google_sheets, "start_pending_sheet_append_worker", _start_worker)
+
+    record = google_sheets.BillRecord(
+        company_name="ABC Market",
+        total_amount=100.0,
+        currency="TRY",
+        source_message_id="wamid-sheet-1",
+        document_date="2026-04-11",
+        confidence=0.91,
+    )
+
+    google_sheets.append_record(
+        record,
+        google_sheets.DocumentCategory.FATURA,
+        is_return=True,
+        drive_link=None,
+        pending_document_bytes=b"fake-image",
+        pending_document_filename="media-1.jpg",
+        pending_document_mime_type="image/jpeg",
+    )
+
+    items = google_sheets._load_pending_sheet_appends()
+    assert len(items) == 2
+    assert worker_started["count"] == 1
+    assert [item["tab_name"] for item in items] == ["🧾 Faturalar", "↩️ İadeler"]
+    assert [item["category"] for item in items] == ["fatura", "iade"]
+    assert all(item["spreadsheet_id"] == "sheet-queue-1" for item in items)
+    assert all(Path(item["document_payload_path"]).exists() for item in items)
+
+
+def test_process_pending_sheet_appends_batches_rows_and_queues_drive_backfill(tmp_path, monkeypatch):
+    monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
+    monkeypatch.setattr(google_sheets.settings, "google_sheets_spreadsheet_id", "sheet-batch-1")
+
+    record = google_sheets.BillRecord(
+        company_name="ABC Market",
+        total_amount=100.0,
+        currency="TRY",
+        source_message_id="wamid-sheet-2",
+        document_date="2026-04-11",
+        confidence=0.91,
+    )
+
+    monkeypatch.setattr(google_sheets, "_get_client", lambda: object())
+    monkeypatch.setattr(google_sheets, "start_pending_sheet_append_worker", lambda: None)
+    google_sheets.append_record(
+        record,
+        google_sheets.DocumentCategory.FATURA,
+        drive_link=None,
+        pending_document_bytes=b"fake-image",
+        pending_document_filename="media-1.jpg",
+        pending_document_mime_type="image/jpeg",
+    )
+
+    queued_items = google_sheets._load_pending_sheet_appends()
+    assert len(queued_items) == 1
+    pending_id = queued_items[0]["id"]
+
+    fake_ws = MagicMock()
+    fake_ws.get.return_value = []
+    fake_ws.col_values.return_value = ["#", "TOPLAM"]
+    fake_sheet = MagicMock()
+    fake_sheet.worksheet.return_value = fake_ws
+    fake_client = MagicMock()
+    fake_client.open_by_key.return_value = fake_sheet
+
+    queue_mock = MagicMock()
+    monkeypatch.setattr(google_sheets, "_get_client", lambda: fake_client)
+    monkeypatch.setattr(google_sheets, "queue_pending_document_upload", queue_mock)
+
+    processed = google_sheets.process_pending_sheet_appends()
+
+    assert processed == 1
+    fake_client.open_by_key.assert_called_once_with("sheet-batch-1")
+    fake_ws.append_rows.assert_called_once()
+    appended_rows = fake_ws.append_rows.call_args.args[0]
+    assert len(appended_rows) == 1
+    assert appended_rows[0][-1] == pending_id
+    queue_mock.assert_called_once()
+    assert queue_mock.call_args.kwargs["targets"] == [
+        {"spreadsheet_id": "sheet-batch-1", "tab_name": "🧾 Faturalar", "row_number": 3}
+    ]
+    assert queue_mock.call_args.kwargs["source_message_id"] == "wamid-sheet-2"
+    assert google_sheets._load_pending_sheet_appends() == []
+    assert list((Path(tmp_path) / "state" / "pending_sheet_appends").glob("*")) == []
+
+
+
+def test_process_pending_sheet_appends_retries_rate_limited_batch(tmp_path, monkeypatch):
+    monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
+    monkeypatch.setattr(google_sheets.settings, "google_sheets_spreadsheet_id", "sheet-batch-2")
+
+    record = google_sheets.BillRecord(
+        company_name="ABC Market",
+        total_amount=100.0,
+        currency="TRY",
+        source_message_id="wamid-sheet-3",
+        document_date="2026-04-11",
+        confidence=0.91,
+    )
+
+    monkeypatch.setattr(google_sheets, "_get_client", lambda: object())
+    monkeypatch.setattr(google_sheets, "start_pending_sheet_append_worker", lambda: None)
+    google_sheets.append_record(
+        record,
+        google_sheets.DocumentCategory.FATURA,
+        drive_link="https://drive.google.com/file/d/test/view",
+    )
+
+    fake_ws = MagicMock()
+    fake_ws.get.return_value = []
+    fake_ws.col_values.return_value = ["#", "TOPLAM"]
+    fake_ws.append_rows.side_effect = FakeApiError("429 rate limit")
+    fake_sheet = MagicMock()
+    fake_sheet.worksheet.return_value = fake_ws
+    fake_client = MagicMock()
+    fake_client.open_by_key.return_value = fake_sheet
+
+    monkeypatch.setattr(google_sheets, "_get_client", lambda: fake_client)
+    monkeypatch.setattr(google_sheets, "_retry_on_rate_limit", lambda fn, **kwargs: fn())
+
+    processed = google_sheets.process_pending_sheet_appends()
+
+    assert processed == 0
+    items = google_sheets._load_pending_sheet_appends()
+    assert len(items) == 1
+    assert items[0]["attempts"] == 1
+    assert "429" in items[0]["last_error"]
+    assert float(items[0]["next_attempt_at"]) > 0

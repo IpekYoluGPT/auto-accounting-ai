@@ -344,7 +344,7 @@ def test_group_image_webhook_reacts_to_group_and_exports_group_metadata():
         assert reaction_mock.call_args_list[0].kwargs["recipient_type"] == "group"
 
 
-def test_image_webhook_queues_pending_drive_backfill_when_upload_fails():
+def test_image_webhook_passes_pending_document_payload_to_sheet_outbox_when_upload_fails():
     record = BillRecord(
         company_name="ABC Market",
         total_amount=100.0,
@@ -355,13 +355,6 @@ def test_image_webhook_queues_pending_drive_backfill_when_upload_fails():
         document_date="2026-04-09",
         confidence=0.91,
     )
-    pending_targets = [
-        {
-            "spreadsheet_id": "sheet-123",
-            "tab_name": "🧾 Faturalar",
-            "row_number": 3,
-        }
-    ]
 
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
@@ -378,10 +371,8 @@ def test_image_webhook_queues_pending_drive_backfill_when_upload_fails():
             return_value=None,
         ), patch(
             "app.services.accounting.intake.google_sheets.append_record",
-            return_value=pending_targets,
-        ), patch(
-            "app.services.accounting.intake.google_sheets.queue_pending_document_upload",
-        ) as queue_mock, patch(
+            return_value=[],
+        ) as append_mock, patch(
             "app.routes.webhooks.whatsapp.send_text_message"
         ) as send_mock, patch(
             "app.routes.webhooks.whatsapp.send_reaction_message"
@@ -393,9 +384,11 @@ def test_image_webhook_queues_pending_drive_backfill_when_upload_fails():
         assert len(_read_export_rows(tmpdir)) == 1
         send_mock.assert_not_called()
         assert reaction_mock.call_count == 2
-        queue_mock.assert_called_once()
-        assert queue_mock.call_args.kwargs["targets"] == pending_targets
-        assert queue_mock.call_args.kwargs["source_message_id"] == "wamid-1"
+        append_mock.assert_called_once()
+        assert append_mock.call_args.kwargs["drive_link"] is None
+        assert append_mock.call_args.kwargs["pending_document_bytes"] == b"fake-image"
+        assert append_mock.call_args.kwargs["pending_document_filename"] == "media-1.jpg"
+        assert append_mock.call_args.kwargs["pending_document_mime_type"] == "image/jpeg"
 
 
 def test_bill_like_text_prompts_for_photo():

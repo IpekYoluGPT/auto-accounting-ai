@@ -9,7 +9,11 @@ def test_reset_sheet_requires_valid_tool_token():
     with patch(
         "app.main.google_sheets.ensure_current_month_spreadsheet_ready"
     ), patch(
+        "app.main.google_sheets.process_pending_sheet_appends"
+    ), patch(
         "app.main.google_sheets.process_pending_document_uploads"
+    ), patch(
+        "app.main.google_sheets.start_pending_sheet_append_worker"
     ), patch(
         "app.main.google_sheets.start_monthly_rollover_scheduler"
     ), patch(
@@ -28,7 +32,11 @@ def test_reset_sheet_allows_request_when_tool_token_is_unset():
     with patch(
         "app.main.google_sheets.ensure_current_month_spreadsheet_ready"
     ), patch(
+        "app.main.google_sheets.process_pending_sheet_appends"
+    ), patch(
         "app.main.google_sheets.process_pending_document_uploads"
+    ), patch(
+        "app.main.google_sheets.start_pending_sheet_append_worker"
     ), patch(
         "app.main.google_sheets.start_monthly_rollover_scheduler"
     ), patch(
@@ -52,7 +60,11 @@ def test_reset_sheet_calls_google_sheets_with_payload_id():
     with patch(
         "app.main.google_sheets.ensure_current_month_spreadsheet_ready"
     ), patch(
+        "app.main.google_sheets.process_pending_sheet_appends"
+    ), patch(
         "app.main.google_sheets.process_pending_document_uploads"
+    ), patch(
+        "app.main.google_sheets.start_pending_sheet_append_worker"
     ), patch(
         "app.main.google_sheets.start_monthly_rollover_scheduler"
     ), patch(

@@ -180,6 +180,7 @@ _AMOUNT_COLUMNS = {
 _lock = threading.Lock()
 _drive_upload_lock = threading.Lock()
 _pending_drive_uploads_lock = threading.Lock()
+_pending_sheet_appends_lock = threading.Lock()
 _gspread_client = None  # lazy-initialised
 _drive_service = None   # lazy-initialised (service account)
 _sheets_service = None  # lazy-initialised (Sheets API v4, service account)
@@ -196,9 +197,13 @@ _rollover_stop_event: threading.Event | None = None
 _rollover_lock = threading.Lock()
 _pending_drive_worker_thread: threading.Thread | None = None
 _pending_drive_worker_lock = threading.Lock()
+_pending_sheet_worker_thread: threading.Thread | None = None
+_pending_sheet_worker_lock = threading.Lock()
 _recently_prepared_spreadsheets: dict[str, float] = {}
 _RECENT_PREPARED_TTL_SECONDS = 180.0
 _PENDING_DRIVE_WORKER_DELAY_SECONDS = 15.0
+_PENDING_SHEET_WORKER_RETRY_DELAY_SECONDS = 30.0
+_PENDING_SHEET_BATCH_SIZE = 25
 
 
 def _get_business_timezone():
@@ -672,6 +677,18 @@ def _pending_drive_uploads_dir() -> Path:
     return path
 
 
+def _pending_sheet_appends_state_path() -> Path:
+    path = Path(settings.storage_dir) / "state" / "pending_sheet_appends.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _pending_sheet_appends_dir() -> Path:
+    path = Path(settings.storage_dir) / "state" / "pending_sheet_appends"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _load_registry() -> dict[str, str]:
     path = _registry_path()
     if not path.exists():
@@ -857,6 +874,22 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
                     "fields": "userEnteredFormat(numberFormat,horizontalAlignment)",
                 }
             })
+
+    requests.append({
+        "updateDimensionProperties": {
+            "range": {
+                "sheetId": sheet_id,
+                "dimension": "COLUMNS",
+                "startIndex": len(headers),
+                "endIndex": len(headers) + 1,
+            },
+            "properties": {
+                "pixelSize": 1,
+                "hiddenByUser": True,
+            },
+            "fields": "pixelSize,hiddenByUser",
+        }
+    })
 
     # Row height for header
     requests.append({
@@ -1433,6 +1466,11 @@ def _drive_column_letter(tab_name: str) -> str:
     return _col_letter(len(headers) - 1)
 
 
+def _internal_row_id_column_letter(tab_name: str) -> str:
+    headers, _ = _TABS[tab_name]
+    return _col_letter(len(headers))
+
+
 def _drive_cell(drive_link: Optional[str]) -> str:
     """Return a HYPERLINK formula if we have a link, otherwise empty string."""
     if drive_link:
@@ -1688,6 +1726,50 @@ def queue_pending_document_upload(
     if not targets:
         return
 
+    normalized_targets = [
+        {
+            "spreadsheet_id": str(target["spreadsheet_id"]),
+            "tab_name": str(target["tab_name"]),
+            "row_number": int(target["row_number"]),
+        }
+        for target in targets
+    ]
+
+    with _pending_drive_uploads_lock:
+        items = _load_pending_drive_uploads()
+        if source_message_id:
+            for existing in items:
+                if (
+                    str(existing.get("source_message_id") or "") == source_message_id
+                    and str(existing.get("filename") or "") == filename
+                    and str(existing.get("mime_type") or "") == mime_type
+                ):
+                    known_targets = {
+                        (
+                            str(target.get("spreadsheet_id") or ""),
+                            str(target.get("tab_name") or ""),
+                            int(target.get("row_number") or 0),
+                        )
+                        for target in existing.get("targets", [])
+                    }
+                    for target in normalized_targets:
+                        target_key = (
+                            target["spreadsheet_id"],
+                            target["tab_name"],
+                            target["row_number"],
+                        )
+                        if target_key not in known_targets:
+                            existing.setdefault("targets", []).append(target)
+                            known_targets.add(target_key)
+                    _save_pending_drive_uploads(items)
+                    logger.warning(
+                        "Merged pending Drive upload for message id=%s; target count is now %d.",
+                        source_message_id,
+                        len(existing.get("targets", [])),
+                    )
+                    start_pending_drive_upload_worker()
+                    return
+
     pending_id = uuid4().hex
     payload_path = _pending_drive_uploads_dir() / f"{pending_id}.bin"
     payload_path.write_bytes(file_bytes)
@@ -1697,7 +1779,7 @@ def queue_pending_document_upload(
         "filename": filename,
         "mime_type": mime_type,
         "payload_path": str(payload_path),
-        "targets": targets,
+        "targets": normalized_targets,
         "source_message_id": source_message_id or "",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "attempts": 0,
@@ -1711,7 +1793,7 @@ def queue_pending_document_upload(
     logger.warning(
         "Queued pending Drive upload for message id=%s with %d target cell(s).",
         source_message_id,
-        len(targets),
+        len(normalized_targets),
     )
     start_pending_drive_upload_worker()
 
@@ -1727,8 +1809,7 @@ def process_pending_document_uploads(*, max_items: int | None = None) -> int:
             items = _load_pending_drive_uploads()
             if not items:
                 break
-            item = items.pop(0)
-            _save_pending_drive_uploads(items)
+            item = dict(items[0])
 
         payload_path = Path(str(item.get("payload_path", "")))
         if not payload_path.exists():
@@ -1737,6 +1818,12 @@ def process_pending_document_uploads(*, max_items: int | None = None) -> int:
                 item.get("id"),
                 payload_path,
             )
+            with _pending_drive_uploads_lock:
+                items = [
+                    existing for existing in _load_pending_drive_uploads()
+                    if str(existing.get("id") or "") != str(item.get("id") or "")
+                ]
+                _save_pending_drive_uploads(items)
             continue
 
         try:
@@ -1751,6 +1838,12 @@ def process_pending_document_uploads(*, max_items: int | None = None) -> int:
             for target in item.get("targets", []):
                 _write_drive_link_to_target(target, drive_link)
 
+            with _pending_drive_uploads_lock:
+                items = [
+                    existing for existing in _load_pending_drive_uploads()
+                    if str(existing.get("id") or "") != str(item.get("id") or "")
+                ]
+                _save_pending_drive_uploads(items)
             payload_path.unlink(missing_ok=True)
             processed += 1
             logger.info(
@@ -1759,11 +1852,14 @@ def process_pending_document_uploads(*, max_items: int | None = None) -> int:
                 len(item.get("targets", [])),
             )
         except Exception as exc:
-            item["attempts"] = int(item.get("attempts", 0)) + 1
-            item["last_error"] = str(exc)
             with _pending_drive_uploads_lock:
                 items = _load_pending_drive_uploads()
-                items.append(item)
+                for existing in items:
+                    if str(existing.get("id") or "") != str(item.get("id") or ""):
+                        continue
+                    existing["attempts"] = int(existing.get("attempts", 0)) + 1
+                    existing["last_error"] = str(exc)
+                    break
                 _save_pending_drive_uploads(items)
             logger.warning(
                 "Pending Drive upload retry failed for message id=%s: %s",
@@ -1798,6 +1894,351 @@ def start_pending_drive_upload_worker() -> None:
         _pending_drive_worker_thread.start()
 
 
+def _load_pending_sheet_appends() -> list[dict]:
+    path = _pending_sheet_appends_state_path()
+    if not path.exists():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return raw if isinstance(raw, list) else []
+
+
+def _save_pending_sheet_appends(items: list[dict]) -> None:
+    _pending_sheet_appends_state_path().write_text(
+        json.dumps(items, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _has_pending_sheet_appends() -> bool:
+    with _pending_sheet_appends_lock:
+        return bool(_load_pending_sheet_appends())
+
+
+def _registered_spreadsheet_id_for_month(target_month_key: str) -> Optional[str]:
+    registry = _load_registry()
+    spreadsheet_id = registry.get(target_month_key)
+    if spreadsheet_id:
+        return spreadsheet_id
+    if target_month_key == _month_key() and settings.google_sheets_spreadsheet_id:
+        return settings.google_sheets_spreadsheet_id
+    return None
+
+
+def _resolve_pending_sheet_spreadsheet_id(*, client=None, month_key: Optional[str] = None) -> Optional[str]:
+    target_month_key = month_key or _month_key()
+    spreadsheet_id = _registered_spreadsheet_id_for_month(target_month_key)
+    if spreadsheet_id:
+        return spreadsheet_id
+
+    if target_month_key != _month_key():
+        return None
+
+    sheet_client = client or _get_client()
+    if sheet_client is None:
+        return None
+
+    try:
+        with _lock:
+            sh = _get_or_create_spreadsheet(sheet_client)
+        return sh.id
+    except Exception as exc:
+        logger.warning("Could not resolve spreadsheet for month %s: %s", target_month_key, exc)
+        return None
+
+
+def _queue_pending_sheet_append_item(
+    *,
+    record: BillRecord,
+    category: DocumentCategory,
+    tab_name: str,
+    drive_link: Optional[str],
+    return_source_category: DocumentCategory | None = None,
+    document_payload: bytes | None = None,
+    document_filename: str | None = None,
+    document_mime_type: str | None = None,
+) -> dict:
+    payload_path = ""
+    if document_payload:
+        payload_id = uuid4().hex
+        payload = _pending_sheet_appends_dir() / f"{payload_id}.bin"
+        payload.write_bytes(document_payload)
+        payload_path = str(payload)
+
+    month_key = _month_key()
+    return {
+        "id": uuid4().hex,
+        "spreadsheet_id": _registered_spreadsheet_id_for_month(month_key) or "",
+        "month_key": month_key,
+        "tab_name": tab_name,
+        "category": category.value,
+        "return_source_category": return_source_category.value if return_source_category else "",
+        "record": record.model_dump(mode="json"),
+        "drive_link": drive_link or "",
+        "document_payload_path": payload_path,
+        "document_filename": document_filename or "",
+        "document_mime_type": document_mime_type or "",
+        "source_message_id": record.source_message_id or "",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "attempts": 0,
+        "next_attempt_at": time.time(),
+    }
+
+
+def _pending_sheet_retry_delay_seconds(attempts: int) -> float:
+    exponent = max(attempts - 1, 0)
+    return min(_PENDING_SHEET_WORKER_RETRY_DELAY_SECONDS * (2 ** exponent), 300.0)
+
+
+def _pending_sheet_item_is_ready(item: dict) -> bool:
+    return float(item.get("next_attempt_at") or 0.0) <= time.time()
+
+
+def _select_pending_sheet_batch(*, batch_size: int) -> list[dict]:
+    with _pending_sheet_appends_lock:
+        items = _load_pending_sheet_appends()
+
+    if not items:
+        return []
+
+    first_ready = next((item for item in items if _pending_sheet_item_is_ready(item)), None)
+    if first_ready is None:
+        return []
+
+    batch_key = (
+        str(first_ready.get("spreadsheet_id") or ""),
+        str(first_ready.get("month_key") or ""),
+        str(first_ready.get("tab_name") or ""),
+    )
+    batch: list[dict] = []
+    for item in items:
+        item_key = (
+            str(item.get("spreadsheet_id") or ""),
+            str(item.get("month_key") or ""),
+            str(item.get("tab_name") or ""),
+        )
+        if item_key != batch_key or not _pending_sheet_item_is_ready(item):
+            continue
+        batch.append(dict(item))
+        if len(batch) >= batch_size:
+            break
+    return batch
+
+
+def _remove_pending_sheet_appends(item_ids: set[str]) -> None:
+    if not item_ids:
+        return
+
+    with _pending_sheet_appends_lock:
+        items = [
+            item for item in _load_pending_sheet_appends()
+            if str(item.get("id") or "") not in item_ids
+        ]
+        _save_pending_sheet_appends(items)
+
+
+def _mark_pending_sheet_batch_failure(batch: list[dict], exc: Exception) -> None:
+    failed_ids = {str(item.get("id") or "") for item in batch}
+    now = time.time()
+    with _pending_sheet_appends_lock:
+        items = _load_pending_sheet_appends()
+        for item in items:
+            item_id = str(item.get("id") or "")
+            if item_id not in failed_ids:
+                continue
+            attempts = int(item.get("attempts", 0)) + 1
+            item["attempts"] = attempts
+            item["last_error"] = str(exc)
+            item["next_attempt_at"] = now + _pending_sheet_retry_delay_seconds(attempts)
+        _save_pending_sheet_appends(items)
+
+
+def _next_pending_sheet_retry_delay() -> float | None:
+    with _pending_sheet_appends_lock:
+        items = _load_pending_sheet_appends()
+
+    if not items:
+        return None
+
+    next_attempt_at = min(float(item.get("next_attempt_at") or 0.0) for item in items)
+    return max(next_attempt_at - time.time(), 0.0)
+
+
+def _existing_row_numbers_by_pending_id(ws, tab_name: str, pending_ids: set[str]) -> dict[str, int]:
+    if not pending_ids:
+        return {}
+
+    column_letter = _internal_row_id_column_letter(tab_name)
+    try:
+        values = ws.get(f"{column_letter}3:{column_letter}")
+    except Exception:
+        return {}
+
+    rows: dict[str, int] = {}
+    for row_number, row in enumerate(values, start=3):
+        cell = str(row[0]).strip() if row else ""
+        if cell in pending_ids:
+            rows[cell] = row_number
+    return rows
+
+
+def process_pending_sheet_appends(*, max_items: int | None = None) -> int:
+    processed = 0
+
+    while True:
+        if max_items is not None and processed >= max_items:
+            break
+
+        remaining_limit = _PENDING_SHEET_BATCH_SIZE
+        if max_items is not None:
+            remaining_limit = max(1, min(_PENDING_SHEET_BATCH_SIZE, max_items - processed))
+
+        batch = _select_pending_sheet_batch(batch_size=remaining_limit)
+        if not batch:
+            break
+
+        try:
+            client = _get_client()
+            if client is None:
+                raise RuntimeError("Google Sheets client unavailable for queued appends.")
+
+            spreadsheet_id = str(batch[0].get("spreadsheet_id") or "")
+            month_key = str(batch[0].get("month_key") or "") or None
+            if not spreadsheet_id:
+                spreadsheet_id = _resolve_pending_sheet_spreadsheet_id(
+                    client=client,
+                    month_key=month_key,
+                ) or ""
+            if not spreadsheet_id:
+                raise RuntimeError("No spreadsheet available for queued append batch.")
+
+            tab_name = str(batch[0].get("tab_name") or "")
+            row_numbers: dict[str, int] = {}
+
+            with _lock:
+                sh = client.open_by_key(spreadsheet_id)
+                ws = _ensure_tab_exists(sh, tab_name)
+                existing_row_numbers = _existing_row_numbers_by_pending_id(
+                    ws,
+                    tab_name,
+                    {str(item.get("id") or "") for item in batch},
+                )
+                row_numbers.update(existing_row_numbers)
+
+                new_items = [
+                    item for item in batch
+                    if str(item.get("id") or "") not in existing_row_numbers
+                ]
+                if new_items:
+                    start_seq = _next_seq(ws)
+                    start_row_number = len(ws.col_values(1)) + 1
+                    rows: list[list] = []
+
+                    for index, item in enumerate(new_items):
+                        record = BillRecord.model_validate(item.get("record") or {})
+                        category = DocumentCategory(str(item.get("category") or DocumentCategory.BELIRSIZ.value))
+                        return_source_raw = str(item.get("return_source_category") or "").strip()
+                        return_source_category = DocumentCategory(return_source_raw) if return_source_raw else None
+                        rows.append(
+                            _build_row(
+                                record,
+                                category,
+                                start_seq + index,
+                                drive_link=str(item.get("drive_link") or "") or None,
+                                return_source_category=return_source_category,
+                            ) + [str(item.get("id") or "")]
+                        )
+                        row_numbers[str(item.get("id") or "")] = start_row_number + index
+
+                    _retry_on_rate_limit(
+                        lambda: ws.append_rows(rows, value_input_option="USER_ENTERED")
+                    )
+
+            for item in batch:
+                item_id = str(item.get("id") or "")
+                row_number = row_numbers.get(item_id)
+                if row_number is None:
+                    raise RuntimeError(f"Queued sheet append {item_id} has no resolved row number.")
+
+                if str(item.get("drive_link") or "").strip():
+                    payload_path_raw = str(item.get("document_payload_path") or "")
+                    if payload_path_raw:
+                        Path(payload_path_raw).unlink(missing_ok=True)
+                    continue
+
+                payload_path_raw = str(item.get("document_payload_path") or "")
+                if not payload_path_raw:
+                    continue
+
+                payload_path = Path(payload_path_raw)
+                if not payload_path.exists():
+                    raise RuntimeError(f"Queued sheet append payload is missing: {payload_path}")
+
+                queue_pending_document_upload(
+                    file_bytes=payload_path.read_bytes(),
+                    filename=str(item.get("document_filename") or payload_path.name),
+                    mime_type=str(item.get("document_mime_type") or "application/octet-stream"),
+                    targets=[
+                        _build_drive_link_target(
+                            spreadsheet_id=spreadsheet_id,
+                            tab_name=tab_name,
+                            row_number=row_number,
+                        )
+                    ],
+                    source_message_id=str(item.get("source_message_id") or "") or None,
+                )
+                payload_path.unlink(missing_ok=True)
+
+            _remove_pending_sheet_appends({str(item.get("id") or "") for item in batch})
+            processed += len(batch)
+            logger.info(
+                "Processed %d queued sheet append(s) into %s/%s.",
+                len(batch),
+                spreadsheet_id,
+                tab_name,
+            )
+        except Exception as exc:
+            _mark_pending_sheet_batch_failure(batch, exc)
+            logger.warning("Pending sheet append retry failed: %s", exc)
+            break
+
+    return processed
+
+
+def _pending_sheet_append_worker() -> None:
+    while True:
+        try:
+            processed = process_pending_sheet_appends()
+        except Exception as exc:
+            logger.warning("Pending sheet append worker stopped after error: %s", exc)
+            processed = 0
+
+        if processed > 0:
+            continue
+
+        wait_seconds = _next_pending_sheet_retry_delay()
+        if wait_seconds is None:
+            break
+        time.sleep(max(wait_seconds, 1.0))
+
+
+def start_pending_sheet_append_worker() -> None:
+    global _pending_sheet_worker_thread
+
+    with _pending_sheet_worker_lock:
+        if _pending_sheet_worker_thread is not None and _pending_sheet_worker_thread.is_alive():
+            return
+
+        _pending_sheet_worker_thread = threading.Thread(
+            target=_pending_sheet_append_worker,
+            name="google-sheets-pending-append",
+            daemon=True,
+        )
+        _pending_sheet_worker_thread.start()
+
+
 # ─── Public interface ─────────────────────────────────────────────────────────
 
 
@@ -1806,78 +2247,72 @@ def append_record(
     category: DocumentCategory,
     is_return: bool = False,
     drive_link: Optional[str] = None,
+    *,
+    pending_document_bytes: bytes | None = None,
+    pending_document_filename: str | None = None,
+    pending_document_mime_type: str | None = None,
 ) -> list[dict[str, str | int]]:
     """
-    Append *record* to the correct Google Sheets tab for *category*.
+    Queue *record* for append into the correct Google Sheets tab for *category*.
 
     drive_link: Google Drive web-view URL for the original document.
                 Shown as a clickable "📄 Görüntüle" link in the 📎 Belge column.
-    If is_return is True, also logs a row in ↩️ İadeler.
+    If is_return is True, also queues a row in ↩️ İadeler.
     All errors are caught so CSV persistence is never disrupted.
     """
     client = _get_client()
     if client is None:
         return []
 
-    with _lock:
-        try:
-            sh = _get_or_create_spreadsheet(client)
-            appended_targets: list[dict[str, str | int]] = []
-
-            # Each spreadsheet is already monthly ("Muhasebe — Nisan 2026"),
-            # so tabs use base names directly (e.g. "🧾 Faturalar").
-            tab_name = _CATEGORY_TAB.get(category, "🧾 Faturalar")
-            ws = _ensure_tab_exists(sh, tab_name)
-            seq = _next_seq(ws)
-            row_number = len(ws.col_values(1)) + 1
-            row = _build_row(record, category, seq, drive_link=drive_link)
-            _retry_on_rate_limit(
-                lambda: ws.append_row(row, value_input_option="USER_ENTERED")
+    try:
+        tab_name = _CATEGORY_TAB.get(category, "🧾 Faturalar")
+        items = [
+            _queue_pending_sheet_append_item(
+                record=record,
+                category=category,
+                tab_name=tab_name,
+                drive_link=drive_link,
+                document_payload=None if drive_link else pending_document_bytes,
+                document_filename=None if drive_link else pending_document_filename,
+                document_mime_type=None if drive_link else pending_document_mime_type,
             )
-            appended_targets.append(
-                _build_drive_link_target(
-                    spreadsheet_id=sh.id,
-                    tab_name=tab_name,
-                    row_number=row_number,
-                )
-            )
-            logger.info("Appended row #%d to '%s'.", seq, tab_name)
-
-            # Also log to ↩️ İadeler if this is a return document
-            if is_return and tab_name != "↩️ İadeler":
-                iade_ws = _ensure_tab_exists(sh, "↩️ İadeler")
-                iade_seq = _next_seq(iade_ws)
-                iade_row_number = len(iade_ws.col_values(1)) + 1
-                iade_row = _build_row(
-                    record,
-                    DocumentCategory.IADE,
-                    iade_seq,
+        ]
+        if is_return and tab_name != "↩️ İadeler":
+            items.append(
+                _queue_pending_sheet_append_item(
+                    record=record,
+                    category=DocumentCategory.IADE,
+                    tab_name="↩️ İadeler",
                     drive_link=drive_link,
                     return_source_category=category,
+                    document_payload=None if drive_link else pending_document_bytes,
+                    document_filename=None if drive_link else pending_document_filename,
+                    document_mime_type=None if drive_link else pending_document_mime_type,
                 )
-                _retry_on_rate_limit(
-                    lambda: iade_ws.append_row(iade_row, value_input_option="USER_ENTERED")
-                )
-                appended_targets.append(
-                    _build_drive_link_target(
-                        spreadsheet_id=sh.id,
-                        tab_name="↩️ İadeler",
-                        row_number=iade_row_number,
-                    )
-                )
-                logger.info("Also logged iade row #%d.", iade_seq)
-
-            return appended_targets
-
-        except Exception as exc:
-            logger.error(
-                "Google Sheets append failed for category=%s message_id=%s: %s",
-                category,
-                record.source_message_id,
-                exc,
-                exc_info=True,
             )
-            return []
+
+        with _pending_sheet_appends_lock:
+            pending_items = _load_pending_sheet_appends()
+            pending_items.extend(items)
+            _save_pending_sheet_appends(pending_items)
+
+        logger.info(
+            "Queued %d Google Sheets append(s) for category=%s message_id=%s.",
+            len(items),
+            category,
+            record.source_message_id,
+        )
+        start_pending_sheet_append_worker()
+        return []
+    except Exception as exc:
+        logger.error(
+            "Google Sheets append queueing failed for category=%s message_id=%s: %s",
+            category,
+            record.source_message_id,
+            exc,
+            exc_info=True,
+        )
+        return []
 
 
 def ensure_current_month_spreadsheet_ready() -> None:
