@@ -4,7 +4,7 @@ Shared inbound accounting intake pipeline for Meta and Periskope messages.
 Flow for media messages:
   1. doc_classifier   — financial-doc triage + category + return detection
   2. gemini_extractor — extract structured fields
-  4. record_store     — persist to daily CSV (dedup by message_id)
+  4. record_store     — persist to daily CSV (dedup by message_id + strong content fingerprints)
   5. google_sheets    — append to the correct Sheets tab
 
 Special path for the company manager:
@@ -13,6 +13,8 @@ Special path for the company manager:
 """
 
 from __future__ import annotations
+
+import hashlib
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -232,7 +234,7 @@ def process_incoming_message(
             )
             if outcome in _RETRYABLE_MEDIA_OUTCOMES:
                 record_store.release_message_processing(message_id)
-            elif outcome != "exported":
+            else:
                 record_store.mark_message_handled(message_id, outcome=outcome)
             return
 
@@ -375,6 +377,8 @@ def _handle_media(
             outcome="media_fetch_failed",
         )
 
+    media_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+
     prepared = media_prep.prepare_media(raw_bytes, mime_type=mime_type)
     working_bytes = prepared.media_bytes
     working_mime_type = prepared.mime_type
@@ -475,6 +479,7 @@ def _handle_media(
     persisted_count = 0
     pending_drive_targets: list[dict[str, str | int]] = []
     for record in valid_records:
+        record.source_media_sha256 = media_sha256
         persisted = record_store.persist_record_once(record)
         if not persisted:
             continue

@@ -250,6 +250,7 @@ class BillRecord(BaseModel):
     source_message_id: Optional[str] = None
     source_filename: Optional[str] = None
     source_type: Optional[str] = None
+    source_media_sha256: Optional[str] = None
     source_sender_id: Optional[str] = None
     source_sender_name: Optional[str] = None
     source_group_id: Optional[str] = None

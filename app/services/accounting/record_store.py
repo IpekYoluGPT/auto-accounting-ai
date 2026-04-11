@@ -5,9 +5,11 @@ Persistent storage helpers for exported rows and processed-message tracking.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import threading
+import unicodedata
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -53,6 +55,10 @@ def _inflight_registry_path() -> Path:
 
 def _warning_registry_path() -> Path:
     return _state_dir() / "warning_throttle.json"
+
+
+def _content_fingerprint_registry_path() -> Path:
+    return _state_dir() / "content_fingerprints.txt"
 
 
 def _lock_path() -> Path:
@@ -148,6 +154,27 @@ def _load_warning_state_unlocked() -> dict[str, str]:
     }
 
 
+def _load_content_fingerprints_unlocked() -> set[str]:
+    filepath = _content_fingerprint_registry_path()
+    if not filepath.exists():
+        return set()
+
+    return {
+        line.strip()
+        for line in filepath.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+
+
+def _append_content_fingerprints_unlocked(fingerprints: set[str]) -> None:
+    if not fingerprints:
+        return
+
+    with _content_fingerprint_registry_path().open("a", encoding="utf-8") as handle:
+        for fingerprint in sorted(fingerprints):
+            handle.write(f"{fingerprint}\n")
+
+
 def _write_warning_state_unlocked(warning_state: dict[str, str]) -> None:
     _warning_registry_path().write_text(
         json.dumps(warning_state, ensure_ascii=True, sort_keys=True),
@@ -203,6 +230,122 @@ def _purge_stale_warnings_unlocked(warning_state: dict[str, str]) -> dict[str, s
             fresh[bucket] = sent_at.isoformat()
 
     return fresh
+
+
+def _compact_text(value: object | None) -> str | None:
+    if value is None:
+        return None
+
+    normalized = unicodedata.normalize("NFKC", str(value)).strip()
+    if not normalized:
+        return None
+
+    normalized = " ".join(normalized.split())
+    compact = "".join(ch for ch in normalized.casefold() if ch.isalnum())
+    return compact or None
+
+
+def _free_text(value: object | None) -> str | None:
+    if value is None:
+        return None
+
+    normalized = unicodedata.normalize("NFKC", str(value)).strip()
+    if not normalized:
+        return None
+
+    return " ".join(normalized.casefold().split())
+
+
+def _amount_token(value: float | None) -> str | None:
+    if value is None:
+        return None
+    return f"{float(value):.2f}"
+
+
+def _content_fingerprints(record: BillRecord) -> set[str]:
+    fingerprints: set[str] = set()
+
+    if record.source_media_sha256:
+        fingerprints.add(f"media:{record.source_media_sha256}")
+
+    identifier_tokens = [
+        token
+        for token in (
+            _compact_text(record.invoice_number),
+            _compact_text(record.document_number),
+            _compact_text(record.receipt_number),
+        )
+        if token
+    ]
+    party_token = _compact_text(record.tax_number) or _compact_text(record.company_name)
+    amount_token = _amount_token(record.total_amount)
+    currency_token = _compact_text(record.currency)
+    date_token = _compact_text(record.document_date)
+    time_token = _compact_text(record.document_time)
+    sender_token = _compact_text(record.sender_name)
+    description_token = _free_text(record.description)
+
+    exact_payload = {
+        key: value
+        for key, value in {
+            "company": _free_text(record.company_name),
+            "tax_number": _compact_text(record.tax_number),
+            "tax_office": _free_text(record.tax_office),
+            "document_number": _compact_text(record.document_number),
+            "invoice_number": _compact_text(record.invoice_number),
+            "receipt_number": _compact_text(record.receipt_number),
+            "document_date": date_token,
+            "document_time": time_token,
+            "currency": currency_token,
+            "total_amount": amount_token,
+            "subtotal": _amount_token(record.subtotal),
+            "vat_amount": _amount_token(record.vat_amount),
+            "sender_name": sender_token,
+            "payment_method": _free_text(record.payment_method),
+            "expense_category": _free_text(record.expense_category),
+            "description": description_token,
+            "notes": _free_text(record.notes),
+        }.items()
+        if value is not None
+    }
+    semantic_signal = bool(record.source_media_sha256 or identifier_tokens or time_token or sender_token or description_token)
+    if exact_payload and semantic_signal:
+        payload_hash = hashlib.sha256(
+            json.dumps(exact_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        fingerprints.add(f"semantic:{payload_hash}")
+
+    for identifier in identifier_tokens:
+        parts = [f"id:{identifier}"]
+        if party_token:
+            parts.append(f"party:{party_token}")
+        if date_token:
+            parts.append(f"date:{date_token}")
+        if amount_token:
+            parts.append(f"total:{amount_token}")
+        if currency_token:
+            parts.append(f"currency:{currency_token}")
+        fingerprints.add("doc:" + "|".join(parts))
+
+    if party_token and date_token and amount_token and time_token:
+        fingerprints.add(
+            "party-date-total-time:"
+            f"{party_token}|{date_token}|{time_token}|{amount_token}|{currency_token or 'na'}"
+        )
+
+    if party_token and date_token and amount_token and sender_token:
+        fingerprints.add(
+            "party-date-total-sender:"
+            f"{party_token}|{date_token}|{amount_token}|{currency_token or 'na'}|{sender_token}"
+        )
+
+    if party_token and date_token and amount_token and description_token and len(description_token) >= 8:
+        fingerprints.add(
+            "party-date-total-description:"
+            f"{party_token}|{date_token}|{amount_token}|{currency_token or 'na'}|{description_token[:80]}"
+        )
+
+    return fingerprints
 
 
 def is_message_processed(message_id: str | None) -> bool:
@@ -308,9 +451,23 @@ def persist_record_once(record: BillRecord) -> bool:
     with _PERSIST_LOCK:
         with _interprocess_lock():
             processed_ids = _load_processed_ids_unlocked()
+            seen_fingerprints = _load_content_fingerprints_unlocked()
             message_id = record.source_message_id
+            record_fingerprints = _content_fingerprints(record)
             if message_id and message_id in processed_ids:
                 logger.info("Skipping duplicate export for message id=%s", message_id)
+                inflight = _purge_stale_inflight_unlocked(_load_inflight_unlocked())
+                inflight.pop(message_id, None)
+                _write_inflight_unlocked(inflight)
+                return False
+
+            duplicate_fingerprints = sorted(record_fingerprints & seen_fingerprints)
+            if duplicate_fingerprints:
+                logger.info(
+                    "Skipping duplicate content for message id=%s via fingerprint=%s",
+                    message_id,
+                    duplicate_fingerprints[0],
+                )
                 inflight = _purge_stale_inflight_unlocked(_load_inflight_unlocked())
                 inflight.pop(message_id, None)
                 _write_inflight_unlocked(inflight)
@@ -323,6 +480,9 @@ def persist_record_once(record: BillRecord) -> bool:
                 if write_header:
                     writer.writeheader()
                 writer.writerow(record_to_row(record))
+
+            if record_fingerprints:
+                _append_content_fingerprints_unlocked(record_fingerprints)
 
             if message_id:
                 inflight = _purge_stale_inflight_unlocked(_load_inflight_unlocked())

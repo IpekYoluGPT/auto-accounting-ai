@@ -492,6 +492,50 @@ def test_malformed_json_returns_ignored():
     assert response.json() == {"status": "ignored"}
 
 
+def test_duplicate_content_with_new_message_id_writes_only_one_export_row():
+    with TemporaryDirectory() as tmpdir:
+        client = TestClient(app)
+
+        def _record_for(message_id: str) -> BillRecord:
+            return BillRecord(
+                company_name="ABC Market",
+                tax_number="1234567890",
+                invoice_number="INV-2026-15",
+                document_date="2026-04-09",
+                document_time="10:15",
+                total_amount=100.0,
+                currency="TRY",
+                source_message_id=message_id,
+                source_filename="media-1.jpg",
+                source_type="image",
+                confidence=0.91,
+            )
+
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.routes.webhooks.whatsapp.fetch_media", return_value=b"same-image"
+        ), patch(
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(DocumentCategory.FATURA, confidence=0.95),
+        ), patch(
+            "app.services.accounting.intake.gemini_extractor.extract_bills",
+            side_effect=[[_record_for("wamid-1")], [_record_for("wamid-2")]],
+        ), patch(
+            "app.services.accounting.intake.google_sheets.upload_document",
+            return_value="https://drive.google.com/file/d/test/view",
+        ), patch(
+            "app.routes.webhooks.whatsapp.send_text_message"
+        ), patch(
+            "app.routes.webhooks.whatsapp.send_reaction_message"
+        ):
+            response_one = client.post("/webhook", json=_image_payload("wamid-1"))
+            response_two = client.post("/webhook", json=_image_payload("wamid-2"))
+
+        assert response_one.status_code == 200
+        assert response_two.status_code == 200
+        rows = _read_export_rows(tmpdir)
+        assert len(rows) == 1
+
+
 def test_duplicate_delivery_writes_only_one_export_row():
     record = BillRecord(
         company_name="ABC Market",
