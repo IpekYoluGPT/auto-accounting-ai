@@ -225,6 +225,45 @@ def test_sandbox_intake_processes_text_in_sandbox_context():
     assert intake_mock.call_args.kwargs["route"].chat_id == "sandbox-alpha@g.us"
 
 
+def test_sandbox_intake_reports_rows_by_source_message_id():
+    context = sandbox_context(session_id="alpha")
+    with _lifespan_patches(), patch(
+        "app.routes.setup.settings.periskope_tool_token",
+        "secret-token",
+    ), patch(
+        "app.routes.setup._ensure_sandbox_context",
+        return_value=(context, "sandbox-sheet-1", False),
+    ), patch(
+        "app.routes.setup.record_store.find_export_rows",
+        side_effect=[[], [{"source_message_id": "sandbox-alpha-1"}]],
+    ) as rows_mock, patch(
+        "app.routes.setup.intake.process_incoming_message",
+        return_value="exported",
+    ), patch(
+        "app.routes.setup._drain_sandbox_queues",
+        return_value={"pending_sheet_appends_processed": 1, "pending_drive_uploads_processed": 0},
+    ), patch(
+        "app.routes.setup.google_sheets.queue_status",
+        return_value={"pending_sheet_appends": 0, "pending_drive_uploads": 0},
+    ):
+        with TestClient(app) as client:
+            response = client.post(
+                "/setup/sandbox/intake",
+                json={
+                    "session_id": "alpha",
+                    "message_id": "sandbox-alpha-1",
+                    "msg_type": "text",
+                    "text": "elden odeme 500 tl yakit",
+                },
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+    assert response.status_code == 200
+    assert response.json()["record_count"] == 1
+    assert rows_mock.call_args_list[0].kwargs["source_message_id"] == "sandbox-alpha-1"
+    assert rows_mock.call_args_list[1].kwargs["source_message_id"] == "sandbox-alpha-1"
+
+
 def test_sandbox_audit_returns_404_for_unknown_session():
     with _lifespan_patches(), patch(
         "app.routes.setup.settings.periskope_tool_token",

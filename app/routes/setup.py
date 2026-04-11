@@ -381,7 +381,7 @@ async def sandbox_intake(request: Request, payload: SandboxIntakeRequest) -> dic
         )
 
         with pipeline_context_scope(context):
-            before_rows = len(record_store.find_export_rows(chat_id=chat_id, limit=1000, context=context))
+            before_rows = len(record_store.find_export_rows(source_message_id=message_id, limit=1000, context=context))
 
         outcome = intake.process_incoming_message(
             message_id=message_id,
@@ -400,7 +400,7 @@ async def sandbox_intake(request: Request, payload: SandboxIntakeRequest) -> dic
 
         drain = _drain_sandbox_queues(context)
         with pipeline_context_scope(context):
-            after_rows = record_store.find_export_rows(chat_id=chat_id, limit=1000, context=context)
+            after_rows = record_store.find_export_rows(source_message_id=message_id, limit=1000, context=context)
             queue = google_sheets.queue_status()
 
         return {

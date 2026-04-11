@@ -151,9 +151,9 @@ def main() -> int:
     drifts = [
         {"action": "corrupt_total_row", "tab_name": "🧾 Faturalar"},
         {"action": "clear_hidden_row_ids", "tab_name": "🧾 Faturalar", "row_count": 5},
+        {"action": "reorder_rows", "tab_name": "🧾 Faturalar", "row_count": 5},
         {"action": "rename_data_tab", "tab_name": "🧾 Faturalar", "replacement_name": "RENAMED FATURALAR"},
         {"action": "delete_summary_tab"},
-        {"action": "reorder_rows", "tab_name": "🧾 Faturalar", "row_count": 5},
     ]
     for drift in drifts:
         payload = {"session_id": session_id, **drift}
