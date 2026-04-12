@@ -1825,6 +1825,8 @@ def _audit_summary_tab(sh, findings: list[dict[str, object]], *, repair: bool) -
         return
 
     if _summary_tab_is_valid(ws):
+        if repair:
+            _setup_summary_tab(ws, _month_label())
         return
 
     finding = {
@@ -1927,6 +1929,9 @@ def _audit_data_tab(sh, tab_name: str, findings: list[dict[str, object]], *, rep
                 "message": f"{missing_count} row(s) are missing hidden row ids.",
                 "count": missing_count,
             })
+
+    if repair and not _tab_spec(tab_name).hidden_tab:
+        _setup_worksheet(ws, tab_name)
 
 
 def _audit_spreadsheet_layout(sh, *, repair: bool = False, target_tabs: set[str] | None = None) -> list[dict[str, object]]:
