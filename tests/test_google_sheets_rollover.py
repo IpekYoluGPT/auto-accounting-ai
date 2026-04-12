@@ -46,7 +46,9 @@ def test_active_layout_excludes_iade_tab_and_keeps_technical_tabs_hidden():
         "Sevk Fişleri",
     ]
     assert {"📊 Özet", "__Raw Belgeler", "__Fatura Kalemleri", "__Çek_Dekont_Detay", "__Cari_Kartlar", "__Ödeme_Dağıtımları"}.issubset(set(google_sheets._TABS))
-    assert google_sheets._header_index("Faturalar", google_sheets._HIDDEN_DRIVE_LINK_HEADER) == 17
+    assert google_sheets._header_index("Faturalar", google_sheets._VISIBLE_DRIVE_LINK_HEADER) == 17
+    assert google_sheets._header_index("Faturalar", google_sheets._HIDDEN_DRIVE_LINK_HEADER) is None
+    assert google_sheets._drive_column_letter("Faturalar") == "R"
 
 
 def test_month_drive_folder_name_uses_fisler_prefix():

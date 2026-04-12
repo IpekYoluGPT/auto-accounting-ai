@@ -38,6 +38,7 @@ logger = get_logger(__name__)
 # ─── Tab definitions ──────────────────────────────────────────────────────────
 
 _HIDDEN_ROW_ID_HEADER = "__row_id"
+_VISIBLE_DRIVE_LINK_HEADER = "Belge"
 _HIDDEN_DRIVE_LINK_HEADER = "__Belge Link"
 _HIDDEN_PARTY_KEY_HEADER = "__party_key"
 _HIDDEN_SOURCE_DOC_ID_HEADER = "__source_doc_id"
@@ -81,9 +82,9 @@ _TAB_SPECS: dict[str, SheetSpec] = {
             "Bakiye (TL)",
             "Ödenen (TL)",
             "Kalan Borç (TL)",
+            _VISIBLE_DRIVE_LINK_HEADER,
         ),
         hidden_headers=(
-            _HIDDEN_DRIVE_LINK_HEADER,
             _HIDDEN_ROW_ID_HEADER,
             _HIDDEN_PARTY_KEY_HEADER,
             _HIDDEN_SOURCE_DOC_ID_HEADER,
@@ -104,9 +105,9 @@ _TAB_SPECS: dict[str, SheetSpec] = {
             "Ödeme Tarihi",
             "Kalan Bakiye (TL)",
             "Durum",
+            _VISIBLE_DRIVE_LINK_HEADER,
         ),
         hidden_headers=(
-            _HIDDEN_DRIVE_LINK_HEADER,
             _HIDDEN_ROW_ID_HEADER,
             _HIDDEN_PARTY_KEY_HEADER,
             _HIDDEN_SOURCE_DOC_ID_HEADER,
@@ -138,9 +139,9 @@ _TAB_SPECS: dict[str, SheetSpec] = {
             "Ödenecek Tutar (TL)",
             "IBAN",
             "Banka",
+            _VISIBLE_DRIVE_LINK_HEADER,
         ),
         hidden_headers=(
-            _HIDDEN_DRIVE_LINK_HEADER,
             _HIDDEN_ROW_ID_HEADER,
             _HIDDEN_PARTY_KEY_HEADER,
             _HIDDEN_SOURCE_DOC_ID_HEADER,
@@ -163,9 +164,9 @@ _TAB_SPECS: dict[str, SheetSpec] = {
             "Satıcı",
             "Çıkış Yeri",
             "Sevk Yeri",
+            _VISIBLE_DRIVE_LINK_HEADER,
         ),
         hidden_headers=(
-            _HIDDEN_DRIVE_LINK_HEADER,
             _HIDDEN_ROW_ID_HEADER,
             _HIDDEN_PARTY_KEY_HEADER,
             _HIDDEN_SOURCE_DOC_ID_HEADER,
@@ -324,6 +325,7 @@ _COL_WIDTHS: dict[str, int] = {
     "Alıcı / Tedarikçi": 150,
     "Açıklama": 180,
     "Belge No / Referans": 116,
+    "Belge": 64,
     "Bakiye (TL)": 90,
     "Ödenen (TL)": 90,
     "Kalan Borç (TL)": 94,
@@ -400,6 +402,7 @@ _TAB_COLUMN_WIDTHS: dict[str, dict[str, int]] = {
         "Bakiye (TL)": 86,
         "Ödenen (TL)": 86,
         "Kalan Borç (TL)": 90,
+        "Belge": 64,
     },
     "Banka Ödemeleri": {
         "Alıcı / Tedarikçi": 132,
@@ -410,6 +413,7 @@ _TAB_COLUMN_WIDTHS: dict[str, dict[str, int]] = {
         "Ödeme Tarihi": 74,
         "Kalan Bakiye (TL)": 90,
         "Durum": 80,
+        "Belge": 64,
     },
     "Faturalar": {
         "Fatura No": 72,
@@ -429,6 +433,7 @@ _TAB_COLUMN_WIDTHS: dict[str, dict[str, int]] = {
         "Ödenecek Tutar (TL)": 76,
         "IBAN": 100,
         "Banka": 78,
+        "Belge": 62,
     },
     "Sevk Fişleri": {
         "Fiş No": 80,
@@ -442,6 +447,7 @@ _TAB_COLUMN_WIDTHS: dict[str, dict[str, int]] = {
         "Satıcı": 120,
         "Çıkış Yeri": 100,
         "Sevk Yeri": 100,
+        "Belge": 64,
     },
 }
 
@@ -2523,7 +2529,11 @@ def _safe(v):
 
 
 def _drive_column_letter(tab_name: str) -> str:
-    return _header_letter(tab_name, _HIDDEN_DRIVE_LINK_HEADER) or _col_letter(len(_headers(tab_name)) - 1)
+    return (
+        _header_letter(tab_name, _VISIBLE_DRIVE_LINK_HEADER)
+        or _header_letter(tab_name, _HIDDEN_DRIVE_LINK_HEADER)
+        or _col_letter(len(_headers(tab_name)) - 1)
+    )
 
 
 def _internal_row_id_column_letter(tab_name: str) -> str:
@@ -3960,7 +3970,7 @@ def process_pending_sheet_appends(*, max_items: int | None = None) -> int:
                                 source_doc_id=item_id,
                             )
                             rows.append(row)
-                            if _header_index(tab_name, _HIDDEN_DRIVE_LINK_HEADER) is not None:
+                            if _header_index(tab_name, _VISIBLE_DRIVE_LINK_HEADER) is not None or _header_index(tab_name, _HIDDEN_DRIVE_LINK_HEADER) is not None:
                                 row_id = str(row[row_id_idx] if row_id_idx is not None else item_id)
                                 row_targets_by_item[item_id] = [
                                     _build_drive_link_target(
