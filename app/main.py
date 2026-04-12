@@ -4,6 +4,7 @@ FastAPI application entry point.
 
 import csv
 import os
+import threading
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
@@ -21,6 +22,29 @@ from app.routes.webhooks import router as webhook_router
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def _run_google_sheets_startup_tasks() -> None:
+    startup_steps = (
+        ("prepare_current_month_sheet", google_sheets.ensure_current_month_spreadsheet_ready),
+        ("process_pending_sheet_appends", google_sheets.process_pending_sheet_appends),
+        ("process_pending_document_uploads", google_sheets.process_pending_document_uploads),
+    )
+    for step_name, step in startup_steps:
+        try:
+            step()
+        except Exception as exc:
+            logger.warning("Startup bootstrap step %s failed: %s", step_name, exc)
+
+
+def _start_google_sheets_bootstrap() -> threading.Thread:
+    thread = threading.Thread(
+        target=_run_google_sheets_startup_tasks,
+        name="google-sheets-startup-bootstrap",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 @asynccontextmanager
@@ -54,11 +78,10 @@ async def lifespan(app: FastAPI):
         logger.warning("Gemini model override detected; expected gemini-2.5-pro but got %s", non_pro_models)
     if not settings.periskope_signing_key:
         logger.warning("PERISKOPE_SIGNING_KEY is not configured; webhook signature verification will be skipped.")
-    google_sheets.ensure_current_month_spreadsheet_ready()
-    google_sheets.process_pending_sheet_appends()
-    google_sheets.process_pending_document_uploads()
     google_sheets.start_pending_sheet_append_worker()
+    google_sheets.start_pending_drive_upload_worker()
     google_sheets.start_monthly_rollover_scheduler()
+    _start_google_sheets_bootstrap()
     try:
         yield
     finally:

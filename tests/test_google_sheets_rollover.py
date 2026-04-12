@@ -252,16 +252,31 @@ def test_get_or_create_spreadsheet_creates_new_month_without_overwriting_old_reg
     bootstrap_mock.assert_called_once_with(spreadsheet)
 
 
-def test_app_startup_prepares_current_month_sheet_and_scheduler():
+def test_google_sheets_startup_bootstrap_runs_preparation_and_queue_drain_steps():
     with patch(
         "app.main.google_sheets.ensure_current_month_spreadsheet_ready"
     ) as ensure_mock, patch(
         "app.main.google_sheets.process_pending_sheet_appends"
     ) as pending_sheet_mock, patch(
         "app.main.google_sheets.process_pending_document_uploads"
-    ) as pending_drive_mock, patch(
+    ) as pending_drive_mock:
+        from app.main import _run_google_sheets_startup_tasks
+
+        _run_google_sheets_startup_tasks()
+
+    ensure_mock.assert_called_once_with()
+    pending_sheet_mock.assert_called_once_with()
+    pending_drive_mock.assert_called_once_with()
+
+
+def test_app_startup_prepares_current_month_sheet_and_scheduler():
+    with patch(
+        "app.main._start_google_sheets_bootstrap"
+    ) as start_bootstrap_mock, patch(
         "app.main.google_sheets.start_pending_sheet_append_worker"
     ) as start_pending_sheet_mock, patch(
+        "app.main.google_sheets.start_pending_drive_upload_worker"
+    ) as start_pending_drive_mock, patch(
         "app.main.google_sheets.start_monthly_rollover_scheduler"
     ) as start_mock, patch(
         "app.main.google_sheets.stop_monthly_rollover_scheduler"
@@ -269,10 +284,9 @@ def test_app_startup_prepares_current_month_sheet_and_scheduler():
         with TestClient(app):
             pass
 
-    ensure_mock.assert_called_once_with()
-    pending_sheet_mock.assert_called_once_with()
-    pending_drive_mock.assert_called_once_with()
+    start_bootstrap_mock.assert_called_once_with()
     start_pending_sheet_mock.assert_called_once_with()
+    start_pending_drive_mock.assert_called_once_with()
     start_mock.assert_called_once_with()
     stop_mock.assert_called_once_with()
 
