@@ -368,4 +368,5 @@ def test_sandbox_audit_passes_target_tabs_to_google_sheets():
         spreadsheet_id="sandbox-sheet-1",
         repair=True,
         target_tabs={"🧾 Faturalar", "📊 Özet"},
+        refresh_formatting=True,
     )

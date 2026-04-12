@@ -478,6 +478,7 @@ async def sandbox_audit(
                 spreadsheet_id=spreadsheet_id,
                 repair=repair,
                 target_tabs=target_tabs or None,
+                refresh_formatting=repair,
             )
         return {
             "status": "ok",

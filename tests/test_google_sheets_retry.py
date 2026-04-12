@@ -784,7 +784,7 @@ def test_audit_missing_tab_repair_uses_lightweight_creation(monkeypatch):
     assert findings[1]["repaired"] is True
 
 
-def test_audit_data_tab_repair_reapplies_formatting_for_visible_tabs(monkeypatch):
+def test_audit_data_tab_repair_does_not_reapply_formatting_by_default(monkeypatch):
     ws = MagicMock()
 
     monkeypatch.setattr(google_sheets, "_get_worksheet", lambda _sh, _title: ws)
@@ -799,10 +799,29 @@ def test_audit_data_tab_repair_reapplies_formatting_for_visible_tabs(monkeypatch
     google_sheets._audit_data_tab(object(), "Faturalar", findings, repair=True)
 
     assert findings == []
+    assert setup_calls == []
+
+
+
+def test_audit_data_tab_reapplies_formatting_when_explicitly_requested(monkeypatch):
+    ws = MagicMock()
+
+    monkeypatch.setattr(google_sheets, "_get_worksheet", lambda _sh, _title: ws)
+    monkeypatch.setattr(google_sheets, "_tab_headers_match", lambda _ws, _tab_name: True)
+    monkeypatch.setattr(google_sheets, "_tab_total_row_is_valid", lambda _ws, _tab_name: True)
+    monkeypatch.setattr(google_sheets, "_repair_drive_link_formulas", lambda _ws, _tab_name: None)
+    monkeypatch.setattr(google_sheets, "_backfill_internal_row_ids", lambda _ws, _tab_name: 0)
+    setup_calls = []
+    monkeypatch.setattr(google_sheets, "_setup_worksheet", lambda _ws, _tab_name, *, lightweight=False: setup_calls.append((_tab_name, lightweight)))
+
+    findings = []
+    google_sheets._audit_data_tab(object(), "Faturalar", findings, repair=True, refresh_formatting=True)
+
+    assert findings == []
     assert setup_calls == [("Faturalar", False)]
 
 
-def test_audit_summary_tab_repair_reapplies_formatting_when_summary_is_valid(monkeypatch):
+def test_audit_summary_tab_repair_does_not_reapply_formatting_by_default(monkeypatch):
     ws = MagicMock()
 
     monkeypatch.setattr(google_sheets, "_get_worksheet", lambda _sh, _title: ws)
@@ -813,6 +832,23 @@ def test_audit_summary_tab_repair_reapplies_formatting_when_summary_is_valid(mon
 
     findings = []
     google_sheets._audit_summary_tab(object(), findings, repair=True)
+
+    assert findings == []
+    assert setup_calls == []
+
+
+
+def test_audit_summary_tab_reapplies_formatting_when_explicitly_requested(monkeypatch):
+    ws = MagicMock()
+
+    monkeypatch.setattr(google_sheets, "_get_worksheet", lambda _sh, _title: ws)
+    monkeypatch.setattr(google_sheets, "_summary_tab_is_valid", lambda _ws: True)
+    setup_calls = []
+    monkeypatch.setattr(google_sheets, "_setup_summary_tab", lambda _ws, month_label, *, lightweight=False: setup_calls.append((month_label, lightweight)))
+    monkeypatch.setattr(google_sheets, "_month_label", lambda: "Nisan 2026")
+
+    findings = []
+    google_sheets._audit_summary_tab(object(), findings, repair=True, refresh_formatting=True)
 
     assert findings == []
     assert setup_calls == [("Nisan 2026", False)]

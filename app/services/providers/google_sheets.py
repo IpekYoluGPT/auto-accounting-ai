@@ -1870,7 +1870,7 @@ def _summary_tab_is_valid(ws) -> bool:
     return actual_total_formula == expected_total
 
 
-def _audit_summary_tab(sh, findings: list[dict[str, object]], *, repair: bool) -> None:
+def _audit_summary_tab(sh, findings: list[dict[str, object]], *, repair: bool, refresh_formatting: bool = False) -> None:
     import gspread
 
     try:
@@ -1889,7 +1889,7 @@ def _audit_summary_tab(sh, findings: list[dict[str, object]], *, repair: bool) -
         return
 
     if _summary_tab_is_valid(ws):
-        if repair:
+        if repair and refresh_formatting:
             _setup_summary_tab(ws, _month_label())
         return
 
@@ -1906,7 +1906,7 @@ def _audit_summary_tab(sh, findings: list[dict[str, object]], *, repair: bool) -
         finding["repaired"] = True
 
 
-def _audit_data_tab(sh, tab_name: str, findings: list[dict[str, object]], *, repair: bool) -> None:
+def _audit_data_tab(sh, tab_name: str, findings: list[dict[str, object]], *, repair: bool, refresh_formatting: bool = False) -> None:
     import gspread
 
     try:
@@ -1994,11 +1994,11 @@ def _audit_data_tab(sh, tab_name: str, findings: list[dict[str, object]], *, rep
                 "count": missing_count,
             })
 
-    if repair and not _tab_spec(tab_name).hidden_tab:
+    if repair and refresh_formatting and not _tab_spec(tab_name).hidden_tab:
         _setup_worksheet(ws, tab_name)
 
 
-def _audit_spreadsheet_layout(sh, *, repair: bool = False, target_tabs: set[str] | None = None) -> list[dict[str, object]]:
+def _audit_spreadsheet_layout(sh, *, repair: bool = False, target_tabs: set[str] | None = None, refresh_formatting: bool = False) -> list[dict[str, object]]:
     findings: list[dict[str, object]] = []
     if repair:
         archived_legacy_tabs = _archive_legacy_iade_tabs(sh)
@@ -2034,9 +2034,9 @@ def _audit_spreadsheet_layout(sh, *, repair: bool = False, target_tabs: set[str]
 
     for tab_name in titles_to_check:
         if tab_name == "📊 Özet":
-            _audit_summary_tab(sh, findings, repair=repair)
+            _audit_summary_tab(sh, findings, repair=repair, refresh_formatting=refresh_formatting)
             continue
-        _audit_data_tab(sh, tab_name, findings, repair=repair)
+        _audit_data_tab(sh, tab_name, findings, repair=repair, refresh_formatting=refresh_formatting)
 
     return findings
 
@@ -2052,6 +2052,7 @@ def audit_current_month_spreadsheet(
     spreadsheet_id: Optional[str] = None,
     repair: bool = False,
     target_tabs: set[str] | None = None,
+    refresh_formatting: bool = False,
 ) -> dict[str, object]:
     client = _get_client()
     if client is None:
@@ -2059,7 +2060,7 @@ def audit_current_month_spreadsheet(
 
     with _lock:
         sh = _open_spreadsheet_by_key(client, spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
-        findings = _audit_spreadsheet_layout(sh, repair=repair, target_tabs=target_tabs)
+        findings = _audit_spreadsheet_layout(sh, repair=repair, target_tabs=target_tabs, refresh_formatting=refresh_formatting)
         return {
             "spreadsheet_id": sh.id,
             "month_key": _month_key(),
@@ -2155,7 +2156,7 @@ def clear_current_namespace_storage() -> dict[str, int]:
 
 
 def _repair_monthly_spreadsheet_layout(sh) -> None:
-    _audit_spreadsheet_layout(sh, repair=True)
+    _audit_spreadsheet_layout(sh, repair=True, refresh_formatting=True)
     _mark_recently_prepared(sh)
 
 
