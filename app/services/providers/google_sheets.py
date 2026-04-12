@@ -391,6 +391,14 @@ _COL_WIDTHS: dict[str, int] = {
     "Kalan": 110,
 }
 
+_BRAND_HEADER_COLOR = {"red": 0.12, "green": 0.22, "blue": 0.38}
+_ROW_BAND_COLOR = {"red": 0.91, "green": 0.94, "blue": 0.98}
+_STATUS_GREEN = {"red": 0.78, "green": 0.93, "blue": 0.80}
+_STATUS_YELLOW = {"red": 1.0, "green": 0.93, "blue": 0.67}
+_STATUS_ORANGE = {"red": 1.0, "green": 0.88, "blue": 0.74}
+_STATUS_RED = {"red": 0.97, "green": 0.78, "blue": 0.80}
+
+
 # Columns that should wrap text (long free-text fields)
 _WRAP_COLUMNS = {
     "Açıklama", "Açıklama / Hizmet", "Notlar", "Ürün Cinsi",
@@ -416,6 +424,56 @@ _AMOUNT_COLUMNS = {
     "Ayrılan Tutar",
     "Kalan",
 }
+
+
+def _add_conditional_format_rule(
+    requests: list[dict],
+    *,
+    sheet_id: int,
+    start_row: int,
+    end_row: int,
+    start_col: int,
+    end_col: int,
+    condition_type: str,
+    values: list[str],
+    background: dict[str, float] | None = None,
+    foreground: dict[str, float] | None = None,
+    bold: bool | None = None,
+    index: int = 0,
+) -> None:
+    format_payload: dict[str, object] = {}
+    if background:
+        format_payload["backgroundColor"] = background
+    if foreground or bold is not None:
+        text_format: dict[str, object] = {}
+        if foreground:
+            text_format["foregroundColor"] = foreground
+        if bold is not None:
+            text_format["bold"] = bold
+        format_payload["textFormat"] = text_format
+
+    requests.append({
+        "addConditionalFormatRule": {
+            "rule": {
+                "ranges": [{
+                    "sheetId": sheet_id,
+                    "startRowIndex": start_row,
+                    "endRowIndex": end_row,
+                    "startColumnIndex": start_col,
+                    "endColumnIndex": end_col,
+                }],
+                "booleanRule": {
+                    "condition": {
+                        "type": condition_type,
+                        "values": [{"userEnteredValue": value} for value in values],
+                    },
+                    "format": format_payload,
+                },
+            },
+            "index": index,
+        }
+    })
+
 
 _lock = threading.Lock()
 _drive_upload_lock = threading.Lock()
@@ -1191,6 +1249,9 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
     """Format a worksheet with visible business columns plus hidden technical columns."""
     headers = _headers(tab_name)
     color = _tab_spec(tab_name).color
+    header_color = color
+    if not _tab_spec(tab_name).hidden_tab and tab_name != "📊 Özet":
+        header_color = _BRAND_HEADER_COLOR
     if not headers:
         return
 
@@ -1201,6 +1262,7 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
     visible_header_range = f"A1:{visible_last_col}1"
     total_range = f"A2:{last_col}2"
     data_range = f"A3:{last_col}1000"
+    visible_data_range = f"A3:{visible_last_col}1000"
 
     ws.update([headers], "A1", value_input_option="RAW")
     ws.update([_total_row_values(tab_name)], "A2", value_input_option="USER_ENTERED")
@@ -1212,7 +1274,7 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
         return
 
     ws.format(visible_header_range, {
-        "backgroundColor": color,
+        "backgroundColor": header_color,
         "textFormat": {
             "bold": True,
             "fontSize": 10,
@@ -1234,6 +1296,10 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
         "wrapStrategy": "CLIP",
         "textFormat": {"fontSize": 10},
     })
+    if not _tab_spec(tab_name).hidden_tab and visible_last_col:
+        ws.format(visible_data_range, {
+            "backgroundColor": _ROW_BAND_COLOR,
+        })
     ws.format(total_range, {
         "backgroundColor": {"red": 0.96, "green": 0.96, "blue": 0.96},
         "textFormat": {"bold": True, "fontSize": 10},
@@ -1286,6 +1352,139 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
                     "fields": "userEnteredFormat(numberFormat,horizontalAlignment)",
                 }
             })
+
+
+    if not _tab_spec(tab_name).hidden_tab:
+        rule_index = 0
+        if tab_name == "Masraf Kayıtları":
+            balance_idx = _header_index(tab_name, "Kalan Borç (TL)")
+            if balance_idx is not None:
+                _add_conditional_format_rule(
+                    requests,
+                    sheet_id=ws.id,
+                    start_row=2,
+                    end_row=1000,
+                    start_col=balance_idx,
+                    end_col=balance_idx + 1,
+                    condition_type="NUMBER_LESS",
+                    values=["0"],
+                    background=_STATUS_RED,
+                    index=rule_index,
+                )
+                rule_index += 1
+                _add_conditional_format_rule(
+                    requests,
+                    sheet_id=ws.id,
+                    start_row=2,
+                    end_row=1000,
+                    start_col=balance_idx,
+                    end_col=balance_idx + 1,
+                    condition_type="NUMBER_EQ",
+                    values=["0"],
+                    background=_STATUS_GREEN,
+                    index=rule_index,
+                )
+                rule_index += 1
+                _add_conditional_format_rule(
+                    requests,
+                    sheet_id=ws.id,
+                    start_row=2,
+                    end_row=1000,
+                    start_col=balance_idx,
+                    end_col=balance_idx + 1,
+                    condition_type="NUMBER_GREATER",
+                    values=["0"],
+                    background=_STATUS_YELLOW,
+                    index=rule_index,
+                )
+                rule_index += 1
+        if tab_name == "Banka Ödemeleri":
+            remaining_idx = _header_index(tab_name, "Kalan Bakiye (TL)")
+            if remaining_idx is not None:
+                _add_conditional_format_rule(
+                    requests,
+                    sheet_id=ws.id,
+                    start_row=2,
+                    end_row=1000,
+                    start_col=remaining_idx,
+                    end_col=remaining_idx + 1,
+                    condition_type="NUMBER_LESS",
+                    values=["0"],
+                    background=_STATUS_RED,
+                    index=rule_index,
+                )
+                rule_index += 1
+                _add_conditional_format_rule(
+                    requests,
+                    sheet_id=ws.id,
+                    start_row=2,
+                    end_row=1000,
+                    start_col=remaining_idx,
+                    end_col=remaining_idx + 1,
+                    condition_type="NUMBER_EQ",
+                    values=["0"],
+                    background=_STATUS_GREEN,
+                    index=rule_index,
+                )
+                rule_index += 1
+                _add_conditional_format_rule(
+                    requests,
+                    sheet_id=ws.id,
+                    start_row=2,
+                    end_row=1000,
+                    start_col=remaining_idx,
+                    end_col=remaining_idx + 1,
+                    condition_type="NUMBER_GREATER",
+                    values=["0"],
+                    background=_STATUS_YELLOW,
+                    index=rule_index,
+                )
+                rule_index += 1
+            status_idx = _header_index(tab_name, "Durum")
+            if status_idx is not None:
+                status_rules = [
+                    ("TEXT_CONTAINS", "Kapandı", _STATUS_GREEN),
+                    ("TEXT_CONTAINS", "Borç Yok", _STATUS_GREEN),
+                    ("TEXT_CONTAINS", "Kısmi", _STATUS_YELLOW),
+                    ("TEXT_CONTAINS", "Açık", _STATUS_YELLOW),
+                    ("TEXT_CONTAINS", "Fazla Ödeme", _STATUS_ORANGE),
+                    ("TEXT_CONTAINS", "Eşleşmedi", _STATUS_RED),
+                    ("TEXT_CONTAINS", "ÖDENDİ", _STATUS_GREEN),
+                    ("TEXT_CONTAINS", "KALAN VAR", _STATUS_RED),
+                ]
+                for condition, value, color in status_rules:
+                    _add_conditional_format_rule(
+                        requests,
+                        sheet_id=ws.id,
+                        start_row=2,
+                        end_row=1000,
+                        start_col=status_idx,
+                        end_col=status_idx + 1,
+                        condition_type=condition,
+                        values=[value],
+                        background=color,
+                        index=rule_index,
+                    )
+                    rule_index += 1
+            payment_idx = _header_index(tab_name, "Ödeme Tutarı (TL)")
+            if payment_idx is not None:
+                requests.append({
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": ws.id,
+                            "startRowIndex": 2,
+                            "endRowIndex": 1000,
+                            "startColumnIndex": payment_idx,
+                            "endColumnIndex": payment_idx + 1,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "textFormat": {"foregroundColor": {"red": 0.12, "green": 0.32, "blue": 0.78}},
+                            }
+                        },
+                        "fields": "userEnteredFormat.textFormat.foregroundColor",
+                    }
+                })
 
     try:
         ws.spreadsheet.batch_update({"requests": requests})
