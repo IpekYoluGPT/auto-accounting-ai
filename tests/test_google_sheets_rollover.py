@@ -27,22 +27,26 @@ def test_next_month_rollover_boundary_uses_configured_timezone():
 
 
 def test_tab_total_and_summary_formulas_use_dedicated_total_cells():
-    assert google_sheets._build_tab_total_formula("🧾 Faturalar") == "=IFERROR(SUM(K3:K);0)"
-    assert google_sheets._build_summary_formula("🧾 Faturalar") == "=IFERROR('🧾 Faturalar'!K2;0)"
+    assert google_sheets._build_tab_total_formula("🧾 Faturalar") == "=IFERROR(SUM(O3:O);0)"
+    assert google_sheets._build_summary_formula("🧾 Faturalar") == "=IFERROR('Faturalar'!O2;0)"
     assert [tab_name for _, tab_name in google_sheets._summary_rows()] == [
-        "🧾 Faturalar",
-        "💳 Dekontlar",
-        "⛽ Harcama Fişleri",
-        "📝 Çekler",
-        "💵 Elden Ödemeler",
-        "🏗️ Malzeme",
+        "Masraf Kayıtları",
+        "Banka Ödemeleri",
+        "Faturalar",
     ]
 
 
 
-def test_active_layout_excludes_iade_tab_and_uses_wide_belge_column():
+def test_active_layout_excludes_iade_tab_and_keeps_technical_tabs_hidden():
     assert "↩️ İadeler" not in google_sheets._TABS
-    assert google_sheets._COL_WIDTHS["Belge"] == 100
+    assert google_sheets._VISIBLE_TABS == [
+        "Masraf Kayıtları",
+        "Banka Ödemeleri",
+        "Faturalar",
+        "Sevk Fişleri",
+    ]
+    assert {"📊 Özet", "__Raw Belgeler", "__Fatura Kalemleri", "__Çek_Dekont_Detay", "__Cari_Kartlar", "__Ödeme_Dağıtımları"}.issubset(set(google_sheets._TABS))
+    assert google_sheets._header_index("Faturalar", google_sheets._HIDDEN_DRIVE_LINK_HEADER) == 17
 
 
 def test_month_drive_folder_name_uses_fisler_prefix():
@@ -75,7 +79,7 @@ def test_ensure_tab_total_row_rewrites_row_two_when_existing_data_starts_on_row_
 
 
 def test_elden_odeme_row_includes_drive_verification_cell():
-    row = google_sheets._build_row(
+    row = google_sheets._build_row_for_tab(
         BillRecord(
             document_date="2026-04-09",
             document_time="10:30",
@@ -84,19 +88,22 @@ def test_elden_odeme_row_includes_drive_verification_cell():
             currency="TRY",
             source_sender_id="905551112233",
         ),
-        DocumentCategory.ELDEN_ODEME,
-        seq=1,
+        "Masraf Kayıtları",
+        category=DocumentCategory.ELDEN_ODEME,
+        row_id="row-1",
+        row_number=3,
         drive_link="https://drive.google.com/file/d/example/view",
+        source_doc_id="row-1",
     )
 
-    assert row[4] == 1500.0
-    assert row[-2] == "905551112233"
-    assert row[-1] == '=HYPERLINK("https://drive.google.com/file/d/example/view";"Görüntüle")'
-    assert google_sheets._TABS["💵 Elden Ödemeler"][0][-1] == "Belge"
+    assert row[2] == "Kasadan odeme"
+    assert row[5] == 1500.0
+    assert row[8] == '=HYPERLINK("https://drive.google.com/file/d/example/view";"Görüntüle")'
+    assert row[9] == "row-1"
 
 
 def test_dekont_row_prefers_sender_name_over_phone_number():
-    row = google_sheets._build_row(
+    row = google_sheets._build_row_for_tab(
         BillRecord(
             document_date="2026-04-09",
             document_time="10:30",
@@ -109,16 +116,19 @@ def test_dekont_row_prefers_sender_name_over_phone_number():
             source_sender_name="Meta Profil",
             source_sender_id="905551112233",
         ),
-        DocumentCategory.ODEME_DEKONTU,
-        seq=1,
+        "__Çek_Dekont_Detay",
+        category=DocumentCategory.ODEME_DEKONTU,
+        row_id="row-1",
+        row_number=3,
         drive_link=None,
+        source_doc_id="row-1",
     )
 
-    assert row[5] == "Ahmet Yılmaz"
+    assert row[3] == "Ahmet Yılmaz"
 
 
 def test_dekont_row_falls_back_to_source_sender_name_but_not_phone_number():
-    row = google_sheets._build_row(
+    row = google_sheets._build_row_for_tab(
         BillRecord(
             document_date="2026-04-09",
             document_time="10:30",
@@ -130,12 +140,15 @@ def test_dekont_row_falls_back_to_source_sender_name_but_not_phone_number():
             source_sender_name="Ayşe Demir",
             source_sender_id="905551112233",
         ),
-        DocumentCategory.ODEME_DEKONTU,
-        seq=1,
+        "__Çek_Dekont_Detay",
+        category=DocumentCategory.ODEME_DEKONTU,
+        row_id="row-1",
+        row_number=3,
         drive_link=None,
+        source_doc_id="row-1",
     )
 
-    assert row[5] == "Ayşe Demir"
+    assert row[3] == "Ayşe Demir"
 
 
 def test_repair_drive_link_formulas_rewrites_old_comma_separator():
@@ -150,7 +163,7 @@ def test_repair_drive_link_formulas_rewrites_old_comma_separator():
 
     ws.update.assert_called_once_with(
         [['=HYPERLINK("https://drive.google.com/file/d/a/view";"Görüntüle")']],
-        "K3",
+        "I3",
         value_input_option="USER_ENTERED",
     )
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
@@ -32,6 +33,33 @@ COLUMN_MAP: dict[str, str] = {
     "vat_amount": "KDV Tutarı",
     "total_amount": "Genel Toplam",
     "sender_name": "Gönderen Adı",
+    "recipient_name": "Alıcı / Tedarikçi",
+    "buyer_name": "Alıcı",
+    "invoice_type": "Fatura Tipi",
+    "line_quantity": "Miktar",
+    "line_unit": "Birim",
+    "unit_price": "Birim Fiyat",
+    "line_amount": "Kalem Tutarı",
+    "withholding_present": "Tevkifat Var mı",
+    "withholding_rate": "Tevkifat Oranı",
+    "withholding_amount": "Tevkifat Tutarı",
+    "payable_amount": "Ödenecek Tutar",
+    "iban": "IBAN",
+    "bank_name": "Banka",
+    "shipment_origin": "Çıkış Yeri",
+    "shipment_destination": "Sevk Yeri",
+    "pallet_count": "Palet Sayısı",
+    "items_per_pallet": "Adet/Palet",
+    "product_quantity": "Ürün Miktarı",
+    "vehicle_plate": "Plaka",
+    "cheque_issue_place": "Çek Keşide Yeri",
+    "cheque_issue_date": "Çek Keşide Tarihi",
+    "cheque_due_date": "Çek Vade Tarihi",
+    "cheque_serial_number": "Çek Seri No",
+    "cheque_bank_name": "Çek Banka",
+    "cheque_branch": "Çek Şube",
+    "cheque_account_ref": "Çek Hesap Ref",
+    "line_items": "Fatura Kalemleri JSON",
     "payment_method": "Ödeme Yöntemi",
     "expense_category": "Gider Kategorisi",
     "description": "Açıklama",
@@ -55,7 +83,12 @@ def record_to_row(record: BillRecord) -> dict[str, str]:
     row: dict[str, str] = {}
     for field, column in COLUMN_MAP.items():
         value = raw.get(field)
-        row[column] = "" if value is None else str(value)
+        if value is None:
+            row[column] = ""
+        elif field == "line_items":
+            row[column] = json.dumps(value, ensure_ascii=False)
+        else:
+            row[column] = str(value)
     return row
 
 

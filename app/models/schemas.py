@@ -213,6 +213,17 @@ class PeriskopeAssignToHumanRequest(BaseModel):
 # ─── Bill / Invoice Record ────────────────────────────────────────────────────
 
 
+class InvoiceLineItem(BaseModel):
+    """Optional structured invoice line item for hidden detail sheets."""
+
+    description: Optional[str] = None
+    quantity: Optional[float] = None
+    unit: Optional[str] = None
+    unit_price: Optional[float] = None
+    line_amount: Optional[float] = None
+
+    model_config = {"extra": "ignore"}
+
 class BillRecord(BaseModel):
     """Normalised internal representation of an extracted bill / invoice."""
 
@@ -237,6 +248,33 @@ class BillRecord(BaseModel):
     vat_amount: Optional[float] = None
     total_amount: Optional[float] = None
     sender_name: Optional[str] = None
+    recipient_name: Optional[str] = None
+    buyer_name: Optional[str] = None
+    invoice_type: Optional[str] = None
+    line_quantity: Optional[float] = None
+    line_unit: Optional[str] = None
+    unit_price: Optional[float] = None
+    line_amount: Optional[float] = None
+    withholding_present: Optional[bool] = None
+    withholding_rate: Optional[float] = None
+    withholding_amount: Optional[float] = None
+    payable_amount: Optional[float] = None
+    iban: Optional[str] = None
+    bank_name: Optional[str] = None
+    shipment_origin: Optional[str] = None
+    shipment_destination: Optional[str] = None
+    pallet_count: Optional[float] = None
+    items_per_pallet: Optional[float] = None
+    product_quantity: Optional[float] = None
+    vehicle_plate: Optional[str] = None
+    cheque_issue_place: Optional[str] = None
+    cheque_issue_date: Optional[str] = None
+    cheque_due_date: Optional[str] = None
+    cheque_serial_number: Optional[str] = None
+    cheque_bank_name: Optional[str] = None
+    cheque_branch: Optional[str] = None
+    cheque_account_ref: Optional[str] = None
+    line_items: Optional[list[InvoiceLineItem]] = None
 
     # Classification
     payment_method: Optional[str] = None
@@ -276,6 +314,33 @@ class AIExtractionResult(BaseModel):
     vat_amount: Optional[float] = None
     total_amount: Optional[float] = None
     sender_name: Optional[str] = None
+    recipient_name: Optional[str] = None
+    buyer_name: Optional[str] = None
+    invoice_type: Optional[str] = None
+    line_quantity: Optional[float] = None
+    line_unit: Optional[str] = None
+    unit_price: Optional[float] = None
+    line_amount: Optional[float] = None
+    withholding_present: Optional[bool] = None
+    withholding_rate: Optional[float] = None
+    withholding_amount: Optional[float] = None
+    payable_amount: Optional[float] = None
+    iban: Optional[str] = None
+    bank_name: Optional[str] = None
+    shipment_origin: Optional[str] = None
+    shipment_destination: Optional[str] = None
+    pallet_count: Optional[float] = None
+    items_per_pallet: Optional[float] = None
+    product_quantity: Optional[float] = None
+    vehicle_plate: Optional[str] = None
+    cheque_issue_place: Optional[str] = None
+    cheque_issue_date: Optional[str] = None
+    cheque_due_date: Optional[str] = None
+    cheque_serial_number: Optional[str] = None
+    cheque_bank_name: Optional[str] = None
+    cheque_branch: Optional[str] = None
+    cheque_account_ref: Optional[str] = None
+    line_items: Optional[list[InvoiceLineItem]] = None
     payment_method: Optional[
         Literal["Nakit", "Kredi Karti", "Kredi Kartı", "Banka Transferi", "Diger", "Diğer"]
     ] = None

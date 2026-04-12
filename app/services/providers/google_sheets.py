@@ -7,8 +7,8 @@ Monthly sheet management:
   3. If GOOGLE_SHEETS_SPREADSHEET_ID is set → seed this month's entry
   4. If neither → auto-create in GOOGLE_DRIVE_PARENT_FOLDER_ID
 
-Tab names use emoji for visual clarity.
-Backwards-compatible: plain-name tabs are renamed to emoji versions on first access.
+The customer-facing workbook uses four business tabs plus hidden technical tabs.
+Backwards-compatible: legacy emoji/plain tab names are normalized to the current layout on first access.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import shutil
 import ssl
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -28,6 +29,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.config import settings
 from app.models.schemas import BillRecord, DocumentCategory
+from app.services.accounting import ledger
 from app.services.accounting.pipeline_context import PipelineContext, current_pipeline_context, namespace_storage_root, pipeline_context_scope
 from app.utils.logging import get_logger
 
@@ -35,78 +37,278 @@ logger = get_logger(__name__)
 
 # ─── Tab definitions ──────────────────────────────────────────────────────────
 
-# Tab name (with emoji) → (header row, header background colour as RGB 0–1)
-_TABS: dict[str, tuple[list[str], dict]] = {
-    "📊 Özet": (
-        [],  # summary tab — content set by _setup_summary_tab
-        {"red": 0.13, "green": 0.13, "blue": 0.13},
+_HIDDEN_ROW_ID_HEADER = "__row_id"
+_HIDDEN_DRIVE_LINK_HEADER = "__Belge Link"
+_HIDDEN_PARTY_KEY_HEADER = "__party_key"
+_HIDDEN_SOURCE_DOC_ID_HEADER = "__source_doc_id"
+_HIDDEN_TAX_NUMBER_HEADER = "__tax_number"
+_HIDDEN_RECORD_KIND_HEADER = "__record_kind"
+_HIDDEN_SETTLED_AMOUNT_HEADER = "__settled_amount"
+_HIDDEN_ALLOCATION_ID_HEADER = "__allocation_id"
+_HIDDEN_PAYMENT_DOC_ID_HEADER = "__payment_doc_id"
+_HIDDEN_DEBT_ROW_ID_HEADER = "__debt_row_id"
+
+
+@dataclass(frozen=True)
+class SheetSpec:
+    visible_headers: tuple[str, ...]
+    hidden_headers: tuple[str, ...]
+    color: dict[str, float]
+    total_header: str | None = None
+    hidden_tab: bool = False
+    summary_tab: bool = False
+
+    @property
+    def headers(self) -> list[str]:
+        return list(self.visible_headers + self.hidden_headers)
+
+
+_TAB_SPECS: dict[str, SheetSpec] = {
+    "📊 Özet": SheetSpec(
+        visible_headers=(),
+        hidden_headers=(),
+        color={"red": 0.13, "green": 0.13, "blue": 0.13},
+        hidden_tab=True,
+        summary_tab=True,
     ),
-    "🧾 Faturalar": (
-        ["#", "Tarih", "Saat", "Firma Adı", "Vergi No", "Vergi Dairesi",
-         "Fatura No", "KDVsiz Tutar", "KDV %", "KDV Tutarı", "GENEL TOPLAM",
-         "Ödeme Yöntemi", "Gider Kategorisi", "Açıklama", "Notlar", "Belge"],
-        {"red": 0.16, "green": 0.38, "blue": 0.74},
+    "Masraf Kayıtları": SheetSpec(
+        visible_headers=(
+            "Tarih",
+            "Kategori",
+            "Alıcı / Tedarikçi",
+            "Açıklama",
+            "Belge No / Referans",
+            "Bakiye (TL)",
+            "Ödenen (TL)",
+            "Kalan Borç (TL)",
+        ),
+        hidden_headers=(
+            _HIDDEN_DRIVE_LINK_HEADER,
+            _HIDDEN_ROW_ID_HEADER,
+            _HIDDEN_PARTY_KEY_HEADER,
+            _HIDDEN_SOURCE_DOC_ID_HEADER,
+            _HIDDEN_TAX_NUMBER_HEADER,
+            _HIDDEN_RECORD_KIND_HEADER,
+            _HIDDEN_SETTLED_AMOUNT_HEADER,
+        ),
+        color={"red": 0.90, "green": 0.49, "blue": 0.13},
+        total_header="Kalan Borç (TL)",
     ),
-    "💳 Dekontlar": (
-        ["#", "Tarih", "Saat", "Banka / Firma", "Referans No",
-         "Gönderen", "Alıcı / Açıklama", "TUTAR", "Para Birimi", "Notlar", "Belge"],
-        {"red": 0.13, "green": 0.55, "blue": 0.13},
+    "Banka Ödemeleri": SheetSpec(
+        visible_headers=(
+            "Alıcı / Tedarikçi",
+            "Açıklama",
+            "Borç Tarihi",
+            "Kişi Toplam Borcu (TL)",
+            "Ödeme Tutarı (TL)",
+            "Ödeme Tarihi",
+            "Kalan Bakiye (TL)",
+            "Durum",
+        ),
+        hidden_headers=(
+            _HIDDEN_DRIVE_LINK_HEADER,
+            _HIDDEN_ROW_ID_HEADER,
+            _HIDDEN_PARTY_KEY_HEADER,
+            _HIDDEN_SOURCE_DOC_ID_HEADER,
+            _HIDDEN_PAYMENT_DOC_ID_HEADER,
+            _HIDDEN_DEBT_ROW_ID_HEADER,
+            _HIDDEN_ALLOCATION_ID_HEADER,
+            _HIDDEN_TAX_NUMBER_HEADER,
+            _HIDDEN_RECORD_KIND_HEADER,
+        ),
+        color={"red": 0.13, "green": 0.55, "blue": 0.13},
+        total_header="Ödeme Tutarı (TL)",
     ),
-    "⛽ Harcama Fişleri": (
-        ["#", "Tarih", "Saat", "Firma", "Fiş No", "Vergi No",
-         "KDVsiz", "KDV %", "KDV", "TOPLAM", "Ödeme", "Kategori",
-         "Açıklama", "Plaka", "Belge"],
-        {"red": 0.90, "green": 0.49, "blue": 0.13},
+    "Faturalar": SheetSpec(
+        visible_headers=(
+            "Fatura No",
+            "Fatura Tarihi",
+            "Fatura Tipi",
+            "Satıcı (Düzenleyen)",
+            "Satıcı VKN/TCKN",
+            "Alıcı",
+            "Açıklama / Hizmet",
+            "Miktar",
+            "Birim Fiyat (TL)",
+            "Mal/Hizmet Tutarı (TL)",
+            "KDV %",
+            "KDV Tutarı (TL)",
+            "Tevkifat Var mı?",
+            "Tevkifat Tutarı (TL)",
+            "Ödenecek Tutar (TL)",
+            "IBAN",
+            "Banka",
+        ),
+        hidden_headers=(
+            _HIDDEN_DRIVE_LINK_HEADER,
+            _HIDDEN_ROW_ID_HEADER,
+            _HIDDEN_PARTY_KEY_HEADER,
+            _HIDDEN_SOURCE_DOC_ID_HEADER,
+            _HIDDEN_TAX_NUMBER_HEADER,
+            _HIDDEN_RECORD_KIND_HEADER,
+        ),
+        color={"red": 0.16, "green": 0.38, "blue": 0.74},
+        total_header="Ödenecek Tutar (TL)",
     ),
-    "📝 Çekler": (
-        ["#", "Çek / Belge No", "Düzenleyen Firma", "Vergi No",
-         "Lehdar (Alıcı)", "Vade Tarihi", "TUTAR", "Para Birimi",
-         "Açıklama", "Belge"],
-        {"red": 0.76, "green": 0.09, "blue": 0.09},
+    "Sevk Fişleri": SheetSpec(
+        visible_headers=(
+            "Fiş No",
+            "Tarih",
+            "Alıcı",
+            "Ürün Cinsi",
+            "Palet Sayısı",
+            "Adet/Palet",
+            "Ürün Miktarı",
+            "Plaka",
+            "Satıcı",
+            "Çıkış Yeri",
+            "Sevk Yeri",
+        ),
+        hidden_headers=(
+            _HIDDEN_DRIVE_LINK_HEADER,
+            _HIDDEN_ROW_ID_HEADER,
+            _HIDDEN_PARTY_KEY_HEADER,
+            _HIDDEN_SOURCE_DOC_ID_HEADER,
+            _HIDDEN_TAX_NUMBER_HEADER,
+            _HIDDEN_RECORD_KIND_HEADER,
+        ),
+        color={"red": 0.47, "green": 0.27, "blue": 0.08},
     ),
-    "💵 Elden Ödemeler": (
-        ["#", "Tarih", "Saat", "Alıcı / Açıklama", "TUTAR", "Para Birimi", "Kaydeden", "Belge"],
-        {"red": 0.46, "green": 0.11, "blue": 0.64},
+    "__Raw Belgeler": SheetSpec(
+        visible_headers=(
+            "Belge ID",
+            "Kategori",
+            "İade Mi",
+            "Firma",
+            "Vergi No",
+            "Belge No",
+            "Fatura No",
+            "Fiş No",
+            "Tarih",
+            "Saat",
+            "Toplam",
+            "Para Birimi",
+            "Gönderen",
+            "Alıcı",
+            "Açıklama",
+            "Notlar",
+            "IBAN",
+            "Banka",
+            "Kaynak Mesaj ID",
+        ),
+        hidden_headers=(_HIDDEN_DRIVE_LINK_HEADER, _HIDDEN_ROW_ID_HEADER),
+        color={"red": 0.30, "green": 0.30, "blue": 0.30},
+        hidden_tab=True,
     ),
-    "🏗️ Malzeme": (
-        ["#", "Tarih", "Firma", "İrsaliye / Belge No", "Malzeme Cinsi",
-         "Miktar", "Birim", "Teslim Yeri", "Plaka", "Tutar",
-         "Açıklama", "Belge"],
-        {"red": 0.47, "green": 0.27, "blue": 0.08},
+    "__Fatura Kalemleri": SheetSpec(
+        visible_headers=(
+            "Belge ID",
+            "Kalem No",
+            "Açıklama",
+            "Miktar",
+            "Birim",
+            "Birim Fiyat",
+            "Tutar",
+        ),
+        hidden_headers=(_HIDDEN_ROW_ID_HEADER,),
+        color={"red": 0.26, "green": 0.26, "blue": 0.54},
+        hidden_tab=True,
+    ),
+    "__Çek_Dekont_Detay": SheetSpec(
+        visible_headers=(
+            "Belge ID",
+            "Kategori",
+            "Karşı Taraf",
+            "Gönderen",
+            "Alıcı",
+            "Referans",
+            "IBAN",
+            "Banka",
+            "Çek Seri No",
+            "Çek Banka",
+            "Çek Şube",
+            "Çek Hesap Ref",
+            "Keşide Yeri",
+            "Keşide Tarihi",
+            "Vade Tarihi",
+            "Açıklama",
+        ),
+        hidden_headers=(_HIDDEN_DRIVE_LINK_HEADER, _HIDDEN_ROW_ID_HEADER),
+        color={"red": 0.58, "green": 0.14, "blue": 0.14},
+        hidden_tab=True,
+    ),
+    "__Cari_Kartlar": SheetSpec(
+        visible_headers=(
+            "Party Key",
+            "Görünen Ad",
+            "Vergi No",
+            "Aliaslar",
+        ),
+        hidden_headers=(_HIDDEN_ROW_ID_HEADER,),
+        color={"red": 0.31, "green": 0.31, "blue": 0.31},
+        hidden_tab=True,
+    ),
+    "__Ödeme_Dağıtımları": SheetSpec(
+        visible_headers=(
+            "Allocation ID",
+            "Party Key",
+            "Borç Row ID",
+            "Ödeme Belge ID",
+            "Ödeme Tarihi",
+            "Borç Tarihi",
+            "Borç Tutarı",
+            "Ayrılan Tutar",
+            "Kalan",
+            "Durum",
+        ),
+        hidden_headers=(_HIDDEN_ROW_ID_HEADER,),
+        color={"red": 0.18, "green": 0.18, "blue": 0.18},
+        hidden_tab=True,
     ),
 }
 
-# Category → tab name (with emoji)
-_CATEGORY_TAB: dict[DocumentCategory, str] = {
-    DocumentCategory.FATURA: "🧾 Faturalar",
-    DocumentCategory.ODEME_DEKONTU: "💳 Dekontlar",
-    DocumentCategory.HARCAMA_FISI: "⛽ Harcama Fişleri",
-    DocumentCategory.CEK: "📝 Çekler",
-    DocumentCategory.ELDEN_ODEME: "💵 Elden Ödemeler",
-    DocumentCategory.MALZEME: "🏗️ Malzeme",
-    DocumentCategory.IADE: "🧾 Faturalar",
-    DocumentCategory.BELIRSIZ: "🧾 Faturalar",
+_TABS: dict[str, tuple[list[str], dict[str, float]]] = {
+    tab_name: (spec.headers, spec.color) for tab_name, spec in _TAB_SPECS.items()
+}
+_VISIBLE_TABS = [tab_name for tab_name, spec in _TAB_SPECS.items() if not spec.hidden_tab and not spec.summary_tab]
+_HIDDEN_TABS = {tab_name for tab_name, spec in _TAB_SPECS.items() if spec.hidden_tab}
+
+_CATEGORY_VISIBLE_TAB: dict[DocumentCategory, str] = {
+    DocumentCategory.FATURA: "Faturalar",
+    DocumentCategory.ODEME_DEKONTU: "Banka Ödemeleri",
+    DocumentCategory.HARCAMA_FISI: "Masraf Kayıtları",
+    DocumentCategory.CEK: "Banka Ödemeleri",
+    DocumentCategory.ELDEN_ODEME: "Masraf Kayıtları",
+    DocumentCategory.MALZEME: "Sevk Fişleri",
+    DocumentCategory.IADE: "Faturalar",
+    DocumentCategory.BELIRSIZ: "Faturalar",
 }
 
-# Plain name → emoji name (for backwards-compat renaming)
-_PLAIN_TO_EMOJI: dict[str, str] = {
+_TAB_ALIASES: dict[str, str] = {
     "Özet": "📊 Özet",
-    "Faturalar": "🧾 Faturalar",
-    "Dekontlar": "💳 Dekontlar",
-    "Harcama Fişleri": "⛽ Harcama Fişleri",
-    "Çekler": "📝 Çekler",
-    "Elden Ödemeler": "💵 Elden Ödemeler",
-    "Malzeme": "🏗️ Malzeme",
+    "📊 Özet": "📊 Özet",
+    "Masraf Kayitlari": "Masraf Kayıtları",
+    "Masraf Kayıtları": "Masraf Kayıtları",
+    "⛽ Harcama Fişleri": "Masraf Kayıtları",
+    "💵 Elden Ödemeler": "Masraf Kayıtları",
+    "Banka Odemeleri": "Banka Ödemeleri",
+    "Banka Ödemeleri": "Banka Ödemeleri",
+    "💳 Dekontlar": "Banka Ödemeleri",
+    "📝 Çekler": "Banka Ödemeleri",
+    "Faturalar": "Faturalar",
+    "🧾 Faturalar": "Faturalar",
+    "Sevk Fisleri": "Sevk Fişleri",
+    "Sevk Fişleri": "Sevk Fişleri",
+    "🏗️ Malzeme": "Sevk Fişleri",
+    "↩️ İadeler": "Faturalar",
+    "İadeler": "Faturalar",
 }
 
-_TAB_TOTAL_COLUMNS: dict[str, str] = {
-    "🧾 Faturalar": "K",
-    "💳 Dekontlar": "H",
-    "⛽ Harcama Fişleri": "J",
-    "📝 Çekler": "G",
-    "💵 Elden Ödemeler": "E",
-    "🏗️ Malzeme": "J",
-}
+_SUMMARY_ROWS: list[tuple[str, str]] = [
+    ("Masraf Kalan Borç (TL)", "Masraf Kayıtları"),
+    ("Banka Ödemeleri Toplamı (TL)", "Banka Ödemeleri"),
+    ("Faturalar Ödenecek Toplam (TL)", "Faturalar"),
+]
 
 _SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -116,61 +318,103 @@ _SCOPES = [
 # ─── Column width map (pixels) ────────────────────────────────────────────────
 
 _COL_WIDTHS: dict[str, int] = {
-    "#": 38,
     "Tarih": 90,
     "Saat": 58,
-    "Firma Adı": 210,
+    "Kategori": 120,
+    "Alıcı / Tedarikçi": 220,
+    "Açıklama": 280,
+    "Belge No / Referans": 150,
+    "Bakiye (TL)": 115,
+    "Ödenen (TL)": 115,
+    "Kalan Borç (TL)": 125,
+    "Borç Tarihi": 95,
+    "Kişi Toplam Borcu (TL)": 125,
+    "Ödeme Tutarı (TL)": 115,
+    "Ödeme Tarihi": 95,
+    "Kalan Bakiye (TL)": 125,
+    "Durum": 100,
+    "Fatura No": 130,
+    "Fatura Tarihi": 100,
+    "Fatura Tipi": 120,
+    "Satıcı (Düzenleyen)": 240,
+    "Satıcı VKN/TCKN": 130,
+    "Alıcı": 220,
+    "Açıklama / Hizmet": 300,
+    "Miktar": 90,
+    "Birim Fiyat (TL)": 115,
+    "Mal/Hizmet Tutarı (TL)": 135,
+    "KDV %": 70,
+    "KDV Tutarı (TL)": 115,
+    "Tevkifat Var mı?": 110,
+    "Tevkifat Tutarı (TL)": 125,
+    "Ödenecek Tutar (TL)": 125,
+    "IBAN": 240,
+    "Banka": 180,
+    "Fiş No": 120,
+    "Ürün Cinsi": 220,
+    "Palet Sayısı": 95,
+    "Adet/Palet": 95,
+    "Ürün Miktarı": 105,
+    "Plaka": 100,
+    "Satıcı": 220,
+    "Çıkış Yeri": 180,
+    "Sevk Yeri": 180,
+    "Belge ID": 160,
     "Firma": 210,
-    "Banka / Firma": 210,
-    "Düzenleyen Firma": 210,
-    "Vergi No": 105,
-    "Vergi Dairesi": 120,
-    "Fatura No": 100,
-    "İrsaliye / Belge No": 130,
-    "Çek / Belge No": 120,
-    "Referans No": 120,
-    "Belge No": 100,
-    "Belge Türü": 120,
-    "KDVsiz Tutar": 110,
-    "KDVsiz": 90,
-    "KDV %": 58,
-    "KDV Oranı": 70,
-    "KDV Tutarı": 105,
-    "KDV": 80,
-    "GENEL TOPLAM": 125,
-    "TOPLAM": 110,
-    "TUTAR": 110,
-    "Tutar": 110,
-    "Para Birimi": 78,
-    "Ödeme Yöntemi": 115,
-    "Ödeme": 100,
-    "Gider Kategorisi": 130,
-    "Kategori": 110,
-    "Açıklama": 260,
-    "Alıcı / Açıklama": 240,
-    "Notlar": 200,
-    "Malzeme Cinsi": 220,
-    "Teslim Yeri": 180,
-    "Plaka": 75,
-    "Miktar": 68,
+    "Vergi No": 130,
+    "Belge No": 120,
+    "Fiş No": 120,
+    "Toplam": 110,
+    "Para Birimi": 85,
+    "Gönderen": 160,
+    "Notlar": 220,
     "Birim": 58,
-    "Gönderen": 130,
-    "Lehdar (Alıcı)": 150,
+    "Tutar": 110,
+    "Kalem No": 72,
+    "Karşı Taraf": 200,
+    "Referans": 140,
+    "Çek Seri No": 140,
+    "Çek Banka": 180,
+    "Çek Şube": 140,
+    "Çek Hesap Ref": 150,
+    "Keşide Yeri": 140,
+    "Keşide Tarihi": 95,
     "Vade Tarihi": 90,
-    "Kaydeden": 130,
-    "Belge": 100,
+    "Party Key": 160,
+    "Görünen Ad": 220,
+    "Aliaslar": 220,
+    "Allocation ID": 160,
+    "Borç Row ID": 160,
+    "Ödeme Belge ID": 160,
+    "Borç Tutarı": 115,
+    "Ayrılan Tutar": 115,
+    "Kalan": 110,
 }
 
 # Columns that should wrap text (long free-text fields)
 _WRAP_COLUMNS = {
-    "Açıklama", "Alıcı / Açıklama", "Notlar",
-    "Malzeme Cinsi", "Teslim Yeri",
+    "Açıklama", "Açıklama / Hizmet", "Notlar", "Ürün Cinsi",
+    "Çıkış Yeri", "Sevk Yeri", "Aliaslar",
 }
 
 # Columns that hold monetary amounts (get number formatting)
 _AMOUNT_COLUMNS = {
-    "KDVsiz Tutar", "KDVsiz", "KDV Tutarı", "KDV",
-    "GENEL TOPLAM", "TOPLAM", "TUTAR", "Tutar",
+    "Bakiye (TL)",
+    "Ödenen (TL)",
+    "Kalan Borç (TL)",
+    "Kişi Toplam Borcu (TL)",
+    "Ödeme Tutarı (TL)",
+    "Kalan Bakiye (TL)",
+    "Birim Fiyat (TL)",
+    "Mal/Hizmet Tutarı (TL)",
+    "KDV Tutarı (TL)",
+    "Tevkifat Tutarı (TL)",
+    "Ödenecek Tutar (TL)",
+    "Toplam",
+    "Tutar",
+    "Borç Tutarı",
+    "Ayrılan Tutar",
+    "Kalan",
 }
 
 _lock = threading.Lock()
@@ -439,6 +683,16 @@ def _open_spreadsheet_by_key(client, spreadsheet_id: str):
 
 
 def _get_worksheet(sh, title: str):
+    import gspread
+
+    last_error: Exception | None = None
+    for candidate in _tab_title_candidates(title):
+        try:
+            return _retry_on_rate_limit(lambda candidate=candidate: sh.worksheet(candidate))
+        except gspread.WorksheetNotFound as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
     return _retry_on_rate_limit(lambda: sh.worksheet(title))
 
 
@@ -773,8 +1027,87 @@ def _formula_arg_separator() -> str:
     return ";"
 
 
+def _canonical_tab_name(tab_name: str) -> str:
+    raw = str(tab_name or '').strip()
+    if not raw:
+        return raw
+    if ' — ' in raw:
+        prefix, suffix = raw.split(' — ', 1)
+        canonical_suffix = _canonical_tab_name(suffix)
+        if canonical_suffix != suffix:
+            return f'{prefix} — {canonical_suffix}'
+    return _TAB_ALIASES.get(raw, raw)
+
+
+def _tab_title_candidates(tab_name: str) -> list[str]:
+    raw = str(tab_name or '').strip()
+    if not raw:
+        return []
+
+    if ' — ' in raw:
+        prefix, suffix = raw.split(' — ', 1)
+        candidates = [f'{prefix} — {candidate}' for candidate in _tab_title_candidates(suffix)]
+        if raw not in candidates:
+            candidates.append(raw)
+    else:
+        canonical = _canonical_tab_name(raw)
+        candidates = [canonical]
+        for alias, resolved in _TAB_ALIASES.items():
+            if resolved == canonical and alias not in candidates:
+                candidates.append(alias)
+        if raw not in candidates:
+            candidates.append(raw)
+
+    deduped: list[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in deduped:
+            deduped.append(candidate)
+    return deduped
+
+
+def _tab_spec(tab_name: str) -> SheetSpec:
+    return _TAB_SPECS[_canonical_tab_name(tab_name)]
+
+
+def _headers(tab_name: str) -> list[str]:
+    return _tab_spec(tab_name).headers
+
+
+def _visible_headers(tab_name: str) -> list[str]:
+    return list(_tab_spec(tab_name).visible_headers)
+
+
+def _visible_header_count(tab_name: str) -> int:
+    return len(_tab_spec(tab_name).visible_headers)
+
+
+def _hidden_headers(tab_name: str) -> list[str]:
+    return list(_tab_spec(tab_name).hidden_headers)
+
+
+def _header_index(tab_name: str, header_name: str) -> int | None:
+    try:
+        return _headers(tab_name).index(header_name)
+    except ValueError:
+        return None
+
+
+def _header_letter(tab_name: str, header_name: str) -> str | None:
+    idx = _header_index(tab_name, header_name)
+    if idx is None:
+        return None
+    return _col_letter(idx)
+
+
+def _tab_total_column_letter(tab_name: str) -> str | None:
+    total_header = _tab_spec(tab_name).total_header
+    if not total_header:
+        return None
+    return _header_letter(tab_name, total_header)
+
+
 def _build_tab_total_formula(tab_name: str) -> str | None:
-    total_col = _TAB_TOTAL_COLUMNS.get(tab_name)
+    total_col = _tab_total_column_letter(tab_name)
     if not total_col:
         return None
     sep = _formula_arg_separator()
@@ -782,19 +1115,25 @@ def _build_tab_total_formula(tab_name: str) -> str | None:
 
 
 def _build_summary_formula(tab_name: str) -> str:
-    total_col = _TAB_TOTAL_COLUMNS[tab_name]
+    canonical_tab_name = _canonical_tab_name(tab_name)
+    total_col = _tab_total_column_letter(canonical_tab_name)
+    if not total_col:
+        raise KeyError(f"No total column configured for {canonical_tab_name}")
     sep = _formula_arg_separator()
-    return f"=IFERROR('{tab_name}'!{total_col}2{sep}0)"
+    return f"=IFERROR('{canonical_tab_name}'!{total_col}2{sep}0)"
 
 
 def _total_row_values(tab_name: str) -> list[str]:
-    headers, _ = _TABS[tab_name]
+    headers = _headers(tab_name)
     values = [""] * len(headers)
-    values[0] = "TOPLAM"
+    if headers:
+        values[0] = "TOPLAM"
     total_formula = _build_tab_total_formula(tab_name)
-    if total_formula:
-        total_col_idx = ord(_TAB_TOTAL_COLUMNS[tab_name]) - ord("A")
-        values[total_col_idx] = total_formula
+    total_col = _tab_total_column_letter(tab_name)
+    if total_formula and total_col:
+        total_col_idx = _header_index(tab_name, _tab_spec(tab_name).total_header or "")
+        if total_col_idx is not None:
+            values[total_col_idx] = total_formula
     return values
 
 
@@ -803,72 +1142,44 @@ def _looks_like_total_row(first_cell: str | None) -> bool:
 
 
 def _summary_rows() -> list[tuple[str, str]]:
-    return [
-        ("🧾 Faturalar Toplamı (TL)", "🧾 Faturalar"),
-        ("💳 Ödeme Dekontları (TL)", "💳 Dekontlar"),
-        ("⛽ Harcama Fişleri (TL)", "⛽ Harcama Fişleri"),
-        ("📝 Çekler (TL)", "📝 Çekler"),
-        ("💵 Elden Ödemeler (TL)", "💵 Elden Ödemeler"),
-        ("🏗️ Malzeme (TL)", "🏗️ Malzeme"),
-    ]
+    return list(_SUMMARY_ROWS)
 
 
-def _apply_lightweight_layout(ws, headers: list[str]) -> None:
-    requests = []
-    sheet_id = ws.id
+def _visibility_requests(ws, tab_name: str) -> list[dict]:
+    headers = _headers(tab_name)
+    requests: list[dict] = []
+    visible_count = _visible_header_count(tab_name)
 
-    for i, header in enumerate(headers):
-        if header != "Belge":
-            continue
+    for index, header in enumerate(headers):
         requests.append({
             "updateDimensionProperties": {
                 "range": {
-                    "sheetId": sheet_id,
+                    "sheetId": ws.id,
                     "dimension": "COLUMNS",
-                    "startIndex": i,
-                    "endIndex": i + 1,
+                    "startIndex": index,
+                    "endIndex": index + 1,
                 },
-                "properties": {"pixelSize": _COL_WIDTHS["Belge"]},
-                "fields": "pixelSize",
-            }
-        })
-        requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": sheet_id,
-                    "startRowIndex": 0,
-                    "startColumnIndex": i,
-                    "endColumnIndex": i + 1,
+                "properties": {
+                    "pixelSize": _COL_WIDTHS.get(header, 120),
+                    "hiddenByUser": index >= visible_count,
                 },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment)",
+                "fields": "pixelSize,hiddenByUser",
             }
         })
 
     requests.append({
-        "updateDimensionProperties": {
-            "range": {
-                "sheetId": sheet_id,
-                "dimension": "COLUMNS",
-                "startIndex": len(headers),
-                "endIndex": len(headers) + 1,
-            },
-            "properties": {
-                "pixelSize": 1,
-                "hiddenByUser": True,
-            },
-            "fields": "pixelSize,hiddenByUser",
+        "updateSheetProperties": {
+            "properties": {"sheetId": ws.id, "hidden": _tab_spec(tab_name).hidden_tab},
+            "fields": "hidden",
         }
     })
+    return requests
 
+
+def _apply_lightweight_layout(ws, tab_name: str) -> None:
+    requests = _visibility_requests(ws, tab_name)
     if not requests:
         return
-
     try:
         ws.spreadsheet.batch_update({"requests": requests})
     except Exception as exc:
@@ -876,30 +1187,30 @@ def _apply_lightweight_layout(ws, headers: list[str]) -> None:
 
 
 def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
-    """Format a data worksheet: freeze row 1, bold + coloured headers,
-    column widths, text-wrap on long fields, number format on amounts."""
-    headers, color = _TABS[tab_name]
+    """Format a worksheet with visible business columns plus hidden technical columns."""
+    headers = _headers(tab_name)
+    color = _tab_spec(tab_name).color
     if not headers:
         return
 
     col_count = len(headers)
     last_col = _col_letter(col_count - 1)
+    visible_last_col = _col_letter(max(_visible_header_count(tab_name) - 1, 0)) if _visible_header_count(tab_name) else "A"
     header_range = f"A1:{last_col}1"
+    visible_header_range = f"A1:{visible_last_col}1"
     total_range = f"A2:{last_col}2"
     data_range = f"A3:{last_col}1000"
 
-    # Write headers
     ws.update([headers], "A1", value_input_option="RAW")
     ws.update([_total_row_values(tab_name)], "A2", value_input_option="USER_ENTERED")
     ws.freeze(rows=2)
 
     if lightweight:
-        _apply_lightweight_layout(ws, headers)
+        _apply_lightweight_layout(ws, tab_name)
         logger.debug("Worksheet '%s' bootstrapped in lightweight mode.", tab_name)
         return
 
-    # Bold white text on coloured background
-    ws.format(header_range, {
+    ws.format(visible_header_range, {
         "backgroundColor": color,
         "textFormat": {
             "bold": True,
@@ -910,116 +1221,29 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
         "verticalAlignment": "MIDDLE",
         "wrapStrategy": "CLIP",
     })
+    if _visible_header_count(tab_name) < len(headers):
+        hidden_start = _col_letter(_visible_header_count(tab_name))
+        ws.format(f"{hidden_start}1:{last_col}1", {
+            "textFormat": {"foregroundColor": {"red": 0.6, "green": 0.6, "blue": 0.6}, "fontSize": 9},
+            "backgroundColor": {"red": 0.96, "green": 0.96, "blue": 0.96},
+        })
 
-    # Data rows: light alternating background, middle-align, clip by default
     ws.format(data_range, {
         "verticalAlignment": "MIDDLE",
         "wrapStrategy": "CLIP",
         "textFormat": {"fontSize": 10},
     })
-
     ws.format(total_range, {
         "backgroundColor": {"red": 0.96, "green": 0.96, "blue": 0.96},
         "textFormat": {"bold": True, "fontSize": 10},
         "verticalAlignment": "MIDDLE",
     })
-    requests = []
-    sheet_id = ws.id
 
-    for i, header in enumerate(headers):
-        width = _COL_WIDTHS.get(header, 120)
-        requests.append({
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": sheet_id,
-                    "dimension": "COLUMNS",
-                    "startIndex": i,
-                    "endIndex": i + 1,
-                },
-                "properties": {"pixelSize": width},
-                "fields": "pixelSize",
-            }
-        })
-
-        if header in _WRAP_COLUMNS:
-            requests.append({
-                "repeatCell": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": 2,
-                        "startColumnIndex": i,
-                        "endColumnIndex": i + 1,
-                    },
-                    "cell": {
-                        "userEnteredFormat": {
-                            "wrapStrategy": "WRAP",
-                        }
-                    },
-                    "fields": "userEnteredFormat.wrapStrategy",
-                }
-            })
-
-        if header in _AMOUNT_COLUMNS:
-            requests.append({
-                "repeatCell": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": 2,
-                        "startColumnIndex": i,
-                        "endColumnIndex": i + 1,
-                    },
-                    "cell": {
-                        "userEnteredFormat": {
-                            "numberFormat": {
-                                "type": "NUMBER",
-                                "pattern": "#,##0.00",
-                            },
-                            "horizontalAlignment": "RIGHT",
-                        }
-                    },
-                    "fields": "userEnteredFormat(numberFormat,horizontalAlignment)",
-                }
-            })
-
-        if header == "Belge":
-            requests.append({
-                "repeatCell": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": 2,
-                        "startColumnIndex": i,
-                        "endColumnIndex": i + 1,
-                    },
-                    "cell": {
-                        "userEnteredFormat": {
-                            "horizontalAlignment": "CENTER",
-                            "verticalAlignment": "MIDDLE",
-                        }
-                    },
-                    "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment)",
-                }
-            })
-
+    requests = _visibility_requests(ws, tab_name)
     requests.append({
         "updateDimensionProperties": {
             "range": {
-                "sheetId": sheet_id,
-                "dimension": "COLUMNS",
-                "startIndex": len(headers),
-                "endIndex": len(headers) + 1,
-            },
-            "properties": {
-                "pixelSize": 1,
-                "hiddenByUser": True,
-            },
-            "fields": "pixelSize,hiddenByUser",
-        }
-    })
-
-    requests.append({
-        "updateDimensionProperties": {
-            "range": {
-                "sheetId": sheet_id,
+                "sheetId": ws.id,
                 "dimension": "ROWS",
                 "startIndex": 0,
                 "endIndex": 1,
@@ -1028,6 +1252,39 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
             "fields": "pixelSize",
         }
     })
+
+    for i, header in enumerate(headers):
+        if header in _WRAP_COLUMNS:
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": 2,
+                        "startColumnIndex": i,
+                        "endColumnIndex": i + 1,
+                    },
+                    "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP"}},
+                    "fields": "userEnteredFormat.wrapStrategy",
+                }
+            })
+        if header in _AMOUNT_COLUMNS:
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": 2,
+                        "startColumnIndex": i,
+                        "endColumnIndex": i + 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"},
+                            "horizontalAlignment": "RIGHT",
+                        }
+                    },
+                    "fields": "userEnteredFormat(numberFormat,horizontalAlignment)",
+                }
+            })
 
     try:
         ws.spreadsheet.batch_update({"requests": requests})
@@ -1038,8 +1295,8 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
 
 
 def _setup_summary_tab(ws, month_label: str, *, lightweight: bool = False) -> None:
-    """Populate the 📊 Özet tab with title, labels, and cross-sheet SUM formulas."""
-    header_color = _TABS["📊 Özet"][1]
+    """Populate the hidden summary tab with current high-level totals."""
+    header_color = _tab_spec("📊 Özet").color
     summary_rows = _summary_rows()
     total_end_row = len(summary_rows) + 1
     blank_row = total_end_row + 1
@@ -1060,6 +1317,7 @@ def _setup_summary_tab(ws, month_label: str, *, lightweight: bool = False) -> No
     ws.freeze(rows=1)
 
     if lightweight:
+        _apply_lightweight_layout(ws, "📊 Özet")
         logger.debug("Summary tab bootstrapped in lightweight mode for %s.", month_label)
         return
 
@@ -1073,7 +1331,6 @@ def _setup_summary_tab(ws, month_label: str, *, lightweight: bool = False) -> No
         "horizontalAlignment": "CENTER",
     })
     ws.merge_cells("A1:B1")
-
     ws.format(f"A2:A{total_end_row}", {"textFormat": {"fontSize": 11}})
     ws.format(f"B2:B{total_end_row}", {
         "textFormat": {"fontSize": 11, "bold": True},
@@ -1084,32 +1341,27 @@ def _setup_summary_tab(ws, month_label: str, *, lightweight: bool = False) -> No
         "backgroundColor": {"red": 0.95, "green": 0.95, "blue": 0.95},
         "numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"},
     })
-
     try:
         ws.spreadsheet.batch_update({
             "requests": [
                 {
                     "updateDimensionProperties": {
-                        "range": {
-                            "sheetId": ws.id,
-                            "dimension": "COLUMNS",
-                            "startIndex": 0,
-                            "endIndex": 1,
-                        },
+                        "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
                         "properties": {"pixelSize": 280},
                         "fields": "pixelSize",
                     }
                 },
                 {
                     "updateDimensionProperties": {
-                        "range": {
-                            "sheetId": ws.id,
-                            "dimension": "COLUMNS",
-                            "startIndex": 1,
-                            "endIndex": 2,
-                        },
+                        "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 2},
                         "properties": {"pixelSize": 160},
                         "fields": "pixelSize",
+                    }
+                },
+                {
+                    "updateSheetProperties": {
+                        "properties": {"sheetId": ws.id, "hidden": True},
+                        "fields": "hidden",
                     }
                 },
             ]
@@ -1120,7 +1372,7 @@ def _setup_summary_tab(ws, month_label: str, *, lightweight: bool = False) -> No
     logger.debug("📊 Özet tab populated for %s.", month_label)
 
 def _ensure_tab_total_row(ws, tab_name: str) -> None:
-    headers, _ = _TABS[tab_name]
+    headers = _headers(tab_name)
     last_col = _col_letter(len(headers) - 1)
 
     # Row 2 is reserved for the canonical TOPLAM row. Rewriting it in place is
@@ -1133,7 +1385,7 @@ def _ensure_tab_total_row(ws, tab_name: str) -> None:
         "verticalAlignment": "MIDDLE",
     })
 
-    total_col = _TAB_TOTAL_COLUMNS.get(tab_name)
+    total_col = _tab_total_column_letter(tab_name)
     if total_col:
         ws.format(f"{total_col}2:{total_col}2", {
             "textFormat": {"bold": True, "fontSize": 10},
@@ -1144,7 +1396,7 @@ def _ensure_tab_total_row(ws, tab_name: str) -> None:
 
 
 def _ensure_worksheet_dimensions(ws, tab_name: str) -> None:
-    headers, _ = _TABS[tab_name]
+    headers = _headers(tab_name)
     target_cols = len(headers) + 2
     target_rows = max(getattr(ws, "row_count", 0) or 0, 1000)
 
@@ -1191,14 +1443,13 @@ def _repair_drive_link_formulas(ws, tab_name: str) -> None:
 
 
 def _worksheet_has_visible_data(ws, tab_name: str) -> bool:
-    headers, _ = _TABS[tab_name]
     last_col = _internal_row_id_column_letter(tab_name)
     try:
         rows = _get_range_values(ws, f"A3:{last_col}")
     except Exception:
         return False
 
-    visible_cols = len(headers)
+    visible_cols = _visible_header_count(tab_name)
     for row in rows:
         if any(str(cell or "").strip() for cell in row[:visible_cols]):
             return True
@@ -1245,7 +1496,6 @@ def _is_ignored_orphan_title(title: str) -> bool:
 
 
 def _backfill_internal_row_ids(ws, tab_name: str) -> int:
-    headers, _ = _TABS[tab_name]
     hidden_col = _internal_row_id_column_letter(tab_name)
     last_col = hidden_col
     try:
@@ -1254,7 +1504,7 @@ def _backfill_internal_row_ids(ws, tab_name: str) -> int:
         return 0
 
     repaired = 0
-    visible_cols = len(headers)
+    visible_cols = _visible_header_count(tab_name)
     for row_number, row in enumerate(rows, start=3):
         visible_values = row[:visible_cols]
         hidden_value = str(row[visible_cols]).strip() if len(row) > visible_cols else ""
@@ -1274,23 +1524,23 @@ def _backfill_internal_row_ids(ws, tab_name: str) -> int:
 
 
 def _legacy_header_variant(expected_headers: list[str]) -> list[str]:
-    return ["📎 Belge" if header == "Belge" else header for header in expected_headers]
+    return list(expected_headers)
 
 
 def _tab_headers_match(ws, tab_name: str) -> bool:
-    expected_headers, _ = _TABS[tab_name]
+    expected_headers = _headers(tab_name)
     actual_headers = _row_values(ws, 1)[: len(expected_headers)]
     return actual_headers == expected_headers
 
 
 def _tab_headers_can_migrate_in_place(ws, tab_name: str) -> bool:
-    expected_headers, _ = _TABS[tab_name]
+    expected_headers = _headers(tab_name)
     actual_headers = _row_values(ws, 1)[: len(expected_headers)]
     return actual_headers == _legacy_header_variant(expected_headers)
 
 
 def _tab_total_row_is_valid(ws, tab_name: str) -> bool:
-    headers, _ = _TABS[tab_name]
+    headers = _headers(tab_name)
     last_col = _col_letter(len(headers) - 1)
     try:
         rows = _get_range_values(ws, f"A2:{last_col}2", value_render_option="FORMULA")
@@ -1305,7 +1555,10 @@ def _tab_total_row_is_valid(ws, tab_name: str) -> bool:
     if not total_formula:
         return True
 
-    total_col_idx = ord(_TAB_TOTAL_COLUMNS[tab_name]) - ord("A")
+    total_header = _tab_spec(tab_name).total_header or ""
+    total_col_idx = _header_index(tab_name, total_header)
+    if total_col_idx is None:
+        return True
     actual_formula = str(row[total_col_idx]).strip() if len(row) > total_col_idx else ""
     return actual_formula == total_formula
 
@@ -1437,14 +1690,13 @@ def _audit_data_tab(sh, tab_name: str, findings: list[dict[str, object]], *, rep
             "count": repaired_row_ids,
         })
     elif not repair:
-        headers, _ = _TABS[tab_name]
         hidden_col = _internal_row_id_column_letter(tab_name)
         try:
             rows = _get_range_values(ws, f"A3:{hidden_col}")
         except Exception:
             rows = []
         missing_count = 0
-        visible_cols = len(headers)
+        visible_cols = _visible_header_count(tab_name)
         for row in rows:
             visible_values = row[:visible_cols]
             hidden_value = str(row[visible_cols]).strip() if len(row) > visible_cols else ""
@@ -1526,7 +1778,7 @@ def audit_current_month_spreadsheet(
 
 
 def recommended_audit_tabs_for_test_drift(*, action: str, tab_name: str | None = None) -> list[str]:
-    target_tab = tab_name or "🧾 Faturalar"
+    target_tab = tab_name or "Faturalar"
     if action == "delete_summary_tab":
         return ["📊 Özet"]
     if action == "rename_data_tab":
@@ -1552,7 +1804,7 @@ def apply_test_drift(
 
     with _lock:
         sh = _open_spreadsheet_by_key(client, spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
-        target_tab = tab_name or "🧾 Faturalar"
+        target_tab = tab_name or "Faturalar"
 
         if action == "delete_summary_tab":
             ws = _get_worksheet(sh, "📊 Özet")
@@ -1567,14 +1819,16 @@ def apply_test_drift(
 
         if action == "corrupt_total_row":
             ws = _get_worksheet(sh, target_tab)
-            total_col = _TAB_TOTAL_COLUMNS[target_tab]
+            total_col = _tab_total_column_letter(target_tab)
+            if not total_col:
+                raise RuntimeError(f"No total column configured for {target_tab}")
             ws.update([["BROKEN"]], "A2", value_input_option="RAW")
             ws.update([[""]], f"{total_col}2", value_input_option="RAW")
             return {"spreadsheet_id": sh.id, "action": action, "applied": True, "tab_name": target_tab}
 
         if action == "corrupt_header_row":
             ws = _get_worksheet(sh, target_tab)
-            headers = list(_TABS[target_tab][0])
+            headers = list(_headers(target_tab))
             headers[0] = "BROKEN"
             ws.update([headers], "A1", value_input_option="RAW")
             return {"spreadsheet_id": sh.id, "action": action, "applied": True, "tab_name": target_tab}
@@ -1685,8 +1939,8 @@ def _create_and_setup_spreadsheet(client, title: str) -> str:
     default_ws.update_title("📊 Özet")
 
     # Create data tabs FIRST so Özet formulas can reference them
-    for tab_name in list(_TABS.keys())[1:]:
-        headers, _ = _TABS[tab_name]
+    for tab_name in [name for name in _TABS if name != "📊 Özet"]:
+        headers = _headers(tab_name)
         ws = sh.add_worksheet(
             title=tab_name,
             rows=1000,
@@ -1718,47 +1972,33 @@ def _create_and_setup_spreadsheet(client, title: str) -> str:
 
 
 def _monthly_tab_name(base_name: str) -> str:
-    """Return month-prefixed tab name, e.g. 'Nisan 2026 — 🧾 Faturalar'."""
-    return f"{_month_label()} — {base_name}"
+    """Return month-prefixed tab name using the canonical base title."""
+    return f"{_month_label()} — {_canonical_tab_name(base_name)}"
 
 
 def _ensure_tab_exists(sh, tab_name: str, base_name: str | None = None, *, lightweight: bool = False):
-    """
-    Return the worksheet for tab_name, creating it if missing.
-
-    base_name: the canonical tab name from _TABS used for formatting/headers
-               (e.g. '🧾 Faturalar' when tab_name is 'Nisan 2026 — 🧾 Faturalar').
-               If None, tab_name itself is used as the lookup key.
-
-    Also handles backwards-compat: if a plain-name version exists (no emoji),
-    it is automatically renamed to the emoji version (only for non-monthly tabs).
-    """
+    """Return the canonical worksheet for *tab_name*, creating or renaming it if needed."""
     import gspread
 
-    # 1. Try exact name
+    canonical_title = _canonical_tab_name(tab_name)
+    lookup = _canonical_tab_name(base_name or canonical_title)
+
     try:
-        return sh.worksheet(tab_name)
+        ws = _get_worksheet(sh, canonical_title)
+        if ws.title != canonical_title and not _is_ignored_orphan_title(ws.title):
+            try:
+                ws.update_title(canonical_title)
+                logger.info("Renamed tab '%s' → '%s'", ws.title, canonical_title)
+            except Exception as exc:
+                logger.warning("Could not rename tab '%s' to '%s': %s", ws.title, canonical_title, exc)
+        return ws
     except gspread.WorksheetNotFound:
         pass
 
-    # 2. Try plain (no-emoji) version and rename — only for non-monthly tabs
-    if base_name is None:
-        plain = tab_name.split(" ", 1)[-1] if " " in tab_name else tab_name
-        if plain != tab_name:
-            try:
-                ws = sh.worksheet(plain)
-                ws.update_title(tab_name)
-                logger.info("Renamed tab '%s' → '%s'", plain, tab_name)
-                return ws
-            except gspread.WorksheetNotFound:
-                pass
-
-    # 3. Create new tab
-    logger.info("Tab '%s' not found; creating it.", tab_name)
-    lookup = base_name or tab_name
-    headers, _ = _TABS.get(lookup, ([], {}))
+    logger.info("Tab '%s' not found; creating it.", canonical_title)
+    headers = _headers(lookup) if lookup in _TABS else []
     ws = sh.add_worksheet(
-        title=tab_name,
+        title=canonical_title,
         rows=1000,
         cols=max(len(headers) + 2, 10),
     )
@@ -1972,8 +2212,8 @@ def _bootstrap_spreadsheet_tabs(sh) -> None:
         ozet_ws.update_title("📊 Özet")
 
         # 2. Create ALL data tabs first (so formula references will work)
-        for tab_name in list(_TABS.keys())[1:]:
-            headers, _ = _TABS[tab_name]
+        for tab_name in [name for name in _TABS if name != "📊 Özet"]:
+            headers = _headers(tab_name)
             new_ws = sh.add_worksheet(title=tab_name, rows=1000, cols=len(headers) + 2)
             _setup_worksheet(new_ws, tab_name, lightweight=True)
 
@@ -1998,13 +2238,11 @@ def _safe(v):
 
 
 def _drive_column_letter(tab_name: str) -> str:
-    headers, _ = _TABS[tab_name]
-    return _col_letter(len(headers) - 1)
+    return _header_letter(tab_name, _HIDDEN_DRIVE_LINK_HEADER) or _col_letter(len(_headers(tab_name)) - 1)
 
 
 def _internal_row_id_column_letter(tab_name: str) -> str:
-    headers, _ = _TABS[tab_name]
-    return _col_letter(len(headers))
+    return _header_letter(tab_name, _HIDDEN_ROW_ID_HEADER) or _col_letter(len(_headers(tab_name)))
 
 
 def _drive_cell(drive_link: Optional[str]) -> str:
@@ -2045,128 +2283,603 @@ def _sender_display_name(record: BillRecord) -> str:
     return ""
 
 
-def _build_row(
-    record: BillRecord,
-    category: DocumentCategory,
-    seq: int,
-    drive_link: Optional[str] = None,
-    *,
-    return_source_category: DocumentCategory | None = None,
-) -> list:
-    r = record
+def _document_reference(record: BillRecord) -> str:
+    return str(record.invoice_number or record.document_number or record.receipt_number or record.cheque_serial_number or "")
 
+
+def _document_source_id(record: BillRecord, row_id: str) -> str:
+    return str(row_id)
+
+
+def _primary_amount(record: BillRecord) -> float | None:
+    for value in (record.payable_amount, record.total_amount, record.subtotal, record.line_amount):
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _is_return_record(record: BillRecord, category: DocumentCategory, return_source_category: DocumentCategory | None = None) -> bool:
+    if category == DocumentCategory.IADE or return_source_category is not None:
+        return True
+    haystack = " ".join(
+        str(part or "")
+        for part in (record.invoice_type, record.description, record.notes, record.document_number, record.invoice_number)
+    ).casefold()
+    return "iade" in haystack or "iptal" in haystack
+
+
+def _signed_amount(record: BillRecord, category: DocumentCategory, return_source_category: DocumentCategory | None = None) -> float | None:
+    amount = _primary_amount(record)
+    if amount is None:
+        return None
+    return -abs(amount) if _is_return_record(record, category, return_source_category) else amount
+
+
+def _is_directly_settled(record: BillRecord, category: DocumentCategory) -> bool:
+    if category in {DocumentCategory.HARCAMA_FISI, DocumentCategory.ELDEN_ODEME}:
+        return True
+    payment_method = str(record.payment_method or "").strip().casefold()
+    return payment_method in {"nakit", "kredi karti", "kredi kartı", "banka transferi"}
+
+
+def _counterparty_name(record: BillRecord, category: DocumentCategory) -> str:
     if category == DocumentCategory.FATURA:
-        return [
-            seq,
-            _safe(r.document_date), _safe(r.document_time),
-            _safe(r.company_name), _safe(r.tax_number), _safe(r.tax_office),
-            _safe(r.invoice_number or r.document_number),
-            _safe(r.subtotal), _safe(r.vat_rate), _safe(r.vat_amount),
-            _safe(r.total_amount),
-            _safe(r.payment_method), _safe(r.expense_category),
-            _safe(r.description), _safe(r.notes),
-            _drive_cell(drive_link),
-        ]
-
-    if category == DocumentCategory.ODEME_DEKONTU:
-        return [
-            seq,
-            _safe(r.document_date), _safe(r.document_time),
-            _safe(r.company_name),
-            _safe(r.document_number or r.invoice_number),
-            _sender_display_name(r),
-            _safe(r.description),
-            _safe(r.total_amount),
-            _safe(r.currency or "TRY"),
-            _safe(r.notes),
-            _drive_cell(drive_link),
-        ]
-
-    if category == DocumentCategory.HARCAMA_FISI:
-        import re
-        plaka = ""
-        if r.notes:
-            m = re.search(r"[Pp]laka[:\s]+([A-Z0-9]+)", r.notes or "")
-            if m:
-                plaka = m.group(1)
-        return [
-            seq,
-            _safe(r.document_date), _safe(r.document_time),
-            _safe(r.company_name),
-            _safe(r.receipt_number or r.document_number),
-            _safe(r.tax_number),
-            _safe(r.subtotal), _safe(r.vat_rate), _safe(r.vat_amount),
-            _safe(r.total_amount),
-            _safe(r.payment_method), _safe(r.expense_category),
-            _safe(r.description),
-            plaka,
-            _drive_cell(drive_link),
-        ]
-
-    if category == DocumentCategory.CEK:
-        return [
-            seq,
-            _safe(r.document_number or r.receipt_number),
-            _safe(r.company_name), _safe(r.tax_number),
-            _safe(r.notes),
-            _safe(r.document_date),
-            _safe(r.total_amount),
-            _safe(r.currency or "TRY"),
-            _safe(r.description),
-            _drive_cell(drive_link),
-        ]
-
+        return str(record.company_name or record.recipient_name or record.buyer_name or _sender_display_name(record) or "")
     if category == DocumentCategory.ELDEN_ODEME:
+        return str(record.recipient_name or record.buyer_name or record.company_name or record.description or "")
+    if category == DocumentCategory.ODEME_DEKONTU:
+        return str(record.recipient_name or record.buyer_name or record.company_name or _sender_display_name(record) or "")
+    if category == DocumentCategory.CEK:
+        return str(record.recipient_name or record.notes or record.company_name or "")
+    return str(record.recipient_name or record.company_name or record.buyer_name or _sender_display_name(record) or "")
+
+
+def _party_key(record: BillRecord, *, role: str) -> str:
+    return ledger.derive_party_key(record.model_dump(mode="json"), role=role)
+
+
+def _withholding_label(record: BillRecord) -> str:
+    if record.withholding_present is True or record.withholding_amount not in (None, 0):
+        if record.withholding_rate not in (None, 0):
+            return f"EVET (%{_safe(record.withholding_rate)})"
+        return "EVET"
+    if record.withholding_present is False:
+        return "HAYIR"
+    return ""
+
+
+def _iter_invoice_line_items(record: BillRecord) -> list[dict[str, object]]:
+    line_items = record.line_items or []
+    rows: list[dict[str, object]] = []
+    for item in line_items:
+        if item is None:
+            continue
+        data = item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
+        rows.append(data)
+    if rows:
+        return rows
+    if any(value is not None for value in (record.line_quantity, record.line_unit, record.unit_price, record.line_amount, record.description)):
+        rows.append({
+            "description": record.description,
+            "quantity": record.line_quantity,
+            "unit": record.line_unit,
+            "unit_price": record.unit_price,
+            "line_amount": record.line_amount or record.subtotal,
+        })
+    return rows
+
+
+def _masraf_paid_formula(row_number: int) -> str:
+    sep = _formula_arg_separator()
+    settled_ref = f"{_header_letter('Masraf Kayıtları', _HIDDEN_SETTLED_AMOUNT_HEADER)}{row_number}"
+    row_id_ref = f"{_header_letter('Masraf Kayıtları', _HIDDEN_ROW_ID_HEADER)}{row_number}"
+    debt_col = _header_letter('__Ödeme_Dağıtımları', 'Borç Row ID')
+    amount_col = _header_letter('__Ödeme_Dağıtımları', 'Ayrılan Tutar')
+    return (
+        f"=IFERROR({settled_ref}{sep}0)+"
+        f"IFERROR(SUMIF('__Ödeme_Dağıtımları'!{debt_col}:{debt_col}{sep}{row_id_ref}{sep}'__Ödeme_Dağıtımları'!{amount_col}:{amount_col}){sep}0)"
+    )
+
+
+def _masraf_remaining_formula(row_number: int) -> str:
+    sep = _formula_arg_separator()
+    balance_ref = f"{_header_letter('Masraf Kayıtları', 'Bakiye (TL)')}{row_number}"
+    paid_ref = f"{_header_letter('Masraf Kayıtları', 'Ödenen (TL)')}{row_number}"
+    return f"=IFERROR({balance_ref}-{paid_ref}{sep}0)"
+
+
+def _build_row_for_tab(
+    record: BillRecord,
+    tab_name: str,
+    *,
+    category: DocumentCategory,
+    row_id: str,
+    row_number: int,
+    drive_link: Optional[str] = None,
+    return_source_category: DocumentCategory | None = None,
+    source_doc_id: str | None = None,
+) -> list:
+    source_doc_id = source_doc_id or _document_source_id(record, row_id)
+    tax_number = str(record.tax_number or "")
+    drive_value = _drive_cell(drive_link)
+
+    if tab_name == 'Faturalar':
         return [
-            seq,
-            _safe(r.document_date), _safe(r.document_time),
-            _safe(r.description),
-            _safe(r.total_amount),
-            _safe(r.currency or "TRY"),
-            _safe(r.source_sender_id),
-            _drive_cell(drive_link),
+            _safe(record.invoice_number or record.document_number),
+            _safe(record.document_date),
+            _safe(record.invoice_type or (_return_source_label(return_source_category) if _is_return_record(record, category, return_source_category) else 'Fatura')),
+            _safe(record.company_name),
+            _safe(record.tax_number),
+            _safe(record.buyer_name or record.recipient_name),
+            _safe(record.description),
+            _safe(record.line_quantity),
+            _safe(record.unit_price),
+            _safe(record.subtotal if record.subtotal is not None else record.line_amount),
+            _safe(record.vat_rate),
+            _safe(record.vat_amount),
+            _withholding_label(record),
+            _safe(record.withholding_amount),
+            _safe(record.payable_amount if record.payable_amount is not None else record.total_amount),
+            _safe(record.iban),
+            _safe(record.bank_name),
+            drive_value,
+            row_id,
+            _party_key(record, role='debt'),
+            source_doc_id,
+            tax_number,
+            'fatura',
         ]
 
-    if category == DocumentCategory.MALZEME:
+    if tab_name == 'Masraf Kayıtları':
+        signed_amount = _signed_amount(record, category, return_source_category)
+        settled_amount = signed_amount if (signed_amount is not None and _is_directly_settled(record, category) and not _is_return_record(record, category, return_source_category)) else 0
         return [
-            seq,
-            _safe(r.document_date),
-            _safe(r.company_name),
-            _safe(r.document_number or r.receipt_number),
-            _safe(r.description),
-            "", "",
-            _safe(r.notes),
-            "",
-            _safe(r.total_amount),
-            _safe(r.expense_category),
-            _drive_cell(drive_link),
+            _safe(record.document_date),
+            _safe(record.expense_category or record.invoice_type or _return_source_label(return_source_category or category)),
+            _safe(_counterparty_name(record, category)),
+            _safe(record.description or record.notes),
+            _safe(_document_reference(record)),
+            _safe(signed_amount),
+            _masraf_paid_formula(row_number),
+            _masraf_remaining_formula(row_number),
+            drive_value,
+            row_id,
+            _party_key(record, role='debt'),
+            source_doc_id,
+            tax_number,
+            category.value,
+            _safe(settled_amount),
         ]
 
-    if category == DocumentCategory.IADE:
+    if tab_name == 'Sevk Fişleri':
         return [
-            seq,
-            _safe(r.document_date),
-            _return_source_label(return_source_category),
-            _safe(r.company_name),
-            _safe(r.document_number or r.invoice_number),
-            _safe(r.total_amount),
-            _safe(r.currency or "TRY"),
-            _safe(r.description),
-            _drive_cell(drive_link),
+            _safe(record.document_number or record.receipt_number),
+            _safe(record.document_date),
+            _safe(record.recipient_name or record.buyer_name),
+            _safe(record.description),
+            _safe(record.pallet_count),
+            _safe(record.items_per_pallet),
+            _safe(record.product_quantity or record.line_quantity),
+            _safe(record.vehicle_plate),
+            _safe(record.company_name),
+            _safe(record.shipment_origin),
+            _safe(record.shipment_destination),
+            drive_value,
+            row_id,
+            _party_key(record, role='debt'),
+            source_doc_id,
+            tax_number,
+            category.value,
         ]
 
-    # BELIRSIZ → Faturalar fallback
+    if tab_name == '__Raw Belgeler':
+        return [
+            source_doc_id,
+            category.value,
+            'EVET' if _is_return_record(record, category, return_source_category) else 'HAYIR',
+            _safe(record.company_name),
+            _safe(record.tax_number),
+            _safe(record.document_number),
+            _safe(record.invoice_number),
+            _safe(record.receipt_number),
+            _safe(record.document_date),
+            _safe(record.document_time),
+            _safe(_primary_amount(record)),
+            _safe(record.currency or 'TRY'),
+            _safe(_sender_display_name(record)),
+            _safe(record.recipient_name or record.buyer_name),
+            _safe(record.description),
+            _safe(record.notes),
+            _safe(record.iban),
+            _safe(record.bank_name or record.cheque_bank_name),
+            _safe(record.source_message_id),
+            drive_value,
+            row_id,
+        ]
+
+    if tab_name == '__Çek_Dekont_Detay':
+        return [
+            source_doc_id,
+            category.value,
+            _safe(record.company_name),
+            _safe(_sender_display_name(record)),
+            _safe(record.recipient_name or record.buyer_name),
+            _safe(record.document_number or record.invoice_number),
+            _safe(record.iban or record.cheque_account_ref),
+            _safe(record.bank_name or record.cheque_bank_name),
+            _safe(record.cheque_serial_number or record.document_number),
+            _safe(record.cheque_bank_name),
+            _safe(record.cheque_branch),
+            _safe(record.cheque_account_ref),
+            _safe(record.cheque_issue_place),
+            _safe(record.cheque_issue_date),
+            _safe(record.cheque_due_date or record.document_date),
+            _safe(record.description or record.notes),
+            drive_value,
+            row_id,
+        ]
+
+    raise KeyError(f'Unsupported row build for tab: {tab_name}')
+
+
+def _build_invoice_line_rows(record: BillRecord, *, row_id_prefix: str, source_doc_id: str | None = None) -> list[list]:
+    source_doc_id = source_doc_id or _document_source_id(record, row_id_prefix)
+    rows: list[list] = []
+    for index, item in enumerate(_iter_invoice_line_items(record), start=1):
+        rows.append([
+            source_doc_id,
+            index,
+            _safe(item.get('description')),
+            _safe(item.get('quantity')),
+            _safe(item.get('unit')),
+            _safe(item.get('unit_price')),
+            _safe(item.get('line_amount')),
+            f'{row_id_prefix}__line{index}',
+        ])
+    return rows
+
+
+def _build_payment_allocation_row(
+    *,
+    party_name: str,
+    description: str,
+    debt_date: str,
+    debt_total: float | int | str | None,
+    payment_amount: float | int | str | None,
+    payment_date: str,
+    remaining_balance: float | int | str | None,
+    status: str,
+    drive_link: Optional[str],
+    row_id: str,
+    party_key: str,
+    source_doc_id: str,
+    debt_row_id: str,
+    tax_number: str = '',
+    allocation_id: str = '',
+) -> list:
     return [
-        seq,
-        _safe(r.document_date), _safe(r.document_time),
-        _safe(r.company_name), _safe(r.tax_number), _safe(r.tax_office),
-        _safe(r.invoice_number or r.document_number),
-        _safe(r.subtotal), _safe(r.vat_rate), _safe(r.vat_amount),
-        _safe(r.total_amount),
-        _safe(r.payment_method), _safe(r.expense_category),
-        _safe(r.description), _safe(r.notes),
+        _safe(party_name),
+        _safe(description),
+        _safe(debt_date),
+        _safe(debt_total),
+        _safe(payment_amount),
+        _safe(payment_date),
+        _safe(remaining_balance),
+        _safe(status),
         _drive_cell(drive_link),
+        row_id,
+        _safe(party_key),
+        _safe(source_doc_id),
+        _safe(source_doc_id),
+        _safe(debt_row_id),
+        _safe(allocation_id),
+        _safe(tax_number),
+        'odeme',
     ]
+
+
+def _build_allocation_detail_row(
+    *,
+    allocation_id: str,
+    party_key: str,
+    debt_row_id: str,
+    payment_doc_id: str,
+    payment_date: str,
+    debt_date: str,
+    debt_amount: float | int | str | None,
+    allocated_amount: float | int | str | None,
+    remaining_amount: float | int | str | None,
+    status: str,
+) -> list:
+    return [
+        allocation_id,
+        _safe(party_key),
+        _safe(debt_row_id),
+        _safe(payment_doc_id),
+        _safe(payment_date),
+        _safe(debt_date),
+        _safe(debt_amount),
+        _safe(allocated_amount),
+        _safe(remaining_amount),
+        _safe(status),
+        allocation_id,
+    ]
+
+def _worksheet_rows_as_dicts(ws, tab_name: str, *, value_render_option: str | None = None) -> list[dict[str, object]]:
+    last_col = _internal_row_id_column_letter(tab_name)
+    try:
+        rows = _get_range_values(ws, f"A3:{last_col}", value_render_option=value_render_option)
+    except Exception:
+        return []
+
+    headers = _headers(tab_name)
+    visible_count = _visible_header_count(tab_name)
+    result: list[dict[str, object]] = []
+    for row in rows:
+        padded = list(row) + [""] * max(0, len(headers) - len(row))
+        if not any(str(cell or "").strip() for cell in padded[:visible_count]):
+            continue
+        result.append({headers[idx]: padded[idx] if idx < len(padded) else "" for idx in range(len(headers))})
+    return result
+
+
+def _split_aliases(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (list, tuple, set)):
+        parts = [str(item).strip() for item in value if str(item or '').strip()]
+    else:
+        parts = [part.strip() for part in str(value).split(',') if part.strip()]
+    seen: list[str] = []
+    for part in parts:
+        if part not in seen:
+            seen.append(part)
+    return tuple(seen)
+
+
+def _load_party_card_map(sh) -> dict[str, dict[str, object]]:
+    ws = _ensure_tab_exists(sh, '__Cari_Kartlar', lightweight=True)
+    rows = _worksheet_rows_as_dicts(ws, '__Cari_Kartlar')
+    result: dict[str, dict[str, object]] = {}
+    for row in rows:
+        party_key = str(row.get('Party Key') or '').strip()
+        if not party_key:
+            continue
+        result[party_key] = {
+            'display_name': str(row.get('Görünen Ad') or '').strip(),
+            'tax_number': str(row.get('Vergi No') or '').strip(),
+            'aliases': _split_aliases(row.get('Aliaslar')),
+        }
+    return result
+
+
+def _party_card_row(*, party_key: str, display_name: str, tax_number: str = '', aliases: tuple[str, ...] = ()) -> list:
+    return [party_key, display_name, tax_number, ', '.join(alias for alias in aliases if alias), party_key]
+
+
+def _upsert_party_cards(sh, cards: list[dict[str, object]]) -> None:
+    if not cards:
+        return
+    ws = _ensure_tab_exists(sh, '__Cari_Kartlar', lightweight=True)
+    existing = _load_party_card_map(sh)
+    rows_to_append: list[list] = []
+    for card in cards:
+        party_key = str(card.get('party_key') or '').strip()
+        display_name = str(card.get('display_name') or '').strip()
+        if not party_key or not display_name or party_key in existing:
+            continue
+        rows_to_append.append(_party_card_row(
+            party_key=party_key,
+            display_name=display_name,
+            tax_number=str(card.get('tax_number') or '').strip(),
+            aliases=_split_aliases(card.get('aliases')),
+        ))
+        existing[party_key] = card
+    if rows_to_append:
+        _retry_on_rate_limit(lambda: ws.append_rows(rows_to_append, value_input_option='USER_ENTERED'))
+
+
+def _load_expense_debt_state(sh) -> list[dict[str, object]]:
+    ws = _ensure_tab_exists(sh, 'Masraf Kayıtları', lightweight=True)
+    rows = _worksheet_rows_as_dicts(ws, 'Masraf Kayıtları', value_render_option='UNFORMATTED_VALUE')
+    cards = _load_party_card_map(sh)
+    result: list[dict[str, object]] = []
+    for index, row in enumerate(rows):
+        row_id = str(row.get(_HIDDEN_ROW_ID_HEADER) or '').strip()
+        if not row_id:
+            continue
+        party_key = str(row.get(_HIDDEN_PARTY_KEY_HEADER) or '').strip()
+        display_name = str(row.get('Alıcı / Tedarikçi') or '').strip()
+        tax_number = str(row.get(_HIDDEN_TAX_NUMBER_HEADER) or '').strip()
+        aliases = cards.get(party_key, {}).get('aliases', ()) if party_key else ()
+        try:
+            original_amount = float(row.get('Bakiye (TL)') or 0)
+        except Exception:
+            original_amount = 0.0
+        try:
+            remaining_amount = float(row.get('Kalan Borç (TL)') or 0)
+        except Exception:
+            remaining_amount = 0.0
+        result.append({
+            'row_id': row_id,
+            'party_key': party_key or f'row:{row_id}',
+            'display_name': display_name,
+            'tax_number': tax_number,
+            'date': str(row.get('Tarih') or '').strip(),
+            'original_amount': original_amount,
+            'remaining_amount': remaining_amount,
+            'aliases': aliases,
+            'sort_index': index,
+        })
+    return result
+
+
+def _payment_matching_rows(debt_state: list[dict[str, object]]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for debt in debt_state:
+        rows.append({
+            'row_id': debt['row_id'],
+            'party_key': debt['party_key'],
+            'company_name': debt['display_name'],
+            'recipient_name': debt['display_name'],
+            'tax_number': debt['tax_number'],
+            'aliases': debt.get('aliases', ()),
+            'amount': debt['remaining_amount'],
+            'date': debt['date'],
+        })
+    return rows
+
+
+def _allocation_status(remaining_amount: float, allocated_amount: float) -> str:
+    if allocated_amount <= 0:
+        return ledger.STATUS_ACIK
+    if remaining_amount <= 0:
+        return ledger.STATUS_KAPANDI
+    return ledger.STATUS_KISMI
+
+
+def _build_payment_projection_rows(
+    *,
+    record: BillRecord,
+    item_id: str,
+    debt_state: list[dict[str, object]],
+    drive_link: Optional[str],
+) -> tuple[list[list], list[list], list[dict[str, object]]]:
+    source_doc_id = item_id
+    amount = float(_primary_amount(record) or 0)
+    payment_date = str(record.document_date or record.cheque_due_date or record.cheque_issue_date or '')
+    description = str(record.description or record.notes or _document_reference(record) or '')
+    payment_party_name = _counterparty_name(record, DocumentCategory.ODEME_DEKONTU)
+    payment_tax_number = str(record.tax_number or '')
+    matching_rows = _payment_matching_rows(debt_state)
+    match = ledger.match_payment_party(record.model_dump(mode='json'), matching_rows)
+
+    visible_rows: list[list] = []
+    allocation_rows: list[list] = []
+    party_cards: list[dict[str, object]] = []
+
+    if match.party_key:
+        matched_display_name = match.display_name or payment_party_name
+        party_cards.append({
+            'party_key': match.party_key,
+            'display_name': matched_display_name,
+            'tax_number': match.tax_number or payment_tax_number,
+            'aliases': tuple(filter(None, [payment_party_name])),
+        })
+    else:
+        matched_display_name = payment_party_name
+
+    remaining_payment = amount
+    allocation_index = 0
+
+    if match.party_key:
+        party_debts = [
+            debt for debt in debt_state
+            if debt['party_key'] == match.party_key and float(debt['remaining_amount']) > 0
+        ]
+        party_debts.sort(key=lambda debt: (str(debt.get('date') or ''), int(debt.get('sort_index') or 0)))
+
+        for debt in party_debts:
+            if remaining_payment <= 0:
+                break
+            open_amount = float(debt['remaining_amount'])
+            if open_amount <= 0:
+                continue
+            applied = min(open_amount, remaining_payment)
+            if applied <= 0:
+                continue
+            allocation_index += 1
+            debt['remaining_amount'] = round(open_amount - applied, 2)
+            remaining_payment = round(remaining_payment - applied, 2)
+            allocation_id = f"{item_id}__alloc{allocation_index}"
+            visible_row_id = f"{item_id}__row{allocation_index}"
+            status = _allocation_status(float(debt['remaining_amount']), applied)
+            visible_rows.append(_build_payment_allocation_row(
+                party_name=matched_display_name,
+                description=description,
+                debt_date=str(debt.get('date') or ''),
+                debt_total=debt.get('original_amount'),
+                payment_amount=applied,
+                payment_date=payment_date,
+                remaining_balance=debt.get('remaining_amount'),
+                status=status,
+                drive_link=drive_link,
+                row_id=visible_row_id,
+                party_key=match.party_key,
+                source_doc_id=source_doc_id,
+                debt_row_id=str(debt.get('row_id') or ''),
+                tax_number=str(debt.get('tax_number') or payment_tax_number or ''),
+                allocation_id=allocation_id,
+            ))
+            allocation_rows.append(_build_allocation_detail_row(
+                allocation_id=allocation_id,
+                party_key=match.party_key,
+                debt_row_id=str(debt.get('row_id') or ''),
+                payment_doc_id=source_doc_id,
+                payment_date=payment_date,
+                debt_date=str(debt.get('date') or ''),
+                debt_amount=debt.get('original_amount'),
+                allocated_amount=applied,
+                remaining_amount=debt.get('remaining_amount'),
+                status=status,
+            ))
+
+    if not match.party_key:
+        visible_rows.append(_build_payment_allocation_row(
+            party_name=matched_display_name,
+            description=description,
+            debt_date='',
+            debt_total='',
+            payment_amount=amount,
+            payment_date=payment_date,
+            remaining_balance=amount,
+            status=ledger.STATUS_ESLESMEDI,
+            drive_link=drive_link,
+            row_id=f'{item_id}__row1',
+            party_key='',
+            source_doc_id=source_doc_id,
+            debt_row_id='',
+            tax_number=payment_tax_number,
+            allocation_id=f'{item_id}__alloc0',
+        ))
+    elif allocation_index == 0:
+        visible_rows.append(_build_payment_allocation_row(
+            party_name=matched_display_name,
+            description=description,
+            debt_date='',
+            debt_total='',
+            payment_amount=amount,
+            payment_date=payment_date,
+            remaining_balance=amount,
+            status=ledger.STATUS_BORC_YOK,
+            drive_link=drive_link,
+            row_id=f'{item_id}__row1',
+            party_key=match.party_key,
+            source_doc_id=source_doc_id,
+            debt_row_id='',
+            tax_number=match.tax_number or payment_tax_number,
+            allocation_id=f'{item_id}__alloc0',
+        ))
+    elif remaining_payment > 0:
+        visible_rows.append(_build_payment_allocation_row(
+            party_name=matched_display_name,
+            description=description,
+            debt_date='',
+            debt_total='',
+            payment_amount=remaining_payment,
+            payment_date=payment_date,
+            remaining_balance=remaining_payment,
+            status=ledger.STATUS_FAZLA_ODEME,
+            drive_link=drive_link,
+            row_id=f'{item_id}__row{allocation_index + 1}',
+            party_key=match.party_key,
+            source_doc_id=source_doc_id,
+            debt_row_id='',
+            tax_number=match.tax_number or payment_tax_number,
+            allocation_id=f'{item_id}__alloc{allocation_index + 1}',
+        ))
+
+    return visible_rows, allocation_rows, party_cards
 
 
 def reset_current_month_spreadsheet_data(*, spreadsheet_id: Optional[str] = None) -> int:
@@ -2223,7 +2936,7 @@ def _build_drive_link_target(
 ) -> dict[str, str | int]:
     target: dict[str, str | int] = {
         "spreadsheet_id": str(spreadsheet_id),
-        "tab_name": tab_name,
+        "tab_name": _canonical_tab_name(tab_name),
         "row_number": int(row_number),
     }
     normalized_row_id = (row_id or "").strip()
@@ -2254,7 +2967,10 @@ def _load_pending_drive_uploads() -> list[dict]:
             tab_name = str(target.get("tab_name") or "")
             if tab_name in _LEGACY_IADE_TITLES or _is_ignored_orphan_title(tab_name):
                 continue
-            targets.append(target)
+            normalized_target = _normalize_drive_link_target(target)
+            if _is_ignored_orphan_title(str(normalized_target.get("tab_name") or "")):
+                continue
+            targets.append(normalized_target)
         if not targets:
             continue
         normalized_item = dict(item)
@@ -2273,7 +2989,7 @@ def _save_pending_drive_uploads(items: list[dict]) -> None:
 def _normalize_drive_link_target(target: dict[str, str | int]) -> dict[str, str | int]:
     normalized: dict[str, str | int] = {
         "spreadsheet_id": str(target["spreadsheet_id"]),
-        "tab_name": str(target["tab_name"]),
+        "tab_name": _canonical_tab_name(str(target["tab_name"])),
         "row_number": int(target["row_number"]),
     }
     row_id = str(target.get("row_id") or "").strip()
@@ -2284,7 +3000,7 @@ def _normalize_drive_link_target(target: dict[str, str | int]) -> dict[str, str 
 
 def _drive_link_target_key(target: dict[str, str | int]) -> tuple[str, str, str, str | int]:
     spreadsheet_id = str(target.get("spreadsheet_id") or "")
-    tab_name = str(target.get("tab_name") or "")
+    tab_name = _canonical_tab_name(str(target.get("tab_name") or ""))
     row_id = str(target.get("row_id") or "").strip()
     if row_id:
         return (spreadsheet_id, tab_name, "row_id", row_id)
@@ -2292,7 +3008,7 @@ def _drive_link_target_key(target: dict[str, str | int]) -> tuple[str, str, str,
 
 
 def _resolve_drive_link_target_row_number(ws, target: dict[str, str | int]) -> int:
-    tab_name = str(target["tab_name"])
+    tab_name = _canonical_tab_name(str(target["tab_name"]))
     row_id = str(target.get("row_id") or "").strip()
     if row_id:
         resolved = _existing_row_numbers_by_pending_id(ws, tab_name, {row_id}).get(row_id)
@@ -2310,10 +3026,10 @@ def _write_drive_link_to_target(target: dict[str, str | int], drive_link: str) -
         raise RuntimeError("Google Sheets client unavailable for pending Drive link backfill.")
 
     spreadsheet_id = str(target["spreadsheet_id"])
-    tab_name = str(target["tab_name"])
+    tab_name = _canonical_tab_name(str(target["tab_name"]))
 
     sh = client.open_by_key(spreadsheet_id)
-    ws = sh.worksheet(tab_name)
+    ws = _ensure_tab_exists(sh, tab_name, lightweight=True)
     row_number = _resolve_drive_link_target_row_number(ws, target)
     cell_a1 = f"{_drive_column_letter(tab_name)}{row_number}"
 
@@ -2512,9 +3228,10 @@ def _load_pending_sheet_appends() -> list[dict]:
         if tab_name in _LEGACY_IADE_TITLES or _is_ignored_orphan_title(tab_name):
             continue
         normalized_item = dict(item)
+        normalized_item["tab_name"] = _canonical_tab_name(tab_name)
         if str(normalized_item.get("category") or "") == DocumentCategory.IADE.value:
             normalized_item["category"] = DocumentCategory.FATURA.value
-            normalized_item["tab_name"] = "🧾 Faturalar"
+            normalized_item["tab_name"] = "Faturalar"
             normalized_item["return_source_category"] = ""
         normalized_items.append(normalized_item)
     return normalized_items
@@ -2773,18 +3490,60 @@ def _existing_row_numbers_by_pending_id(ws, tab_name: str, pending_ids: set[str]
     if not pending_ids:
         return {}
 
-    column_letter = _internal_row_id_column_letter(tab_name)
+    row_id_col = _internal_row_id_column_letter(tab_name)
+    source_doc_col = _header_letter(tab_name, _HIDDEN_SOURCE_DOC_ID_HEADER)
+    range_end = source_doc_col or row_id_col
     try:
-        values = ws.get(f"{column_letter}3:{column_letter}")
+        values = ws.get(f"A3:{range_end}")
     except Exception:
         return {}
 
+    headers = _headers(tab_name)
     rows: dict[str, int] = {}
     for row_number, row in enumerate(values, start=3):
-        cell = str(row[0]).strip() if row else ""
-        if cell in pending_ids:
-            rows[cell] = row_number
+        padded = list(row) + [""] * max(0, len(headers) - len(row))
+        row_map = {headers[idx]: padded[idx] for idx in range(min(len(headers), len(padded)))}
+        for key in (
+            str(row_map.get(_HIDDEN_ROW_ID_HEADER) or '').strip(),
+            str(row_map.get(_HIDDEN_SOURCE_DOC_ID_HEADER) or '').strip(),
+        ):
+            if key in pending_ids:
+                rows[key] = row_number
     return rows
+
+
+def _existing_drive_targets_by_pending_id(
+    ws,
+    tab_name: str,
+    spreadsheet_id: str,
+    pending_ids: set[str],
+) -> dict[str, list[dict[str, str | int]]]:
+    if not pending_ids:
+        return {}
+    last_col = _internal_row_id_column_letter(tab_name)
+    try:
+        rows = ws.get(f"A3:{last_col}")
+    except Exception:
+        return {}
+
+    headers = _headers(tab_name)
+    result: dict[str, list[dict[str, str | int]]] = {pending_id: [] for pending_id in pending_ids}
+    for row_number, row in enumerate(rows, start=3):
+        padded = list(row) + [""] * max(0, len(headers) - len(row))
+        row_map = {headers[idx]: padded[idx] for idx in range(len(headers))}
+        row_id = str(row_map.get(_HIDDEN_ROW_ID_HEADER) or '').strip()
+        source_doc_id = str(row_map.get(_HIDDEN_SOURCE_DOC_ID_HEADER) or '').strip()
+        for key in (row_id, source_doc_id):
+            if key and key in pending_ids:
+                result.setdefault(key, []).append(
+                    _build_drive_link_target(
+                        spreadsheet_id=spreadsheet_id,
+                        tab_name=tab_name,
+                        row_number=row_number,
+                        row_id=row_id or key,
+                    )
+                )
+    return {key: value for key, value in result.items() if value}
 
 
 def process_pending_sheet_appends(*, max_items: int | None = None) -> int:
@@ -2818,62 +3577,144 @@ def process_pending_sheet_appends(*, max_items: int | None = None) -> int:
                 raise RuntimeError("No spreadsheet available for queued append batch.")
 
             tab_name = str(batch[0].get("tab_name") or "")
-            row_numbers: dict[str, int] = {}
+            row_targets_by_item: dict[str, list[dict[str, str | int]]] = {}
 
             with _lock:
                 sh = _open_spreadsheet_by_key(client, spreadsheet_id)
-                _audit_spreadsheet_layout(sh, repair=True, target_tabs={tab_name, "📊 Özet"})
+                audit_tabs = {tab_name, '📊 Özet'}
+                if tab_name == 'Banka Ödemeleri':
+                    audit_tabs.update({'Masraf Kayıtları', '__Ödeme_Dağıtımları', '__Cari_Kartlar'})
+                _audit_spreadsheet_layout(sh, repair=True, target_tabs=audit_tabs)
                 ws = _ensure_tab_exists(sh, tab_name)
-                existing_row_numbers = _existing_row_numbers_by_pending_id(
+
+                existing_targets = _existing_drive_targets_by_pending_id(
                     ws,
                     tab_name,
-                    {str(item.get("id") or "") for item in batch},
+                    spreadsheet_id,
+                    {str(item.get('id') or '') for item in batch},
                 )
-                row_numbers.update(existing_row_numbers)
+                row_targets_by_item.update(existing_targets)
 
                 new_items = [
                     item for item in batch
-                    if str(item.get("id") or "") not in existing_row_numbers
+                    if str(item.get('id') or '') not in existing_targets
                 ]
+
                 if new_items:
-                    start_seq = _next_seq(ws)
-                    start_row_number = len(ws.col_values(1)) + 1
-                    rows: list[list] = []
+                    if tab_name == 'Banka Ödemeleri':
+                        allocation_ws = _ensure_tab_exists(sh, '__Ödeme_Dağıtımları', lightweight=True)
+                        debt_state = _load_expense_debt_state(sh)
+                        start_row_number = len(ws.col_values(1)) + 1
+                        visible_rows: list[list] = []
+                        allocation_rows: list[list] = []
+                        party_cards: list[dict[str, object]] = []
 
-                    for index, item in enumerate(new_items):
-                        record = BillRecord.model_validate(item.get("record") or {})
-                        category = DocumentCategory(str(item.get("category") or DocumentCategory.BELIRSIZ.value))
-                        return_source_raw = str(item.get("return_source_category") or "").strip()
-                        return_source_category = DocumentCategory(return_source_raw) if return_source_raw else None
-                        rows.append(
-                            _build_row(
+                        for item in new_items:
+                            item_id = str(item.get('id') or '')
+                            record = BillRecord.model_validate(item.get('record') or {})
+                            built_visible_rows, built_allocation_rows, built_cards = _build_payment_projection_rows(
+                                record=record,
+                                item_id=item_id,
+                                debt_state=debt_state,
+                                drive_link=str(item.get('drive_link') or '') or None,
+                            )
+                            row_targets_by_item[item_id] = []
+                            row_start = start_row_number + len(visible_rows)
+                            row_id_idx = _header_index('Banka Ödemeleri', _HIDDEN_ROW_ID_HEADER)
+                            for offset, row in enumerate(built_visible_rows):
+                                row_id = str(row[row_id_idx] if row_id_idx is not None else item_id)
+                                row_targets_by_item[item_id].append(
+                                    _build_drive_link_target(
+                                        spreadsheet_id=spreadsheet_id,
+                                        tab_name='Banka Ödemeleri',
+                                        row_number=row_start + offset,
+                                        row_id=row_id,
+                                    )
+                                )
+                            visible_rows.extend(built_visible_rows)
+                            allocation_rows.extend(built_allocation_rows)
+                            party_cards.extend(built_cards)
+
+                        if visible_rows:
+                            _retry_on_rate_limit(lambda: ws.append_rows(visible_rows, value_input_option='USER_ENTERED'))
+                        if allocation_rows:
+                            _retry_on_rate_limit(lambda: allocation_ws.append_rows(allocation_rows, value_input_option='USER_ENTERED'))
+                        _upsert_party_cards(sh, party_cards)
+
+                    elif tab_name == '__Fatura Kalemleri':
+                        rows: list[list] = []
+                        for item in new_items:
+                            item_id = str(item.get('id') or '')
+                            record = BillRecord.model_validate(item.get('record') or {})
+                            row_targets_by_item[item_id] = []
+                            rows.extend(_build_invoice_line_rows(record, row_id_prefix=item_id, source_doc_id=item_id))
+                        if rows:
+                            _retry_on_rate_limit(lambda: ws.append_rows(rows, value_input_option='USER_ENTERED'))
+
+                    else:
+                        start_row_number = len(ws.col_values(1)) + 1
+                        rows: list[list] = []
+                        party_cards: list[dict[str, object]] = []
+                        row_id_idx = _header_index(tab_name, _HIDDEN_ROW_ID_HEADER)
+
+                        for item in new_items:
+                            item_id = str(item.get('id') or '')
+                            record = BillRecord.model_validate(item.get('record') or {})
+                            category = DocumentCategory(str(item.get('category') or DocumentCategory.BELIRSIZ.value))
+                            return_source_raw = str(item.get('return_source_category') or '').strip()
+                            return_source_category = DocumentCategory(return_source_raw) if return_source_raw else None
+                            row_number = start_row_number + len(rows)
+                            row = _build_row_for_tab(
                                 record,
-                                category,
-                                start_seq + index,
-                                drive_link=str(item.get("drive_link") or "") or None,
+                                tab_name,
+                                category=category,
+                                row_id=item_id,
+                                row_number=row_number,
+                                drive_link=str(item.get('drive_link') or '') or None,
                                 return_source_category=return_source_category,
-                            ) + [str(item.get("id") or "")]
-                        )
-                        row_numbers[str(item.get("id") or "")] = start_row_number + index
+                                source_doc_id=item_id,
+                            )
+                            rows.append(row)
+                            if _header_index(tab_name, _HIDDEN_DRIVE_LINK_HEADER) is not None:
+                                row_id = str(row[row_id_idx] if row_id_idx is not None else item_id)
+                                row_targets_by_item[item_id] = [
+                                    _build_drive_link_target(
+                                        spreadsheet_id=spreadsheet_id,
+                                        tab_name=tab_name,
+                                        row_number=row_number,
+                                        row_id=row_id,
+                                    )
+                                ]
+                            else:
+                                row_targets_by_item[item_id] = []
 
-                    _retry_on_rate_limit(
-                        lambda: ws.append_rows(rows, value_input_option="USER_ENTERED")
-                    )
+                            if tab_name == 'Masraf Kayıtları':
+                                party_cards.append({
+                                    'party_key': _party_key(record, role='debt'),
+                                    'display_name': _counterparty_name(record, category),
+                                    'tax_number': str(record.tax_number or ''),
+                                    'aliases': tuple(filter(None, [record.company_name, record.recipient_name, record.buyer_name, record.sender_name])),
+                                })
+
+                        if rows:
+                            _retry_on_rate_limit(lambda: ws.append_rows(rows, value_input_option='USER_ENTERED'))
+                        if party_cards:
+                            _upsert_party_cards(sh, party_cards)
 
             payloads_to_cleanup: set[str] = set()
             for item in batch:
-                item_id = str(item.get("id") or "")
-                row_number = row_numbers.get(item_id)
-                if row_number is None:
-                    raise RuntimeError(f"Queued sheet append {item_id} has no resolved row number.")
+                item_id = str(item.get('id') or '')
+                targets = row_targets_by_item.get(item_id, [])
 
-                payload_path_raw = str(item.get("document_payload_path") or "")
-                if str(item.get("drive_link") or "").strip():
+                payload_path_raw = str(item.get('document_payload_path') or '')
+                if str(item.get('drive_link') or '').strip():
                     if payload_path_raw:
                         payloads_to_cleanup.add(payload_path_raw)
                     continue
 
-                if not payload_path_raw:
+                if not payload_path_raw or not targets:
+                    if payload_path_raw and tab_name == '__Fatura Kalemleri':
+                        payloads_to_cleanup.add(payload_path_raw)
                     continue
 
                 payload_path = Path(payload_path_raw)
@@ -2882,21 +3723,14 @@ def process_pending_sheet_appends(*, max_items: int | None = None) -> int:
 
                 queue_pending_document_upload(
                     file_bytes=payload_path.read_bytes(),
-                    filename=str(item.get("document_filename") or payload_path.name),
-                    mime_type=str(item.get("document_mime_type") or "application/octet-stream"),
-                    targets=[
-                        _build_drive_link_target(
-                            spreadsheet_id=spreadsheet_id,
-                            tab_name=tab_name,
-                            row_number=row_number,
-                            row_id=item_id,
-                        )
-                    ],
-                    source_message_id=str(item.get("source_message_id") or "") or None,
+                    filename=str(item.get('document_filename') or payload_path.name),
+                    mime_type=str(item.get('document_mime_type') or 'application/octet-stream'),
+                    targets=targets,
+                    source_message_id=str(item.get('source_message_id') or '') or None,
                 )
                 payloads_to_cleanup.add(payload_path_raw)
 
-            _remove_pending_sheet_appends({str(item.get("id") or "") for item in batch})
+            _remove_pending_sheet_appends({str(item.get('id') or '') for item in batch})
             for payload_path_raw in payloads_to_cleanup:
                 _cleanup_pending_sheet_payload_if_unused(payload_path_raw)
             processed += len(batch)
@@ -2976,18 +3810,39 @@ def append_record(
 
     try:
         normalized_category = DocumentCategory.FATURA if category == DocumentCategory.IADE else category
-        tab_name = _CATEGORY_TAB.get(normalized_category, "🧾 Faturalar")
-        items = [
-            _queue_pending_sheet_append_item(
-                record=record,
-                category=normalized_category,
-                tab_name=tab_name,
-                drive_link=drive_link,
-                document_payload=None if drive_link else pending_document_bytes,
-                document_filename=None if drive_link else pending_document_filename,
-                document_mime_type=None if drive_link else pending_document_mime_type,
+        visible_tab = _CATEGORY_VISIBLE_TAB.get(normalized_category, "Faturalar")
+        payload_bytes = None if drive_link else pending_document_bytes
+        payload_filename = None if drive_link else pending_document_filename
+        payload_mime_type = None if drive_link else pending_document_mime_type
+
+        items: list[dict] = []
+
+        def _queue(tab_name: str) -> None:
+            items.append(
+                _queue_pending_sheet_append_item(
+                    record=record,
+                    category=normalized_category,
+                    tab_name=tab_name,
+                    drive_link=drive_link,
+                    return_source_category=category if category == DocumentCategory.IADE else None,
+                    document_payload=payload_bytes,
+                    document_filename=payload_filename,
+                    document_mime_type=payload_mime_type,
+                )
             )
-        ]
+
+        _queue('__Raw Belgeler')
+        _queue(visible_tab)
+
+        if normalized_category == DocumentCategory.FATURA:
+            _queue('Masraf Kayıtları')
+            if _iter_invoice_line_items(record):
+                _queue('__Fatura Kalemleri')
+        elif normalized_category in {DocumentCategory.HARCAMA_FISI, DocumentCategory.ELDEN_ODEME}:
+            if visible_tab != 'Masraf Kayıtları':
+                _queue('Masraf Kayıtları')
+        elif normalized_category in {DocumentCategory.ODEME_DEKONTU, DocumentCategory.CEK}:
+            _queue('__Çek_Dekont_Detay')
 
         with _pending_sheet_appends_lock:
             pending_items = _load_pending_sheet_appends()

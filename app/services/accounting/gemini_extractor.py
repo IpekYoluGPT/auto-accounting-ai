@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import Optional
 
 from app.config import settings
-from app.models.schemas import AIMultiExtractionResult, BillRecord, DocumentCategory
+from app.models.schemas import AIMultiExtractionResult, BillRecord, DocumentCategory, InvoiceLineItem
 from app.services import gemini_client
 from app.services.accounting import ocr
 from app.utils.logging import get_logger
@@ -27,6 +27,8 @@ Rules:
 - Do not merge separate documents into one record.
 - For return documents, extract the values exactly as shown; do not flip signs unless the document itself shows a negative or return amount.
 - Examples and category hints are pattern guidance only; never copy company names, people names, amounts, serial numbers, or wording from prior examples.
+- Do not overfit to sample templates or prior test images; infer values only from the current document.
+- If an invoice has visible line items, return them as structured line_items ordered top-to-bottom.
 """
 
 _EXTRACTION_PROMPT = """Extract bookkeeping fields from this Turkish business document image or PDF.
@@ -38,28 +40,42 @@ Default currency to TRY when it is not shown."""
 _CATEGORY_SPECIFIC_INSTRUCTIONS: dict[DocumentCategory, str] = {
     DocumentCategory.FATURA: """Belge ailesi: FATURA.
 - company_name satici / duzenleyen firmadir.
+- recipient_name gorunen alici / musteri / sevk edilen taraf ise onu yaz.
+- buyer_name gorunen satin alan veya faturadaki musteri adidir; gorunmuyorsa null birak.
+- invoice_type gorunen turu yaz (ornegin Satis Faturasi, Iade Faturasi, E-Arsiv).
 - invoice_number icin once Fatura No, yoksa Belge No kullan.
-- subtotal, vat_rate, vat_amount ve total_amount alanlarini yalnizca acikca gorunuyorsa doldur.
+- subtotal, vat_rate, vat_amount, total_amount, withholding_present, withholding_rate, withholding_amount ve payable_amount alanlarini yalnizca acikca gorunuyorsa doldur.
+- iban ve bank_name gorunuyorsa ekle.
+- line_items varsa her satir icin description, line_quantity, line_unit, unit_price ve line_amount alanlarini doldur; satirlari yukaridan asagiya sirala.
 - description alanina kisa bir fatura ozeti yaz; payment_method sadece belgede acikca varsa doldur.""",
     DocumentCategory.ODEME_DEKONTU: """Belge ailesi: ODEME DEKONTU.
 - company_name alanina gorunur banka, odeme kurumu veya baskin karsi taraf adini yaz.
+- recipient_name aliciyi / paranin gittigi kisi veya firmayi belirtir.
 - document_number alanina referans / islem / dekont numarasini koy.
 - total_amount transfer edilen nihai tutardir.
+- iban ve bank_name gorunuyorsa ayrica doldur.
 - sender_name alanina sadece gonderen kisi/firma adini yaz; telefon, IBAN, hesap numarasi, referans veya aciklama yazma. Isim gorunmuyorsa null birak.
 - description alanina alici veya islem aciklamasini kisa ve yararli bicimde koy.""",
     DocumentCategory.HARCAMA_FISI: """Belge ailesi: HARCAMA FISI.
 - company_name satici isletmedir.
+- recipient_name fiste gorunen alici / musteri / teslim alan varsa onu yaz.
 - receipt_number icin once Fis No, yoksa Belge No kullan.
 - total_amount fisteki nihai toplamdir.
 - description alanina kisa urun/hizmet ozeti yaz.""",
     DocumentCategory.CEK: """Belge ailesi: CEK.
 - document_number cek seri / belge numarasidir.
+- recipient_name lehdar / alici / cekin gidecegi kisi veya firmadir.
 - company_name duzenleyen banka veya firma adidir.
+- cheque_issue_place, cheque_issue_date, cheque_due_date, cheque_serial_number, cheque_bank_name, cheque_branch ve cheque_account_ref gorunuyorsa ayri ayri doldur.
 - document_date alanina vade tarihi gorunuyorsa onu yaz; aksi halde gorunur ana tarihi yaz.
+- total_amount veya payable_amount cek tutari gorunuyorsa doldur.
 - notes alanina lehdar/alici gibi onemli serbest metni koy.""",
-    DocumentCategory.MALZEME: """Belge ailesi: MALZEME / IRSALIYE.
+    DocumentCategory.MALZEME: """Belge ailesi: MALZEME / IRSALIYE / SEVK.
 - company_name tedarikci veya belge ust bilgisindeki firmadir.
+- recipient_name teslim alan / alici / sevk edilen taraf gorunuyorsa onu yaz.
 - document_number irsaliye / belge / form numarasidir.
+- shipment_origin, shipment_destination, vehicle_plate, pallet_count, items_per_pallet ve product_quantity gorunuyorsa doldur.
+- line_items varsa urun listesi gibi satirlari ayri ayri cikar.
 - description alanina malzeme cinsi veya malzeme listesinin kisa ozeti yaz.
 - notes alanina teslim yeri / santiye / aciklama gibi sahaya ait bilgileri yaz.
 - total_amount gorunmuyorsa null birak; sirf tahmin etmek icin hesap yapma.
@@ -67,12 +83,15 @@ _CATEGORY_SPECIFIC_INSTRUCTIONS: dict[DocumentCategory, str] = {
     DocumentCategory.IADE: """Belge ailesi: IADE / IPTAL.
 - Mumkunse belgeyi esas aile mantigiyla oku ama iade niteliklerini koru.
 - description alaninda kisa iade ozeti kullan.
-- Gorunmeyen karsit kayit veya orijinal belge ayrintilarini uydurma.""",
+- Gorunmeyen karsit kayit veya orijinal belge ayrintilarini uydurma.
+- Iade belgesinde gorunen satirlar varsa line_items olarak cikar.""",
     DocumentCategory.BELIRSIZ: """Belge ailesi belirsiz.
 - Gorunen belge yapisina en yakin alanlari doldur.
-- Emin olmadigin alanlari null birak.""",
+- Emin olmadigin alanlari null birak.
+- line_items ya da banka / cek ayrintilari gorunuyorsa, alan adlarini doldur.""",
     DocumentCategory.ELDEN_ODEME: """Belge ailesi: ELDEN ODEME.
-- Bu kategori medya belgeleri icin beklenmez; yine de gorunur odeme kaydi varsa en yakin alanlari doldur.""",
+- Bu kategori medya belgeleri icin beklenmez; yine de gorunur odeme kaydi varsa en yakin alanlari doldur.
+- recipient_name, payable_amount ve description gorunuyorsa ayri ayri yaz.""",
 }
 
 _EXTRACTION_EXAMPLES = """Kisa ornekler:
@@ -96,6 +115,22 @@ def _parse_tr_number(value: str) -> Optional[float]:
 
 
 
+def _safe_bool(value) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    s = str(value).strip().lower()
+    if not s:
+        return None
+    if s in {"true", "1", "yes", "evet", "var", "y"}:
+        return True
+    if s in {"false", "0", "no", "hayir", "hayır", "yok", "n"}:
+        return False
+    return None
+
 def _normalize_record(raw: dict) -> BillRecord:
     """Coerce raw JSON dict into a validated BillRecord."""
 
@@ -107,6 +142,22 @@ def _normalize_record(raw: dict) -> BillRecord:
             return None
         s = str(v).strip()
         return s if s else None
+
+    line_items_raw = raw.get("line_items") or []
+    normalized_line_items: list[InvoiceLineItem] = []
+    if isinstance(line_items_raw, list):
+        for item in line_items_raw:
+            if not isinstance(item, dict):
+                continue
+            normalized_line_items.append(
+                InvoiceLineItem(
+                    description=_safe_str(item.get("description")),
+                    quantity=_safe_float(item.get("quantity")),
+                    unit=_safe_str(item.get("unit")),
+                    unit_price=_safe_float(item.get("unit_price")),
+                    line_amount=_safe_float(item.get("line_amount")),
+                )
+            )
 
     currency_raw = _safe_str(raw.get("currency"))
     if currency_raw:
@@ -131,16 +182,46 @@ def _normalize_record(raw: dict) -> BillRecord:
         vat_amount=_safe_float(raw.get("vat_amount")),
         total_amount=_safe_float(raw.get("total_amount")),
         sender_name=_safe_str(raw.get("sender_name")),
-        payment_method=_safe_str(raw.get("payment_method")),
-        expense_category=_safe_str(raw.get("expense_category")),
-        description=_safe_str(raw.get("description")),
-        notes=_safe_str(raw.get("notes")),
+        recipient_name=_safe_str(raw.get("recipient_name")),
+        buyer_name=_safe_str(raw.get("buyer_name")),
+        invoice_type=_safe_str(raw.get("invoice_type")),
+        line_quantity=_safe_float(raw.get("line_quantity")),
+        line_unit=_safe_str(raw.get("line_unit")),
+        unit_price=_safe_float(raw.get("unit_price")),
+        line_amount=_safe_float(raw.get("line_amount")),
+        withholding_present=_safe_bool(raw.get("withholding_present")),
+        withholding_rate=_safe_float(raw.get("withholding_rate")),
+        withholding_amount=_safe_float(raw.get("withholding_amount")),
+        payable_amount=_safe_float(raw.get("payable_amount")),
+        iban=_safe_str(raw.get("iban")),
+        bank_name=_safe_str(raw.get("bank_name")),
+        shipment_origin=_safe_str(raw.get("shipment_origin")),
+        shipment_destination=_safe_str(raw.get("shipment_destination")),
+        pallet_count=_safe_float(raw.get("pallet_count")),
+        items_per_pallet=_safe_float(raw.get("items_per_pallet")),
+        product_quantity=_safe_float(raw.get("product_quantity")),
+        vehicle_plate=_safe_str(raw.get("vehicle_plate")),
+        cheque_issue_place=_safe_str(raw.get("cheque_issue_place")),
+        cheque_issue_date=ocr.normalize_date(_safe_str(raw.get("cheque_issue_date"))) or _safe_str(raw.get("cheque_issue_date")),
+        cheque_due_date=ocr.normalize_date(_safe_str(raw.get("cheque_due_date"))) or _safe_str(raw.get("cheque_due_date")),
+        cheque_serial_number=_safe_str(raw.get("cheque_serial_number")),
+        cheque_bank_name=_safe_str(raw.get("cheque_bank_name")),
+        cheque_branch=_safe_str(raw.get("cheque_branch")),
+        cheque_account_ref=_safe_str(raw.get("cheque_account_ref")),
+        line_items=normalized_line_items or None,
         source_message_id=_safe_str(raw.get("source_message_id")),
         source_filename=_safe_str(raw.get("source_filename")),
         source_type=_safe_str(raw.get("source_type")),
         confidence=_safe_float(raw.get("confidence")),
+        payment_method=_safe_str(raw.get("payment_method")),
+        expense_category=_safe_str(raw.get("expense_category")),
+        description=_safe_str(raw.get("description")),
+        notes=_safe_str(raw.get("notes")),
+        source_sender_id=_safe_str(raw.get("source_sender_id")),
+        source_sender_name=_safe_str(raw.get("source_sender_name")),
+        source_group_id=_safe_str(raw.get("source_group_id")),
+        source_chat_type=_safe_str(raw.get("source_chat_type")),
     )
-
 
 
 def extract_bills(
@@ -269,7 +350,6 @@ def _build_extraction_prompt(
         _CATEGORY_SPECIFIC_INSTRUCTIONS[DocumentCategory.BELIRSIZ],
     )
 
-    count_hint = strict_document_count or document_count_hint
     if strict_document_count and strict_document_count > 1:
         count_text = f"Bu denemede tam olarak {strict_document_count} ayri belge cikarilmasi gerekiyor."
     elif document_count_hint and document_count_hint > 1:

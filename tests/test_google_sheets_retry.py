@@ -22,6 +22,12 @@ class FakeApiError(Exception):
     pass
 
 
+def _banka_odemeleri_lookup_row(row_id: str) -> list[str]:
+    row = [""] * 12
+    row[9] = row_id
+    return row
+
+
 def test_retry_succeeds_after_rate_limit():
     """Function should retry and eventually succeed on 429."""
     call_count = 0
@@ -257,10 +263,10 @@ def test_process_pending_document_uploads_backfills_missing_drive_links(tmp_path
 
     assert processed == 1
     fake_client.open_by_key.assert_called_once_with("sheet-123")
-    fake_sheet.worksheet.assert_called_once_with("💳 Dekontlar")
+    fake_sheet.worksheet.assert_called_once_with("Banka Ödemeleri")
     fake_ws.update.assert_called_once_with(
         [['=HYPERLINK("https://drive.google.com/file/d/pending/view";"Görüntüle")']],
-        "K7",
+        "I7",
         value_input_option="USER_ENTERED",
     )
     assert google_sheets._load_pending_drive_uploads() == []
@@ -288,7 +294,7 @@ def test_process_pending_document_uploads_resolves_row_id_after_row_reorder(tmp_
     )
 
     fake_ws = MagicMock()
-    fake_ws.get.return_value = [["other-row"], ["pending-row-id"]]
+    fake_ws.get.return_value = [_banka_odemeleri_lookup_row("other-row"), _banka_odemeleri_lookup_row("pending-row-id")]
     fake_sheet = MagicMock()
     fake_sheet.worksheet.return_value = fake_ws
     fake_client = MagicMock()
@@ -304,10 +310,10 @@ def test_process_pending_document_uploads_resolves_row_id_after_row_reorder(tmp_
     processed = google_sheets.process_pending_document_uploads()
 
     assert processed == 1
-    fake_ws.get.assert_called_once_with("L3:L")
+    fake_ws.get.assert_called_once_with("A3:L")
     fake_ws.update.assert_called_once_with(
         [['=HYPERLINK("https://drive.google.com/file/d/pending/view";"Görüntüle")']],
-        "K4",
+        "I4",
         value_input_option="USER_ENTERED",
     )
 
@@ -355,14 +361,14 @@ def test_process_pending_document_uploads_reuses_cached_drive_link_after_row_loo
     assert len(pending_items) == 1
     assert pending_items[0]["drive_link"] == "https://drive.google.com/file/d/pending/view"
 
-    fake_ws.get.return_value = [["pending-row-id"]]
+    fake_ws.get.return_value = [_banka_odemeleri_lookup_row("pending-row-id")]
     processed = google_sheets.process_pending_document_uploads()
 
     assert processed == 1
     assert upload_calls["count"] == 1
     fake_ws.update.assert_called_once_with(
         [['=HYPERLINK("https://drive.google.com/file/d/pending/view";"Görüntüle")']],
-        "K3",
+        "I3",
         value_input_option="USER_ENTERED",
     )
     assert google_sheets._load_pending_drive_uploads() == []
@@ -396,8 +402,8 @@ def test_queue_pending_document_upload_merges_targets_for_same_message(tmp_path,
     assert len(items) == 1
     assert items[0]["source_message_id"] == "wamid-merge-1"
     assert items[0]["targets"] == [
-        {"spreadsheet_id": "sheet-1", "tab_name": "💳 Dekontlar", "row_number": 3, "row_id": "row-dekont-1"},
-        {"spreadsheet_id": "sheet-1", "tab_name": "🏗️ Malzeme", "row_number": 5, "row_id": "row-malzeme-1"},
+        {"spreadsheet_id": "sheet-1", "tab_name": "Banka Ödemeleri", "row_number": 3, "row_id": "row-dekont-1"},
+        {"spreadsheet_id": "sheet-1", "tab_name": "Sevk Fişleri", "row_number": 5, "row_id": "row-malzeme-1"},
     ]
 
 
@@ -433,10 +439,10 @@ def test_append_record_queues_pending_sheet_appends_and_starts_worker(tmp_path, 
     )
 
     items = google_sheets._load_pending_sheet_appends()
-    assert len(items) == 1
+    assert len(items) == 3
     assert worker_started["count"] == 1
-    assert [item["tab_name"] for item in items] == ["🧾 Faturalar"]
-    assert [item["category"] for item in items] == ["fatura"]
+    assert [item["tab_name"] for item in items] == ["__Raw Belgeler", "Faturalar", "Masraf Kayıtları"]
+    assert [item["category"] for item in items] == ["fatura", "fatura", "fatura"]
     assert all(item["spreadsheet_id"] == "sheet-queue-1" for item in items)
     payload_paths = {item["document_payload_path"] for item in items}
     assert len(payload_paths) == 1
@@ -468,8 +474,8 @@ def test_process_pending_sheet_appends_batches_rows_and_queues_drive_backfill(tm
     )
 
     queued_items = google_sheets._load_pending_sheet_appends()
-    assert len(queued_items) == 1
-    pending_id = queued_items[0]["id"]
+    assert len(queued_items) == 3
+    pending_ids_by_tab = {item["tab_name"]: item["id"] for item in queued_items}
 
     fake_ws = MagicMock()
     fake_ws.get.return_value = []
@@ -482,24 +488,20 @@ def test_process_pending_sheet_appends_batches_rows_and_queues_drive_backfill(tm
     queue_mock = MagicMock()
     monkeypatch.setattr(google_sheets, "_get_client", lambda: fake_client)
     monkeypatch.setattr(google_sheets, "queue_pending_document_upload", queue_mock)
+    monkeypatch.setattr(google_sheets, "_audit_spreadsheet_layout", lambda sh, repair=False, target_tabs=None: [])
+    monkeypatch.setattr(google_sheets, "_upsert_party_cards", lambda sh, cards: None)
 
     processed = google_sheets.process_pending_sheet_appends()
 
-    assert processed == 1
-    fake_client.open_by_key.assert_called_once_with("sheet-batch-1")
-    fake_ws.append_rows.assert_called_once()
-    appended_rows = fake_ws.append_rows.call_args.args[0]
-    assert len(appended_rows) == 1
-    assert appended_rows[0][-1] == pending_id
-    queue_mock.assert_called_once()
-    assert queue_mock.call_args.kwargs["targets"] == [
-        {
-            "spreadsheet_id": "sheet-batch-1",
-            "tab_name": "🧾 Faturalar",
-            "row_number": 3,
-            "row_id": pending_id,
-        }
-    ]
+    assert processed == 3
+    assert fake_client.open_by_key.call_count == 3
+    assert {call.args[0] for call in fake_client.open_by_key.call_args_list} == {"sheet-batch-1"}
+    assert fake_ws.append_rows.call_count == 3
+    assert queue_mock.call_count == 3
+    queued_target_tabs = {call.kwargs["targets"][0]["tab_name"] for call in queue_mock.call_args_list}
+    queued_target_row_ids = {call.kwargs["targets"][0]["row_id"] for call in queue_mock.call_args_list}
+    assert queued_target_tabs == {"__Raw Belgeler", "Faturalar", "Masraf Kayıtları"}
+    assert queued_target_row_ids == set(pending_ids_by_tab.values())
     assert queue_mock.call_args.kwargs["source_message_id"] == "wamid-sheet-2"
     assert google_sheets._load_pending_sheet_appends() == []
     assert list((Path(tmp_path) / "state" / "pending_sheet_appends").glob("*")) == []
@@ -543,10 +545,13 @@ def test_process_pending_sheet_appends_retries_rate_limited_batch(tmp_path, monk
 
     assert processed == 0
     items = google_sheets._load_pending_sheet_appends()
-    assert len(items) == 1
-    assert items[0]["attempts"] == 1
-    assert "429" in items[0]["last_error"]
-    assert float(items[0]["next_attempt_at"]) > 0
+    assert len(items) == 3
+    items_by_tab = {item["tab_name"]: item for item in items}
+    assert items_by_tab["__Raw Belgeler"]["attempts"] == 1
+    assert "429" in items_by_tab["__Raw Belgeler"]["last_error"]
+    assert float(items_by_tab["__Raw Belgeler"]["next_attempt_at"]) > 0
+    assert items_by_tab["Faturalar"]["attempts"] == 0
+    assert items_by_tab["Masraf Kayıtları"]["attempts"] == 0
 
 
 
@@ -615,8 +620,8 @@ def test_append_record_skips_pending_payload_when_storage_budget_is_exceeded(tmp
     )
 
     items = google_sheets._load_pending_sheet_appends()
-    assert len(items) == 1
-    assert items[0]["document_payload_path"] == ""
+    assert len(items) == 3
+    assert all(item["document_payload_path"] == "" for item in items)
     assert list((Path(tmp_path) / "state" / "pending_sheet_appends").glob("*.bin")) == []
 
 
@@ -727,10 +732,16 @@ def test_process_pending_sheet_appends_repairs_target_tabs_before_append(tmp_pat
     monkeypatch.setattr(google_sheets, "_get_client", lambda: fake_client)
     monkeypatch.setattr(google_sheets, "_audit_spreadsheet_layout", lambda sh, repair=False, target_tabs=None: audit_calls.append((sh, repair, target_tabs)) or [])
 
+    monkeypatch.setattr(google_sheets, "_upsert_party_cards", lambda sh, cards: None)
+
     processed = google_sheets.process_pending_sheet_appends()
 
-    assert processed == 1
-    assert audit_calls == [(fake_sheet, True, {"🧾 Faturalar", "📊 Özet"})]
+    assert processed == 3
+    assert audit_calls == [
+        (fake_sheet, True, {"__Raw Belgeler", "📊 Özet"}),
+        (fake_sheet, True, {"Faturalar", "📊 Özet"}),
+        (fake_sheet, True, {"Masraf Kayıtları", "📊 Özet"}),
+    ]
 
 
 def test_ensure_tab_total_row_rewrites_in_place_without_inserting_rows():

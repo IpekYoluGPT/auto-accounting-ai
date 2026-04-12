@@ -6,7 +6,7 @@ from unittest.mock import ANY, patch
 
 import pytest
 
-from app.models.schemas import AIExtractionResult, AIMultiExtractionResult, BillRecord, DocumentCategory
+from app.models.schemas import AIExtractionResult, AIMultiExtractionResult, BillRecord, DocumentCategory, InvoiceLineItem
 from app.services.accounting.gemini_extractor import _normalize_record, _parse_tr_number, extract_bill, extract_bills
 
 
@@ -112,6 +112,81 @@ class TestNormalizeRecord:
         record = _normalize_record(self._raw(sender_name="Ahmet Yılmaz"))
         assert record.sender_name == "Ahmet Yılmaz"
 
+    def test_new_structured_fields_are_normalized(self):
+        record = _normalize_record(
+            self._raw(
+                recipient_name="Mehmet Kaya",
+                buyer_name="Kaya İnşaat",
+                invoice_type="E-Arşiv Fatura",
+                line_quantity="2,5",
+                line_unit="ton",
+                unit_price="150,00",
+                line_amount="375,00",
+                withholding_present="true",
+                withholding_rate="20",
+                withholding_amount="75,00",
+                payable_amount="300,00",
+                iban="TR120006200000000123456789",
+                bank_name="Yapı Kredi",
+                shipment_origin="Elazığ",
+                shipment_destination="Karakaya",
+                pallet_count="4",
+                items_per_pallet="12",
+                product_quantity="48",
+                vehicle_plate="23 ABC 123",
+                cheque_issue_place="Elazığ",
+                cheque_issue_date="15.03.2026",
+                cheque_due_date="30.03.2026",
+                cheque_serial_number="CHQ-7788",
+                cheque_bank_name="Yapı Kredi",
+                cheque_branch="Elazığ Şubesi",
+                cheque_account_ref="123-456-789",
+                line_items=[
+                    {
+                        "description": "Arp Lastik",
+                        "quantity": "3",
+                        "unit": "adet",
+                        "unit_price": "25,50",
+                        "line_amount": "76,50",
+                    }
+                ],
+            )
+        )
+
+        assert record.recipient_name == "Mehmet Kaya"
+        assert record.buyer_name == "Kaya İnşaat"
+        assert record.invoice_type == "E-Arşiv Fatura"
+        assert record.line_quantity == pytest.approx(2.5)
+        assert record.line_unit == "ton"
+        assert record.unit_price == pytest.approx(150.0)
+        assert record.line_amount == pytest.approx(375.0)
+        assert record.withholding_present is True
+        assert record.withholding_rate == pytest.approx(20.0)
+        assert record.withholding_amount == pytest.approx(75.0)
+        assert record.payable_amount == pytest.approx(300.0)
+        assert record.iban == "TR120006200000000123456789"
+        assert record.bank_name == "Yapı Kredi"
+        assert record.shipment_origin == "Elazığ"
+        assert record.shipment_destination == "Karakaya"
+        assert record.pallet_count == pytest.approx(4.0)
+        assert record.items_per_pallet == pytest.approx(12.0)
+        assert record.product_quantity == pytest.approx(48.0)
+        assert record.vehicle_plate == "23 ABC 123"
+        assert record.cheque_issue_place == "Elazığ"
+        assert record.cheque_issue_date == "2026-03-15"
+        assert record.cheque_due_date == "2026-03-30"
+        assert record.cheque_serial_number == "CHQ-7788"
+        assert record.cheque_bank_name == "Yapı Kredi"
+        assert record.cheque_branch == "Elazığ Şubesi"
+        assert record.cheque_account_ref == "123-456-789"
+        assert record.line_items is not None
+        assert len(record.line_items) == 1
+        assert isinstance(record.line_items[0], InvoiceLineItem)
+        assert record.line_items[0].description == "Arp Lastik"
+        assert record.line_items[0].quantity == pytest.approx(3.0)
+        assert record.line_items[0].unit_price == pytest.approx(25.5)
+        assert record.line_items[0].line_amount == pytest.approx(76.5)
+
 
 class TestExtractBill:
     def test_no_api_key_raises(self, monkeypatch):
@@ -138,6 +213,14 @@ class TestExtractBill:
             vat_rate=18.0,
             vat_amount=15.25,
             total_amount=100.0,
+            recipient_name="Ahmet Yılmaz",
+            buyer_name="Ahmet Yılmaz",
+            invoice_type="Fatura",
+            iban="TR120006200000000123456789",
+            bank_name="Yapı Kredi",
+            line_items=[
+                InvoiceLineItem(description="Ürün A", quantity=2, unit="adet", unit_price=25.0, line_amount=50.0)
+            ],
             payment_method="Nakit",
             expense_category="Yemek",
             description="Market alışverişi",
@@ -162,6 +245,10 @@ class TestExtractBill:
         assert record.total_amount == 100.0
         assert record.expense_category == "Yemek"
         assert record.source_message_id == "msg_123"
+        assert record.recipient_name == "Ahmet Yılmaz"
+        assert record.iban == "TR120006200000000123456789"
+        assert record.line_items is not None
+        assert record.line_items[0].description == "Ürün A"
         assert record.confidence == pytest.approx(0.91)
         mock_generate.assert_called_once_with(
             model="gemini-test-extractor",
@@ -230,6 +317,34 @@ class TestExtractBill:
         assert "her fiziksel cek yapragini ayri belge say" in prompt
         assert "Ayrik belgeleri ASLA birlestirme" in prompt
 
+    def test_invoice_prompt_requests_structured_line_items_and_withholding_fields(self, monkeypatch):
+        monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
+        expected = AIMultiExtractionResult(
+            documents=[AIExtractionResult(company_name="Semsettin Yilmaz", currency="TRY", confidence=0.8)]
+        )
+
+        with patch(
+            "app.services.accounting.gemini_extractor.gemini_client.generate_structured_content",
+            return_value=expected,
+        ) as mock_generate:
+            extract_bills(
+                b"fake_image",
+                mime_type="image/jpeg",
+                source_message_id="msg-invoice-1",
+                source_filename="invoice.jpg",
+                source_type="image",
+                category_hint=DocumentCategory.FATURA,
+            )
+
+        prompt = mock_generate.call_args.kwargs["prompt"]
+        assert "recipient_name gorunen alici" in prompt
+        assert "buyer_name gorunen satin alan" in prompt
+        assert "invoice_type gorunen turu yaz" in prompt
+        assert "line_items varsa her satir icin description" in prompt
+        assert "withholding_present" in prompt
+        assert "payable_amount" in prompt
+        assert "iban ve bank_name gorunuyorsa ekle" in prompt
+
     def test_dekont_prompt_requests_name_not_phone_for_sender(self, monkeypatch):
         monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
         expected = AIMultiExtractionResult(
@@ -250,8 +365,58 @@ class TestExtractBill:
             )
 
         prompt = mock_generate.call_args.kwargs["prompt"]
+        assert "recipient_name aliciyi" in prompt
         assert "sender_name alanina sadece gonderen kisi/firma adini yaz" in prompt
-        assert "telefon, IBAN, hesap numarasi" in prompt
+        assert "iban ve bank_name gorunuyorsa ayrica doldur" in prompt
+
+    def test_cheque_prompt_requests_bank_and_cheque_metadata(self, monkeypatch):
+        monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
+        expected = AIMultiExtractionResult(
+            documents=[AIExtractionResult(company_name="Banka", currency="TRY", confidence=0.8)]
+        )
+
+        with patch(
+            "app.services.accounting.gemini_extractor.gemini_client.generate_structured_content",
+            return_value=expected,
+        ) as mock_generate:
+            extract_bills(
+                b"fake_image",
+                mime_type="image/jpeg",
+                source_message_id="msg-cheque-1",
+                source_filename="cheque.jpg",
+                source_type="image",
+                category_hint=DocumentCategory.CEK,
+            )
+
+        prompt = mock_generate.call_args.kwargs["prompt"]
+        assert "recipient_name lehdar / alici" in prompt
+        assert "cheque_issue_place, cheque_issue_date, cheque_due_date, cheque_serial_number, cheque_bank_name, cheque_branch ve cheque_account_ref" in prompt
+        assert "total_amount veya payable_amount cek tutari" in prompt
+
+    def test_shipment_prompt_requests_route_and_vehicle_details(self, monkeypatch):
+        monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
+        expected = AIMultiExtractionResult(
+            documents=[AIExtractionResult(company_name="Nakliye", currency="TRY", confidence=0.8)]
+        )
+
+        with patch(
+            "app.services.accounting.gemini_extractor.gemini_client.generate_structured_content",
+            return_value=expected,
+        ) as mock_generate:
+            extract_bills(
+                b"fake_image",
+                mime_type="image/jpeg",
+                source_message_id="msg-shipment-1",
+                source_filename="shipment.jpg",
+                source_type="image",
+                category_hint=DocumentCategory.MALZEME,
+            )
+
+        prompt = mock_generate.call_args.kwargs["prompt"]
+        assert "shipment_origin" in prompt
+        assert "shipment_destination" in prompt
+        assert "vehicle_plate" in prompt
+        assert "pallet_count, items_per_pallet ve product_quantity" in prompt
 
     def test_multi_document_extraction(self, monkeypatch):
         monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
