@@ -40,6 +40,7 @@ _SCOPES = [
 
 class ResetSheetRequest(BaseModel):
     spreadsheet_id: str | None = None
+    clear_storage: bool = True
 
 
 class EnsureSandboxRequest(BaseModel):
@@ -313,14 +314,21 @@ async def reset_sheet(request: Request, payload: ResetSheetRequest) -> dict[str,
     _verify_admin_token(request)
 
     try:
+        queue_before = google_sheets.queue_status() if payload.clear_storage else None
         reset_count = google_sheets.reset_current_month_spreadsheet_data(
             spreadsheet_id=payload.spreadsheet_id,
         )
-        return {
+        queue_cleared = google_sheets.clear_current_namespace_storage() if payload.clear_storage else None
+
+        response = {
             "status": "ok",
             "spreadsheet_id": payload.spreadsheet_id or settings.google_sheets_spreadsheet_id,
             "tabs_reset": reset_count,
         }
+        if payload.clear_storage:
+            response["queue_before"] = queue_before
+            response["queue_cleared"] = queue_cleared
+        return response
     except Exception as exc:
         logger.error("Sheet reset failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc)) from exc

@@ -60,13 +60,26 @@ def test_reset_sheet_allows_request_when_tool_token_is_unset():
     ), patch(
         "app.routes.setup.google_sheets.reset_current_month_spreadsheet_data",
         return_value=8,
-    ) as reset_mock:
+    ) as reset_mock, patch(
+        "app.routes.setup.google_sheets.queue_status",
+        return_value={"pending_sheet_appends": 3, "pending_drive_uploads": 1},
+    ), patch(
+        "app.routes.setup.google_sheets.clear_current_namespace_storage",
+        return_value={"pending_sheet_appends": 3, "pending_drive_uploads": 1},
+    ) as clear_mock:
         with TestClient(app) as client:
             response = client.post("/setup/reset-sheet", json={"spreadsheet_id": "sheet-123"})
 
     assert response.status_code == 200
-    assert response.json()["status"] == "ok"
+    assert response.json() == {
+        "status": "ok",
+        "spreadsheet_id": "sheet-123",
+        "tabs_reset": 8,
+        "queue_before": {"pending_sheet_appends": 3, "pending_drive_uploads": 1},
+        "queue_cleared": {"pending_sheet_appends": 3, "pending_drive_uploads": 1},
+    }
     reset_mock.assert_called_once_with(spreadsheet_id="sheet-123")
+    clear_mock.assert_called_once_with()
 
 
 def test_reset_sheet_calls_google_sheets_with_payload_id():
@@ -88,7 +101,13 @@ def test_reset_sheet_calls_google_sheets_with_payload_id():
     ), patch(
         "app.routes.setup.google_sheets.reset_current_month_spreadsheet_data",
         return_value=8,
-    ) as reset_mock:
+    ) as reset_mock, patch(
+        "app.routes.setup.google_sheets.queue_status",
+        return_value={"pending_sheet_appends": 0, "pending_drive_uploads": 0},
+    ), patch(
+        "app.routes.setup.google_sheets.clear_current_namespace_storage",
+        return_value={"pending_sheet_appends": 0, "pending_drive_uploads": 0},
+    ) as clear_mock:
         with TestClient(app) as client:
             response = client.post(
                 "/setup/reset-sheet",
@@ -101,8 +120,11 @@ def test_reset_sheet_calls_google_sheets_with_payload_id():
         "status": "ok",
         "spreadsheet_id": "sheet-123",
         "tabs_reset": 8,
+        "queue_before": {"pending_sheet_appends": 0, "pending_drive_uploads": 0},
+        "queue_cleared": {"pending_sheet_appends": 0, "pending_drive_uploads": 0},
     }
     reset_mock.assert_called_once_with(spreadsheet_id="sheet-123")
+    clear_mock.assert_called_once_with()
 
 
 def test_reset_sheet_accepts_x_api_key_header():
@@ -112,7 +134,13 @@ def test_reset_sheet_accepts_x_api_key_header():
     ), patch(
         "app.routes.setup.google_sheets.reset_current_month_spreadsheet_data",
         return_value=8,
-    ) as reset_mock:
+    ) as reset_mock, patch(
+        "app.routes.setup.google_sheets.queue_status",
+        return_value={"pending_sheet_appends": 0, "pending_drive_uploads": 0},
+    ), patch(
+        "app.routes.setup.google_sheets.clear_current_namespace_storage",
+        return_value={"pending_sheet_appends": 0, "pending_drive_uploads": 0},
+    ) as clear_mock:
         with TestClient(app) as client:
             response = client.post(
                 "/setup/reset-sheet",
@@ -121,7 +149,39 @@ def test_reset_sheet_accepts_x_api_key_header():
             )
 
     assert response.status_code == 200
+    assert response.json()["queue_cleared"] == {"pending_sheet_appends": 0, "pending_drive_uploads": 0}
     reset_mock.assert_called_once_with(spreadsheet_id="sheet-123")
+    clear_mock.assert_called_once_with()
+
+
+def test_reset_sheet_can_skip_storage_clear():
+    with _lifespan_patches(), patch(
+        "app.routes.setup.settings.periskope_tool_token",
+        "secret-token",
+    ), patch(
+        "app.routes.setup.google_sheets.reset_current_month_spreadsheet_data",
+        return_value=8,
+    ) as reset_mock, patch(
+        "app.routes.setup.google_sheets.queue_status"
+    ) as queue_mock, patch(
+        "app.routes.setup.google_sheets.clear_current_namespace_storage"
+    ) as clear_mock:
+        with TestClient(app) as client:
+            response = client.post(
+                "/setup/reset-sheet",
+                json={"spreadsheet_id": "sheet-123", "clear_storage": False},
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "spreadsheet_id": "sheet-123",
+        "tabs_reset": 8,
+    }
+    reset_mock.assert_called_once_with(spreadsheet_id="sheet-123")
+    queue_mock.assert_not_called()
+    clear_mock.assert_not_called()
 
 
 def test_drain_queues_requires_valid_tool_token():
