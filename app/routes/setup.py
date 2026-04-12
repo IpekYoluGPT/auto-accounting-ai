@@ -46,6 +46,10 @@ class EnsureSandboxRequest(BaseModel):
     session_id: str | None = None
 
 
+class DrainQueuesRequest(BaseModel):
+    max_rounds: int = 10
+
+
 class SandboxSessionRequest(BaseModel):
     session_id: str
 
@@ -319,6 +323,41 @@ async def reset_sheet(request: Request, payload: ResetSheetRequest) -> dict[str,
         }
     except Exception as exc:
         logger.error("Sheet reset failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/drain-queues")
+async def drain_queues(request: Request, payload: DrainQueuesRequest) -> dict[str, object]:
+    """Authenticated helper to drain production queue workers on demand."""
+    _verify_admin_token(request)
+
+    try:
+        queue_before = google_sheets.queue_status()
+        processed_sheet = 0
+        processed_drive = 0
+        rounds = max(1, min(int(payload.max_rounds or 10), 20))
+
+        for _ in range(rounds):
+            sheet_count = google_sheets.process_pending_sheet_appends()
+            drive_count = google_sheets.process_pending_document_uploads()
+            processed_sheet += sheet_count
+            processed_drive += drive_count
+            if sheet_count == 0 and drive_count == 0:
+                break
+
+        queue_after = google_sheets.queue_status()
+        return {
+            "status": "ok",
+            "queue_before": queue_before,
+            "drain": {
+                "pending_sheet_appends_processed": processed_sheet,
+                "pending_drive_uploads_processed": processed_drive,
+            },
+            "queue_after": queue_after,
+            "rounds": rounds,
+        }
+    except Exception as exc:
+        logger.error("Queue drain failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

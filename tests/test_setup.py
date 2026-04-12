@@ -124,6 +124,67 @@ def test_reset_sheet_accepts_x_api_key_header():
     reset_mock.assert_called_once_with(spreadsheet_id="sheet-123")
 
 
+def test_drain_queues_requires_valid_tool_token():
+    with _lifespan_patches(), patch(
+        "app.routes.setup.settings.periskope_tool_token",
+        "secret-token",
+    ):
+        with TestClient(app) as client:
+            response = client.post("/setup/drain-queues", json={"max_rounds": 3})
+
+    assert response.status_code == 401
+
+
+
+def test_drain_queues_returns_processed_counts_and_remaining_queue():
+    with patch(
+        "app.main._start_google_sheets_bootstrap",
+    ), patch(
+        "app.main.google_sheets.start_pending_sheet_append_worker",
+    ), patch(
+        "app.main.google_sheets.start_pending_drive_upload_worker",
+    ), patch(
+        "app.main.google_sheets.start_monthly_rollover_scheduler",
+    ), patch(
+        "app.main.google_sheets.stop_monthly_rollover_scheduler",
+    ), patch(
+        "app.routes.setup.settings.periskope_tool_token",
+        "secret-token",
+    ), patch(
+        "app.routes.setup.google_sheets.queue_status",
+        side_effect=[
+            {"pending_sheet_appends": 4, "pending_drive_uploads": 2},
+            {"pending_sheet_appends": 0, "pending_drive_uploads": 0},
+        ],
+    ), patch(
+        "app.routes.setup.google_sheets.process_pending_sheet_appends",
+        side_effect=[3, 0],
+    ) as sheet_mock, patch(
+        "app.routes.setup.google_sheets.process_pending_document_uploads",
+        side_effect=[2, 0],
+    ) as drive_mock:
+        with TestClient(app) as client:
+            response = client.post(
+                "/setup/drain-queues",
+                json={"max_rounds": 5},
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "queue_before": {"pending_sheet_appends": 4, "pending_drive_uploads": 2},
+        "drain": {
+            "pending_sheet_appends_processed": 3,
+            "pending_drive_uploads_processed": 2,
+        },
+        "queue_after": {"pending_sheet_appends": 0, "pending_drive_uploads": 0},
+        "rounds": 5,
+    }
+    assert sheet_mock.call_count == 2
+    assert drive_mock.call_count == 2
+
+
 def test_sandbox_ensure_returns_structured_payload():
     context = sandbox_context(session_id="alpha")
     with _lifespan_patches(), patch(
