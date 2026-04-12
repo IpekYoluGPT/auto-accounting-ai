@@ -312,3 +312,53 @@ def test_ensure_current_month_spreadsheet_ready_skips_immediate_repair_for_recen
 
     assert result == "sheet-123"
     repair_mock.assert_not_called()
+
+
+def test_archive_drifted_tab_hides_archived_copy(monkeypatch):
+    ws = MagicMock()
+    ws.title = "Masraf Kayıtları"
+    ws.id = 42
+    ws.spreadsheet = MagicMock()
+
+    monkeypatch.setattr(google_sheets, "_list_worksheets", lambda _sh: [])
+
+    archived_title = google_sheets._archive_drifted_tab(MagicMock(), ws, "Masraf Kayıtları")
+
+    assert archived_title.startswith("Masraf Kayıtları MANUAL_DRIFT ")
+    ws.update_title.assert_called_once_with(archived_title)
+    ws.spreadsheet.batch_update.assert_called_once()
+    assert google_sheets._is_ignored_orphan_title(archived_title) is True
+
+
+def test_archive_legacy_iade_tabs_hides_archived_sheet(monkeypatch):
+    legacy_ws = MagicMock()
+    legacy_ws.title = "↩️ İadeler"
+    legacy_ws.id = 7
+    legacy_ws.spreadsheet = MagicMock()
+    canonical_ws = MagicMock()
+    canonical_ws.title = "Faturalar"
+
+    monkeypatch.setattr(google_sheets, "_list_worksheets", lambda _sh: [legacy_ws, canonical_ws])
+
+    archived = google_sheets._archive_legacy_iade_tabs(MagicMock())
+
+    assert archived == ["↩️ İadeler LEGACY"]
+    legacy_ws.update_title.assert_called_once_with("↩️ İadeler LEGACY")
+    legacy_ws.spreadsheet.batch_update.assert_called_once()
+
+
+def test_audit_repair_hides_ignored_orphan_tabs(monkeypatch):
+    archived_ws = MagicMock()
+    archived_ws.title = "Masraf Kayıtları MANUAL_DRIFT 20260412092926"
+    archived_ws.id = 99
+    archived_ws.spreadsheet = MagicMock()
+
+    monkeypatch.setattr(google_sheets, "_list_worksheets", lambda _sh: [archived_ws])
+    monkeypatch.setattr(google_sheets, "_audit_data_tab", lambda sh, tab_name, findings, repair: None)
+    monkeypatch.setattr(google_sheets, "_audit_summary_tab", lambda sh, findings, repair: None)
+    monkeypatch.setattr(google_sheets, "_archive_legacy_iade_tabs", lambda sh: [])
+
+    findings = google_sheets._audit_spreadsheet_layout(MagicMock(), repair=True)
+
+    assert findings == []
+    archived_ws.spreadsheet.batch_update.assert_called_once()

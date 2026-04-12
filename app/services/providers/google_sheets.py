@@ -446,6 +446,7 @@ _PENDING_SHEET_WORKER_RETRY_DELAY_SECONDS = 30.0
 _PENDING_SHEET_BATCH_SIZE = 25
 _LEGACY_IADE_TITLES = {"↩️ İadeler", "İadeler"}
 _LEGACY_IADE_PREFIX = "↩️ İadeler LEGACY"
+_MANUAL_DRIFT_MARKER = " MANUAL_DRIFT "
 
 
 def _get_business_timezone():
@@ -1456,9 +1457,23 @@ def _worksheet_has_visible_data(ws, tab_name: str) -> bool:
     return False
 
 
+def _set_worksheet_hidden(ws, *, hidden: bool = True) -> None:
+    try:
+        ws.spreadsheet.batch_update({
+            "requests": [{
+                "updateSheetProperties": {
+                    "properties": {"sheetId": ws.id, "hidden": hidden},
+                    "fields": "hidden",
+                }
+            }]
+        })
+    except Exception as exc:
+        logger.warning("Could not update hidden state for worksheet '%s': %s", getattr(ws, 'title', '?'), exc)
+
+
 def _archive_drifted_tab(sh, ws, tab_name: str) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    base_title = f"{tab_name} MANUAL_DRIFT {timestamp}"
+    base_title = f"{tab_name}{_MANUAL_DRIFT_MARKER}{timestamp}"
     existing_titles = {worksheet.title for worksheet in _list_worksheets(sh)}
     archived_title = base_title[:100]
     counter = 1
@@ -1467,6 +1482,7 @@ def _archive_drifted_tab(sh, ws, tab_name: str) -> str:
         archived_title = f"{base_title[:max(1, 100 - len(suffix))]}{suffix}"
         counter += 1
     ws.update_title(archived_title)
+    _set_worksheet_hidden(ws, hidden=True)
     return archived_title
 
 
@@ -1485,6 +1501,7 @@ def _archive_legacy_iade_tabs(sh) -> list[str]:
             archived_title = f"{base_title[:max(1, 100 - len(suffix))]}{suffix}"
             counter += 1
         ws.update_title(archived_title)
+        _set_worksheet_hidden(ws, hidden=True)
         existing_titles.add(archived_title)
         existing_titles.discard(title)
         archived_titles.append(archived_title)
@@ -1492,7 +1509,7 @@ def _archive_legacy_iade_tabs(sh) -> list[str]:
 
 
 def _is_ignored_orphan_title(title: str) -> bool:
-    return title.startswith(_LEGACY_IADE_PREFIX)
+    return title.startswith(_LEGACY_IADE_PREFIX) or _MANUAL_DRIFT_MARKER in title
 
 
 def _backfill_internal_row_ids(ws, tab_name: str) -> int:
@@ -1729,9 +1746,15 @@ def _audit_spreadsheet_layout(sh, *, repair: bool = False, target_tabs: set[str]
     canonical_titles = set(_TABS.keys())
     titles_to_check = [tab_name for tab_name in _TABS if target_tabs is None or tab_name in target_tabs]
 
-    existing_titles = {worksheet.title for worksheet in _list_worksheets(sh)}
+    worksheets = _list_worksheets(sh)
+    existing_titles = {worksheet.title for worksheet in worksheets}
+    worksheet_by_title = {worksheet.title: worksheet for worksheet in worksheets}
     for orphan_title in sorted(existing_titles - canonical_titles):
         if _is_ignored_orphan_title(orphan_title):
+            if repair:
+                ws = worksheet_by_title.get(orphan_title)
+                if ws is not None:
+                    _set_worksheet_hidden(ws, hidden=True)
             continue
         findings.append({
             "tab_name": orphan_title,
