@@ -4,6 +4,7 @@ Unit tests for Google Sheets retry-on-rate-limit logic.
 
 from __future__ import annotations
 
+import json
 import ssl
 import threading
 import time
@@ -258,7 +259,7 @@ def test_process_pending_document_uploads_backfills_missing_drive_links(tmp_path
     fake_client.open_by_key.assert_called_once_with("sheet-123")
     fake_sheet.worksheet.assert_called_once_with("💳 Dekontlar")
     fake_ws.update.assert_called_once_with(
-        [['=HYPERLINK("https://drive.google.com/file/d/pending/view";"📄 Görüntüle")']],
+        [['=HYPERLINK("https://drive.google.com/file/d/pending/view";"Görüntüle")']],
         "K7",
         value_input_option="USER_ENTERED",
     )
@@ -305,7 +306,7 @@ def test_process_pending_document_uploads_resolves_row_id_after_row_reorder(tmp_
     assert processed == 1
     fake_ws.get.assert_called_once_with("L3:L")
     fake_ws.update.assert_called_once_with(
-        [['=HYPERLINK("https://drive.google.com/file/d/pending/view";"📄 Görüntüle")']],
+        [['=HYPERLINK("https://drive.google.com/file/d/pending/view";"Görüntüle")']],
         "K4",
         value_input_option="USER_ENTERED",
     )
@@ -360,7 +361,7 @@ def test_process_pending_document_uploads_reuses_cached_drive_link_after_row_loo
     assert processed == 1
     assert upload_calls["count"] == 1
     fake_ws.update.assert_called_once_with(
-        [['=HYPERLINK("https://drive.google.com/file/d/pending/view";"📄 Görüntüle")']],
+        [['=HYPERLINK("https://drive.google.com/file/d/pending/view";"Görüntüle")']],
         "K3",
         value_input_option="USER_ENTERED",
     )
@@ -386,7 +387,7 @@ def test_queue_pending_document_upload_merges_targets_for_same_message(tmp_path,
         filename="Dekont.pdf",
         mime_type="application/pdf",
         targets=[
-            {"spreadsheet_id": "sheet-1", "tab_name": "↩️ İadeler", "row_number": 5, "row_id": "row-iade-1"}
+            {"spreadsheet_id": "sheet-1", "tab_name": "🏗️ Malzeme", "row_number": 5, "row_id": "row-malzeme-1"}
         ],
         source_message_id="wamid-merge-1",
     )
@@ -396,7 +397,7 @@ def test_queue_pending_document_upload_merges_targets_for_same_message(tmp_path,
     assert items[0]["source_message_id"] == "wamid-merge-1"
     assert items[0]["targets"] == [
         {"spreadsheet_id": "sheet-1", "tab_name": "💳 Dekontlar", "row_number": 3, "row_id": "row-dekont-1"},
-        {"spreadsheet_id": "sheet-1", "tab_name": "↩️ İadeler", "row_number": 5, "row_id": "row-iade-1"},
+        {"spreadsheet_id": "sheet-1", "tab_name": "🏗️ Malzeme", "row_number": 5, "row_id": "row-malzeme-1"},
     ]
 
 
@@ -432,10 +433,10 @@ def test_append_record_queues_pending_sheet_appends_and_starts_worker(tmp_path, 
     )
 
     items = google_sheets._load_pending_sheet_appends()
-    assert len(items) == 2
+    assert len(items) == 1
     assert worker_started["count"] == 1
-    assert [item["tab_name"] for item in items] == ["🧾 Faturalar", "↩️ İadeler"]
-    assert [item["category"] for item in items] == ["fatura", "iade"]
+    assert [item["tab_name"] for item in items] == ["🧾 Faturalar"]
+    assert [item["category"] for item in items] == ["fatura"]
     assert all(item["spreadsheet_id"] == "sheet-queue-1" for item in items)
     payload_paths = {item["document_payload_path"] for item in items}
     assert len(payload_paths) == 1
@@ -617,6 +618,42 @@ def test_append_record_skips_pending_payload_when_storage_budget_is_exceeded(tmp
     assert len(items) == 1
     assert items[0]["document_payload_path"] == ""
     assert list((Path(tmp_path) / "state" / "pending_sheet_appends").glob("*.bin")) == []
+
+
+def test_load_pending_sheet_appends_skips_legacy_iade_items(tmp_path, monkeypatch):
+    monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
+    queue_path = Path(tmp_path) / "state" / "pending_sheet_appends.json"
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+    queue_path.write_text(
+        json.dumps(
+            [
+                {"id": "legacy-iade", "tab_name": "↩️ İadeler", "category": "iade"},
+                {"id": "normal-1", "tab_name": "🧾 Faturalar", "category": "fatura"},
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    items = google_sheets._load_pending_sheet_appends()
+
+    assert [item["id"] for item in items] == ["normal-1"]
+
+
+
+def test_archive_legacy_iade_tabs_renames_old_tab_once(monkeypatch):
+    legacy_ws = MagicMock()
+    legacy_ws.title = "↩️ İadeler"
+    canonical_ws = MagicMock()
+    canonical_ws.title = "🧾 Faturalar"
+
+    monkeypatch.setattr(google_sheets, "_list_worksheets", lambda _sh: [legacy_ws, canonical_ws])
+
+    archived = google_sheets._archive_legacy_iade_tabs(MagicMock())
+
+    assert archived == ["↩️ İadeler LEGACY"]
+    legacy_ws.update_title.assert_called_once_with("↩️ İadeler LEGACY")
+    assert google_sheets._is_ignored_orphan_title("↩️ İadeler LEGACY") is True
 
 
 def test_google_sheets_paths_are_namespaced_for_sandbox(tmp_path, monkeypatch):

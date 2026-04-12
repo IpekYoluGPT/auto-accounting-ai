@@ -82,6 +82,72 @@ def test_persist_record_once_skips_duplicate_media_hash_even_with_new_message_id
         assert len(rows) == 1
 
 
+def test_persist_record_once_allows_split_documents_from_same_media_hash():
+    with TemporaryDirectory() as tmpdir, patch(
+        "app.services.accounting.record_store.settings.storage_dir", tmpdir
+    ):
+        first = _record(
+            "wamid-1__doc1",
+            source_media_sha256="sha-cek-1",
+            company_name="Yapı Kredi",
+            document_number="CHK-001",
+            document_date="2026-03-30",
+            total_amount=444000.0,
+        )
+        second = _record(
+            "wamid-1__doc2",
+            source_media_sha256="sha-cek-1",
+            company_name="Yapı Kredi",
+            document_number="CHK-002",
+            document_date="2026-04-20",
+            total_amount=444000.0,
+        )
+        third = _record(
+            "wamid-1__doc3",
+            source_media_sha256="sha-cek-1",
+            company_name="Yapı Kredi",
+            document_number="CHK-003",
+            document_date="2026-04-30",
+            total_amount=444000.0,
+        )
+
+        assert record_store.persist_record_once(first) is True
+        assert record_store.persist_record_once(second) is True
+        assert record_store.persist_record_once(third) is True
+
+        rows = _read_rows(tmpdir)
+        assert len(rows) == 3
+
+
+
+def test_persist_record_once_skips_duplicate_split_documents_on_resend():
+    with TemporaryDirectory() as tmpdir, patch(
+        "app.services.accounting.record_store.settings.storage_dir", tmpdir
+    ):
+        original = _record(
+            "wamid-1__doc1",
+            source_media_sha256="sha-cek-1",
+            company_name="Yapı Kredi",
+            document_number="CHK-001",
+            document_date="2026-03-30",
+            total_amount=444000.0,
+        )
+        resend = _record(
+            "wamid-2__doc1",
+            source_media_sha256="sha-cek-1",
+            company_name="Yapı Kredi",
+            document_number="CHK-001",
+            document_date="2026-03-30",
+            total_amount=444000.0,
+        )
+
+        assert record_store.persist_record_once(original) is True
+        assert record_store.persist_record_once(resend) is False
+
+        rows = _read_rows(tmpdir)
+        assert len(rows) == 1
+
+
 def test_persist_record_once_skips_duplicate_structured_document_fingerprint():
     with TemporaryDirectory() as tmpdir, patch(
         "app.services.accounting.record_store.settings.storage_dir", tmpdir

@@ -44,6 +44,16 @@ async def lifespan(app: FastAPI):
                 )
             else:
                 logger.info("Using Railway volume-backed storage at %s.", storage_path)
+    configured_models = {
+        "classifier": settings.gemini_classifier_model,
+        "extractor": settings.gemini_extractor_model,
+        "validation": settings.gemini_validation_model,
+    }
+    non_pro_models = {name: model for name, model in configured_models.items() if model != "gemini-2.5-pro"}
+    if non_pro_models:
+        logger.warning("Gemini model override detected; expected gemini-2.5-pro but got %s", non_pro_models)
+    if not settings.periskope_signing_key:
+        logger.warning("PERISKOPE_SIGNING_KEY is not configured; webhook signature verification will be skipped.")
     google_sheets.ensure_current_month_spreadsheet_ready()
     google_sheets.process_pending_sheet_appends()
     google_sheets.process_pending_document_uploads()

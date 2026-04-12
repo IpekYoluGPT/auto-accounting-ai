@@ -44,40 +44,35 @@ _TABS: dict[str, tuple[list[str], dict]] = {
     "🧾 Faturalar": (
         ["#", "Tarih", "Saat", "Firma Adı", "Vergi No", "Vergi Dairesi",
          "Fatura No", "KDVsiz Tutar", "KDV %", "KDV Tutarı", "GENEL TOPLAM",
-         "Ödeme Yöntemi", "Gider Kategorisi", "Açıklama", "Notlar", "📎 Belge"],
+         "Ödeme Yöntemi", "Gider Kategorisi", "Açıklama", "Notlar", "Belge"],
         {"red": 0.16, "green": 0.38, "blue": 0.74},
     ),
     "💳 Dekontlar": (
         ["#", "Tarih", "Saat", "Banka / Firma", "Referans No",
-         "Gönderen", "Alıcı / Açıklama", "TUTAR", "Para Birimi", "Notlar", "📎 Belge"],
+         "Gönderen", "Alıcı / Açıklama", "TUTAR", "Para Birimi", "Notlar", "Belge"],
         {"red": 0.13, "green": 0.55, "blue": 0.13},
     ),
     "⛽ Harcama Fişleri": (
         ["#", "Tarih", "Saat", "Firma", "Fiş No", "Vergi No",
          "KDVsiz", "KDV %", "KDV", "TOPLAM", "Ödeme", "Kategori",
-         "Açıklama", "Plaka", "📎 Belge"],
+         "Açıklama", "Plaka", "Belge"],
         {"red": 0.90, "green": 0.49, "blue": 0.13},
     ),
     "📝 Çekler": (
         ["#", "Çek / Belge No", "Düzenleyen Firma", "Vergi No",
          "Lehdar (Alıcı)", "Vade Tarihi", "TUTAR", "Para Birimi",
-         "Açıklama", "📎 Belge"],
+         "Açıklama", "Belge"],
         {"red": 0.76, "green": 0.09, "blue": 0.09},
     ),
     "💵 Elden Ödemeler": (
-        ["#", "Tarih", "Saat", "Alıcı / Açıklama", "TUTAR", "Para Birimi", "Kaydeden", "📎 Belge"],
+        ["#", "Tarih", "Saat", "Alıcı / Açıklama", "TUTAR", "Para Birimi", "Kaydeden", "Belge"],
         {"red": 0.46, "green": 0.11, "blue": 0.64},
     ),
     "🏗️ Malzeme": (
         ["#", "Tarih", "Firma", "İrsaliye / Belge No", "Malzeme Cinsi",
          "Miktar", "Birim", "Teslim Yeri", "Plaka", "Tutar",
-         "Açıklama", "📎 Belge"],
+         "Açıklama", "Belge"],
         {"red": 0.47, "green": 0.27, "blue": 0.08},
-    ),
-    "↩️ İadeler": (
-        ["#", "Tarih", "Belge Türü", "Firma", "Belge No",
-         "TUTAR", "Para Birimi", "Açıklama", "📎 Belge"],
-        {"red": 0.44, "green": 0.44, "blue": 0.44},
     ),
 }
 
@@ -89,7 +84,7 @@ _CATEGORY_TAB: dict[DocumentCategory, str] = {
     DocumentCategory.CEK: "📝 Çekler",
     DocumentCategory.ELDEN_ODEME: "💵 Elden Ödemeler",
     DocumentCategory.MALZEME: "🏗️ Malzeme",
-    DocumentCategory.IADE: "↩️ İadeler",
+    DocumentCategory.IADE: "🧾 Faturalar",
     DocumentCategory.BELIRSIZ: "🧾 Faturalar",
 }
 
@@ -102,7 +97,6 @@ _PLAIN_TO_EMOJI: dict[str, str] = {
     "Çekler": "📝 Çekler",
     "Elden Ödemeler": "💵 Elden Ödemeler",
     "Malzeme": "🏗️ Malzeme",
-    "İadeler": "↩️ İadeler",
 }
 
 _TAB_TOTAL_COLUMNS: dict[str, str] = {
@@ -112,7 +106,6 @@ _TAB_TOTAL_COLUMNS: dict[str, str] = {
     "📝 Çekler": "G",
     "💵 Elden Ödemeler": "E",
     "🏗️ Malzeme": "J",
-    "↩️ İadeler": "F",
 }
 
 _SCOPES = [
@@ -165,7 +158,7 @@ _COL_WIDTHS: dict[str, int] = {
     "Lehdar (Alıcı)": 150,
     "Vade Tarihi": 90,
     "Kaydeden": 130,
-    "📎 Belge": 48,
+    "Belge": 100,
 }
 
 # Columns that should wrap text (long free-text fields)
@@ -207,6 +200,8 @@ _RECENT_PREPARED_TTL_SECONDS = 180.0
 _PENDING_DRIVE_WORKER_DELAY_SECONDS = 15.0
 _PENDING_SHEET_WORKER_RETRY_DELAY_SECONDS = 30.0
 _PENDING_SHEET_BATCH_SIZE = 25
+_LEGACY_IADE_TITLES = {"↩️ İadeler", "İadeler"}
+_LEGACY_IADE_PREFIX = "↩️ İadeler LEGACY"
 
 
 def _get_business_timezone():
@@ -807,6 +802,79 @@ def _looks_like_total_row(first_cell: str | None) -> bool:
     return (first_cell or "").strip().upper() == "TOPLAM"
 
 
+def _summary_rows() -> list[tuple[str, str]]:
+    return [
+        ("🧾 Faturalar Toplamı (TL)", "🧾 Faturalar"),
+        ("💳 Ödeme Dekontları (TL)", "💳 Dekontlar"),
+        ("⛽ Harcama Fişleri (TL)", "⛽ Harcama Fişleri"),
+        ("📝 Çekler (TL)", "📝 Çekler"),
+        ("💵 Elden Ödemeler (TL)", "💵 Elden Ödemeler"),
+        ("🏗️ Malzeme (TL)", "🏗️ Malzeme"),
+    ]
+
+
+def _apply_lightweight_layout(ws, headers: list[str]) -> None:
+    requests = []
+    sheet_id = ws.id
+
+    for i, header in enumerate(headers):
+        if header != "Belge":
+            continue
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": i,
+                    "endIndex": i + 1,
+                },
+                "properties": {"pixelSize": _COL_WIDTHS["Belge"]},
+                "fields": "pixelSize",
+            }
+        })
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 0,
+                    "startColumnIndex": i,
+                    "endColumnIndex": i + 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "horizontalAlignment": "CENTER",
+                        "verticalAlignment": "MIDDLE",
+                    }
+                },
+                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment)",
+            }
+        })
+
+    requests.append({
+        "updateDimensionProperties": {
+            "range": {
+                "sheetId": sheet_id,
+                "dimension": "COLUMNS",
+                "startIndex": len(headers),
+                "endIndex": len(headers) + 1,
+            },
+            "properties": {
+                "pixelSize": 1,
+                "hiddenByUser": True,
+            },
+            "fields": "pixelSize,hiddenByUser",
+        }
+    })
+
+    if not requests:
+        return
+
+    try:
+        ws.spreadsheet.batch_update({"requests": requests})
+    except Exception as exc:
+        logger.warning("Lightweight layout batch update failed for '%s': %s", ws.title, exc)
+
+
 def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
     """Format a data worksheet: freeze row 1, bold + coloured headers,
     column widths, text-wrap on long fields, number format on amounts."""
@@ -826,6 +894,7 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
     ws.freeze(rows=2)
 
     if lightweight:
+        _apply_lightweight_layout(ws, headers)
         logger.debug("Worksheet '%s' bootstrapped in lightweight mode.", tab_name)
         return
 
@@ -854,12 +923,10 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
         "textFormat": {"bold": True, "fontSize": 10},
         "verticalAlignment": "MIDDLE",
     })
-    # Build batch requests for column widths, wrap, and number format
     requests = []
     sheet_id = ws.id
 
     for i, header in enumerate(headers):
-        # Column width
         width = _COL_WIDTHS.get(header, 120)
         requests.append({
             "updateDimensionProperties": {
@@ -874,7 +941,6 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
             }
         })
 
-        # Text wrap for long free-text columns (rows 2+)
         if header in _WRAP_COLUMNS:
             requests.append({
                 "repeatCell": {
@@ -893,7 +959,6 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
                 }
             })
 
-        # Number format for amount columns
         if header in _AMOUNT_COLUMNS:
             requests.append({
                 "repeatCell": {
@@ -916,6 +981,25 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
                 }
             })
 
+        if header == "Belge":
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 2,
+                        "startColumnIndex": i,
+                        "endColumnIndex": i + 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "horizontalAlignment": "CENTER",
+                            "verticalAlignment": "MIDDLE",
+                        }
+                    },
+                    "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment)",
+                }
+            })
+
     requests.append({
         "updateDimensionProperties": {
             "range": {
@@ -932,7 +1016,6 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
         }
     })
 
-    # Row height for header
     requests.append({
         "updateDimensionProperties": {
             "range": {
@@ -957,6 +1040,11 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
 def _setup_summary_tab(ws, month_label: str, *, lightweight: bool = False) -> None:
     """Populate the 📊 Özet tab with title, labels, and cross-sheet SUM formulas."""
     header_color = _TABS["📊 Özet"][1]
+    summary_rows = _summary_rows()
+    total_end_row = len(summary_rows) + 1
+    blank_row = total_end_row + 1
+    total_row = blank_row + 1
+    total_formula = f"=SUM(B2:B{total_end_row})"
 
     if not lightweight:
         try:
@@ -964,18 +1052,11 @@ def _setup_summary_tab(ws, month_label: str, *, lightweight: bool = False) -> No
         except Exception:
             pass
 
-    ws.update([["📊 ÖZET — " + month_label, ""]], "A1", value_input_option="RAW")
-    ws.update([
-        ["🧾 Faturalar Toplamı (TL)",       _build_summary_formula("🧾 Faturalar")],
-        ["💳 Ödeme Dekontları (TL)",         _build_summary_formula("💳 Dekontlar")],
-        ["⛽ Harcama Fişleri (TL)",          _build_summary_formula("⛽ Harcama Fişleri")],
-        ["📝 Çekler (TL)",                   _build_summary_formula("📝 Çekler")],
-        ["💵 Elden Ödemeler (TL)",           _build_summary_formula("💵 Elden Ödemeler")],
-        ["🏗️ Malzeme (TL)",                 _build_summary_formula("🏗️ Malzeme")],
-        ["↩️ İadeler (TL)",                  _build_summary_formula("↩️ İadeler")],
-        ["", ""],
-        ["💰 GENEL TOPLAM (TL)",             "=SUM(B2:B8)"],
-    ], "A2", value_input_option="USER_ENTERED")
+    values = [["📊 ÖZET — " + month_label, ""]]
+    values.extend([[label, _build_summary_formula(tab_name)] for label, tab_name in summary_rows])
+    values.append(["", ""])
+    values.append(["💰 GENEL TOPLAM (TL)", total_formula])
+    ws.update(values, "A1", value_input_option="USER_ENTERED")
     ws.freeze(rows=1)
 
     if lightweight:
@@ -993,20 +1074,17 @@ def _setup_summary_tab(ws, month_label: str, *, lightweight: bool = False) -> No
     })
     ws.merge_cells("A1:B1")
 
-    # Style label column
-    ws.format("A2:A8", {"textFormat": {"fontSize": 11}})
-    ws.format("B2:B8", {
+    ws.format(f"A2:A{total_end_row}", {"textFormat": {"fontSize": 11}})
+    ws.format(f"B2:B{total_end_row}", {
         "textFormat": {"fontSize": 11, "bold": True},
         "numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"},
     })
-    # Style total row
-    ws.format("A10:B10", {
+    ws.format(f"A{total_row}:B{total_row}", {
         "textFormat": {"bold": True, "fontSize": 12},
         "backgroundColor": {"red": 0.95, "green": 0.95, "blue": 0.95},
         "numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"},
     })
 
-    # Column widths
     try:
         ws.spreadsheet.batch_update({
             "requests": [
@@ -1037,10 +1115,9 @@ def _setup_summary_tab(ws, month_label: str, *, lightweight: bool = False) -> No
             ]
         })
     except Exception:
-        pass  # column width is cosmetic, ignore errors
+        pass
 
     logger.debug("📊 Özet tab populated for %s.", month_label)
-
 
 def _ensure_tab_total_row(ws, tab_name: str) -> None:
     headers, _ = _TABS[tab_name]
@@ -1142,6 +1219,31 @@ def _archive_drifted_tab(sh, ws, tab_name: str) -> str:
     return archived_title
 
 
+def _archive_legacy_iade_tabs(sh) -> list[str]:
+    archived_titles: list[str] = []
+    existing_titles = {worksheet.title for worksheet in _list_worksheets(sh)}
+    for ws in _list_worksheets(sh):
+        title = ws.title
+        if title not in _LEGACY_IADE_TITLES:
+            continue
+        base_title = _LEGACY_IADE_PREFIX
+        archived_title = base_title[:100]
+        counter = 1
+        while archived_title in existing_titles:
+            suffix = f" {counter}"
+            archived_title = f"{base_title[:max(1, 100 - len(suffix))]}{suffix}"
+            counter += 1
+        ws.update_title(archived_title)
+        existing_titles.add(archived_title)
+        existing_titles.discard(title)
+        archived_titles.append(archived_title)
+    return archived_titles
+
+
+def _is_ignored_orphan_title(title: str) -> bool:
+    return title.startswith(_LEGACY_IADE_PREFIX)
+
+
 def _backfill_internal_row_ids(ws, tab_name: str) -> int:
     headers, _ = _TABS[tab_name]
     hidden_col = _internal_row_id_column_letter(tab_name)
@@ -1171,10 +1273,20 @@ def _backfill_internal_row_ids(ws, tab_name: str) -> int:
     return repaired
 
 
+def _legacy_header_variant(expected_headers: list[str]) -> list[str]:
+    return ["📎 Belge" if header == "Belge" else header for header in expected_headers]
+
+
 def _tab_headers_match(ws, tab_name: str) -> bool:
     expected_headers, _ = _TABS[tab_name]
     actual_headers = _row_values(ws, 1)[: len(expected_headers)]
     return actual_headers == expected_headers
+
+
+def _tab_headers_can_migrate_in_place(ws, tab_name: str) -> bool:
+    expected_headers, _ = _TABS[tab_name]
+    actual_headers = _row_values(ws, 1)[: len(expected_headers)]
+    return actual_headers == _legacy_header_variant(expected_headers)
 
 
 def _tab_total_row_is_valid(ws, tab_name: str) -> bool:
@@ -1199,8 +1311,13 @@ def _tab_total_row_is_valid(ws, tab_name: str) -> bool:
 
 
 def _summary_tab_is_valid(ws) -> bool:
+    summary_rows = _summary_rows()
+    total_end_row = len(summary_rows) + 1
+    total_row_index = len(summary_rows) + 2
+    expected_total = f"=SUM(B2:B{total_end_row})"
+
     try:
-        rows = _get_range_values(ws, "A1:B10", value_render_option="FORMULA")
+        rows = _get_range_values(ws, f"A1:B{total_row_index + 1}", value_render_option="FORMULA")
     except Exception:
         return False
 
@@ -1208,15 +1325,14 @@ def _summary_tab_is_valid(ws) -> bool:
     if not title.startswith("📊 ÖZET — "):
         return False
 
-    expected_formulas = [_build_summary_formula(tab_name) for tab_name in list(_TABS.keys())[1:]]
-    expected_total = "=SUM(B2:B8)"
+    expected_formulas = [_build_summary_formula(tab_name) for _, tab_name in summary_rows]
     for index, formula in enumerate(expected_formulas, start=1):
         row = rows[index] if len(rows) > index else []
         actual_formula = str(row[1]).strip() if len(row) > 1 else ""
         if actual_formula != formula:
             return False
 
-    total_row = rows[9] if len(rows) > 9 else []
+    total_row = rows[total_row_index] if len(rows) > total_row_index else []
     actual_total_formula = str(total_row[1]).strip() if len(total_row) > 1 else ""
     return actual_total_formula == expected_total
 
@@ -1283,7 +1399,9 @@ def _audit_data_tab(sh, tab_name: str, findings: list[dict[str, object]], *, rep
         }
         findings.append(finding)
         if repair:
-            if _worksheet_has_visible_data(ws, tab_name):
+            if _tab_headers_can_migrate_in_place(ws, tab_name):
+                _setup_worksheet(ws, tab_name, lightweight=True)
+            elif _worksheet_has_visible_data(ws, tab_name):
                 finding["archived_to"] = _archive_drifted_tab(sh, ws, tab_name)
                 ws = _ensure_tab_exists(sh, tab_name, lightweight=True)
             else:
@@ -1345,11 +1463,24 @@ def _audit_data_tab(sh, tab_name: str, findings: list[dict[str, object]], *, rep
 
 def _audit_spreadsheet_layout(sh, *, repair: bool = False, target_tabs: set[str] | None = None) -> list[dict[str, object]]:
     findings: list[dict[str, object]] = []
+    if repair:
+        archived_legacy_tabs = _archive_legacy_iade_tabs(sh)
+        for archived_title in archived_legacy_tabs:
+            findings.append({
+                "tab_name": archived_title,
+                "code": "legacy_iade_archived",
+                "severity": "info",
+                "repaired": True,
+                "message": "Archived the legacy İadeler worksheet outside the active layout.",
+            })
+
     canonical_titles = set(_TABS.keys())
     titles_to_check = [tab_name for tab_name in _TABS if target_tabs is None or tab_name in target_tabs]
 
     existing_titles = {worksheet.title for worksheet in _list_worksheets(sh)}
     for orphan_title in sorted(existing_titles - canonical_titles):
+        if _is_ignored_orphan_title(orphan_title):
+            continue
         findings.append({
             "tab_name": orphan_title,
             "code": "orphan_tab",
@@ -1365,7 +1496,6 @@ def _audit_spreadsheet_layout(sh, *, repair: bool = False, target_tabs: set[str]
         _audit_data_tab(sh, tab_name, findings, repair=repair)
 
     return findings
-
 
 def queue_status() -> dict[str, int]:
     return {
@@ -1881,7 +2011,7 @@ def _drive_cell(drive_link: Optional[str]) -> str:
     """Return a HYPERLINK formula if we have a link, otherwise empty string."""
     if drive_link:
         sep = _formula_arg_separator()
-        return f'=HYPERLINK("{drive_link}"{sep}"📄 Görüntüle")'
+        return f'=HYPERLINK("{drive_link}"{sep}"Görüntüle")'
     return ""
 
 
@@ -2110,7 +2240,27 @@ def _load_pending_drive_uploads() -> list[dict]:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return []
-    return raw if isinstance(raw, list) else []
+    if not isinstance(raw, list):
+        return []
+
+    normalized_items: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        targets = []
+        for target in item.get("targets", []):
+            if not isinstance(target, dict):
+                continue
+            tab_name = str(target.get("tab_name") or "")
+            if tab_name in _LEGACY_IADE_TITLES or _is_ignored_orphan_title(tab_name):
+                continue
+            targets.append(target)
+        if not targets:
+            continue
+        normalized_item = dict(item)
+        normalized_item["targets"] = targets
+        normalized_items.append(normalized_item)
+    return normalized_items
 
 
 def _save_pending_drive_uploads(items: list[dict]) -> None:
@@ -2351,7 +2501,23 @@ def _load_pending_sheet_appends() -> list[dict]:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return []
-    return raw if isinstance(raw, list) else []
+    if not isinstance(raw, list):
+        return []
+
+    normalized_items: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        tab_name = str(item.get("tab_name") or "")
+        if tab_name in _LEGACY_IADE_TITLES or _is_ignored_orphan_title(tab_name):
+            continue
+        normalized_item = dict(item)
+        if str(normalized_item.get("category") or "") == DocumentCategory.IADE.value:
+            normalized_item["category"] = DocumentCategory.FATURA.value
+            normalized_item["tab_name"] = "🧾 Faturalar"
+            normalized_item["return_source_category"] = ""
+        normalized_items.append(normalized_item)
+    return normalized_items
 
 
 def _save_pending_sheet_appends(items: list[dict]) -> None:
@@ -2800,8 +2966,8 @@ def append_record(
     Queue *record* for append into the correct Google Sheets tab for *category*.
 
     drive_link: Google Drive web-view URL for the original document.
-                Shown as a clickable "📄 Görüntüle" link in the 📎 Belge column.
-    If is_return is True, also queues a row in ↩️ İadeler.
+                Shown as a clickable "Görüntüle" link in the Belge column.
+    Return documents remain in their base category tab; no separate active İadeler tab is used.
     All errors are caught so CSV persistence is never disrupted.
     """
     client = _get_client()
@@ -2809,11 +2975,12 @@ def append_record(
         return []
 
     try:
-        tab_name = _CATEGORY_TAB.get(category, "🧾 Faturalar")
+        normalized_category = DocumentCategory.FATURA if category == DocumentCategory.IADE else category
+        tab_name = _CATEGORY_TAB.get(normalized_category, "🧾 Faturalar")
         items = [
             _queue_pending_sheet_append_item(
                 record=record,
-                category=category,
+                category=normalized_category,
                 tab_name=tab_name,
                 drive_link=drive_link,
                 document_payload=None if drive_link else pending_document_bytes,
@@ -2821,19 +2988,6 @@ def append_record(
                 document_mime_type=None if drive_link else pending_document_mime_type,
             )
         ]
-        if is_return and tab_name != "↩️ İadeler":
-            items.append(
-                _queue_pending_sheet_append_item(
-                    record=record,
-                    category=DocumentCategory.IADE,
-                    tab_name="↩️ İadeler",
-                    drive_link=drive_link,
-                    return_source_category=category,
-                    document_payload=None if drive_link else pending_document_bytes,
-                    document_filename=None if drive_link else pending_document_filename,
-                    document_mime_type=None if drive_link else pending_document_mime_type,
-                )
-            )
 
         with _pending_sheet_appends_lock:
             pending_items = _load_pending_sheet_appends()
@@ -2841,9 +2995,10 @@ def append_record(
             _save_pending_sheet_appends(pending_items)
 
         logger.info(
-            "Queued %d Google Sheets append(s) for category=%s message_id=%s.",
+            "Queued %d Google Sheets append(s) for category=%s is_return=%s message_id=%s.",
             len(items),
-            category,
+            normalized_category,
+            is_return,
             record.source_message_id,
         )
         start_pending_sheet_append_worker()

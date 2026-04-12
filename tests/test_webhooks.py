@@ -336,6 +336,8 @@ def test_group_image_webhook_reacts_to_group_and_exports_group_metadata():
             category_hint=DocumentCategory.FATURA,
             document_count_hint=None,
             is_return_hint=False,
+            strict_document_count=None,
+            split_retry=False,
         )
         send_mock.assert_not_called()
         assert reaction_mock.call_count == 2
@@ -483,6 +485,172 @@ def test_malformed_json_returns_ignored():
     )
     assert response.status_code == 200
     assert response.json() == {"status": "ignored"}
+
+
+def test_multi_document_image_exports_all_records_when_counts_match():
+    with TemporaryDirectory() as tmpdir:
+        client = TestClient(app)
+
+        records = [
+            BillRecord(
+                company_name="Yapı Kredi",
+                document_number="CHK-001",
+                document_date="2026-03-30",
+                total_amount=444000.0,
+                currency="TRY",
+                source_message_id="wamid-checks-1__doc1",
+                source_filename="checks.jpg",
+                source_type="image",
+                confidence=0.91,
+            ),
+            BillRecord(
+                company_name="Yapı Kredi",
+                document_number="CHK-002",
+                document_date="2026-04-20",
+                total_amount=444000.0,
+                currency="TRY",
+                source_message_id="wamid-checks-1__doc2",
+                source_filename="checks.jpg",
+                source_type="image",
+                confidence=0.91,
+            ),
+            BillRecord(
+                company_name="Yapı Kredi",
+                document_number="CHK-003",
+                document_date="2026-04-30",
+                total_amount=444000.0,
+                currency="TRY",
+                source_message_id="wamid-checks-1__doc3",
+                source_filename="checks.jpg",
+                source_type="image",
+                confidence=0.91,
+            ),
+        ]
+
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.routes.webhooks.whatsapp.fetch_media", return_value=b"same-image"
+        ), patch(
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(DocumentCategory.CEK, confidence=0.95, document_count=3),
+        ), patch(
+            "app.services.accounting.intake.gemini_extractor.extract_bills",
+            return_value=records,
+        ) as extract_mock, patch(
+            "app.services.accounting.intake.google_sheets.upload_document",
+            return_value="https://drive.google.com/file/d/test/view",
+        ), patch(
+            "app.routes.webhooks.whatsapp.send_text_message"
+        ) as send_mock, patch(
+            "app.routes.webhooks.whatsapp.send_reaction_message"
+        ) as reaction_mock:
+            response = client.post("/webhook", json=_image_payload("wamid-checks-1"))
+
+        assert response.status_code == 200
+        rows = _read_export_rows(tmpdir)
+        assert len(rows) == 3
+        assert extract_mock.call_count == 1
+        send_mock.assert_not_called()
+        assert [call.args[2] for call in reaction_mock.call_args_list] == ["⌛", "✅"]
+
+
+
+def test_multi_document_image_requires_all_or_retry_when_split_stays_incomplete():
+    with TemporaryDirectory() as tmpdir:
+        client = TestClient(app)
+
+        partial_records = [
+            BillRecord(
+                company_name="Yapı Kredi",
+                document_number="CHK-001",
+                document_date="2026-03-30",
+                total_amount=444000.0,
+                currency="TRY",
+                source_message_id="wamid-checks-2__doc1",
+                source_filename="checks.jpg",
+                source_type="image",
+                confidence=0.91,
+            ),
+            BillRecord(
+                company_name="Yapı Kredi",
+                document_number="CHK-002",
+                document_date="2026-04-20",
+                total_amount=444000.0,
+                currency="TRY",
+                source_message_id="wamid-checks-2__doc2",
+                source_filename="checks.jpg",
+                source_type="image",
+                confidence=0.91,
+            ),
+        ]
+
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.routes.webhooks.whatsapp.fetch_media", return_value=b"same-image"
+        ), patch(
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(DocumentCategory.CEK, confidence=0.95, document_count=3),
+        ), patch(
+            "app.services.accounting.intake.gemini_extractor.extract_bills",
+            side_effect=[partial_records, partial_records],
+        ) as extract_mock, patch(
+            "app.routes.webhooks.whatsapp.send_text_message"
+        ) as send_mock, patch(
+            "app.routes.webhooks.whatsapp.send_reaction_message"
+        ) as reaction_mock:
+            response = client.post("/webhook", json=_image_payload("wamid-checks-2"))
+
+        assert response.status_code == 200
+        assert _read_export_rows(tmpdir) == []
+        assert extract_mock.call_count == 2
+        assert extract_mock.call_args_list[0].kwargs["split_retry"] is False
+        assert extract_mock.call_args_list[1].kwargs["split_retry"] is True
+        assert extract_mock.call_args_list[1].kwargs["strict_document_count"] == 3
+        send_mock.assert_called_once()
+        assert "birden fazla belge var" in send_mock.call_args.args[1].lower()
+        assert [call.args[2] for call in reaction_mock.call_args_list] == ["⌛", "⚠️"]
+
+
+
+def test_sheet_backlog_notice_is_throttled_per_chat():
+    record = BillRecord(
+        company_name="ABC Market",
+        total_amount=100.0,
+        currency="TRY",
+        source_message_id="wamid-backlog-1",
+        source_filename="media-1.jpg",
+        source_type="image",
+        document_date="2026-04-09",
+        confidence=0.91,
+    )
+
+    with TemporaryDirectory() as tmpdir:
+        client = TestClient(app)
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.routes.webhooks.whatsapp.fetch_media", return_value=b"fake-image"
+        ), patch(
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(DocumentCategory.FATURA, confidence=0.95),
+        ), patch(
+            "app.services.accounting.intake.gemini_extractor.extract_bills",
+            side_effect=[[record], [record.model_copy(update={"source_message_id": "wamid-backlog-2"})]],
+        ), patch(
+            "app.services.accounting.intake.google_sheets.upload_document",
+            return_value="https://drive.google.com/file/d/test/view",
+        ), patch(
+            "app.services.accounting.intake.google_sheets.queue_status",
+            return_value={"pending_sheet_appends": 7, "pending_drive_uploads": 0},
+        ), patch(
+            "app.routes.webhooks.whatsapp.send_text_message"
+        ) as send_mock, patch(
+            "app.routes.webhooks.whatsapp.send_reaction_message"
+        ) as reaction_mock:
+            response_one = client.post("/webhook", json=_image_payload("wamid-backlog-1"))
+            response_two = client.post("/webhook", json=_image_payload("wamid-backlog-2"))
+
+        assert response_one.status_code == 200
+        assert response_two.status_code == 200
+        assert send_mock.call_count == 1
+        assert "tabloya yazılıyor" in send_mock.call_args.args[1].lower()
+        assert [call.args[2] for call in reaction_mock.call_args_list] == ["⌛", "✅", "⌛", "✅"]
 
 
 def test_duplicate_content_with_new_message_id_writes_only_one_export_row():
@@ -770,6 +938,8 @@ def test_document_webhook_defaults_pdf_metadata():
             category_hint=DocumentCategory.FATURA,
             document_count_hint=None,
             is_return_hint=False,
+            strict_document_count=None,
+            split_retry=False,
         )
         send_mock.assert_not_called()
         assert reaction_mock.call_count == 2

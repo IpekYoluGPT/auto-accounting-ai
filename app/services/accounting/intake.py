@@ -97,6 +97,11 @@ MSG_MEDIA_RETRY_QUALITY = (
     "Belge çok belirsiz veya eksik görünüyor. "
     "Lütfen tek belge içeren daha net ve tam bir fotoğraf/PDF gönderin."
 )
+MSG_MEDIA_MULTI_DOCUMENT_RETRY = (
+    "Aynı fotoğrafta birden fazla belge var ama hepsini güvenle ayıramadım. "
+    "Lütfen daha net bir görsel veya belgeleri ayrı ayrı gönderin."
+)
+MSG_SHEET_BACKLOG_NOTICE = "Belgeler alındı, tabloya yazılıyor; birkaç dakika sürebilir."
 
 REACTION_PROCESSING = "⌛"
 REACTION_SUCCESS = "✅"
@@ -119,7 +124,10 @@ _RETRYABLE_MEDIA_OUTCOMES = {
     "classification_failed",
     "category_failed",
     "extraction_failed",
+    "multi_document_retry_required",
 }
+
+_BACKLOG_NOTICE_THRESHOLD = 5
 
 
 # ─── Route descriptor ─────────────────────────────────────────────────────────
@@ -440,9 +448,10 @@ def _handle_media(
 
     category = analysis.category
     is_return = analysis.is_return
+    expected_document_count = analysis.document_count if analysis.document_count > 1 else None
 
-    try:
-        records = gemini_extractor.extract_bills(
+    def _extract_valid_records(*, split_retry: bool) -> list[BillRecord]:
+        extracted_records = gemini_extractor.extract_bills(
             image_bytes=working_bytes,
             mime_type=working_mime_type,
             source_message_id=message_id,
@@ -453,9 +462,15 @@ def _handle_media(
             source_group_id=route.group_id,
             source_chat_type=route.chat_type,
             category_hint=category,
-            document_count_hint=analysis.document_count if analysis.document_count > 1 else None,
+            document_count_hint=expected_document_count,
             is_return_hint=is_return,
+            strict_document_count=expected_document_count if split_retry else None,
+            split_retry=split_retry,
         )
+        return [record for record in extracted_records if _record_meets_minimum_fields(record, category)]
+
+    try:
+        valid_records = _extract_valid_records(split_retry=False)
     except Exception as exc:
         logger.warning("Failed to extract bills for message id=%s: %s", message_id, exc)
         return _handle_media_failure(
@@ -467,7 +482,43 @@ def _handle_media(
             outcome="extraction_failed",
         )
 
-    valid_records = [record for record in records if _record_meets_minimum_fields(record, category)]
+    if expected_document_count and len(valid_records) != expected_document_count:
+        logger.warning(
+            "Multi-document extraction count mismatch for message id=%s: expected=%d got=%d; retrying with strict split prompt.",
+            message_id,
+            expected_document_count,
+            len(valid_records),
+        )
+        try:
+            retry_records = _extract_valid_records(split_retry=True)
+        except Exception as exc:
+            logger.warning("Failed strict multi-document extraction for message id=%s: %s", message_id, exc)
+            return _handle_media_failure(
+                route,
+                send_text,
+                send_reaction,
+                message=_message_for_media_exception(exc, MSG_MEDIA_EXTRACTION_ERROR),
+                reason="strict multi-document extraction failed",
+                outcome="extraction_failed",
+            )
+
+        if len(retry_records) != expected_document_count:
+            logger.warning(
+                "Strict multi-document extraction still mismatched for message id=%s: expected=%d got=%d.",
+                message_id,
+                expected_document_count,
+                len(retry_records),
+            )
+            return _handle_media_failure(
+                route,
+                send_text,
+                send_reaction,
+                message=MSG_MEDIA_MULTI_DOCUMENT_RETRY,
+                reason="multi-document retry required",
+                outcome="multi_document_retry_required",
+            )
+        valid_records = retry_records
+
     if not valid_records:
         logger.warning("Gemini returned no usable documents for message id=%s", message_id)
         return _handle_media_failure(
@@ -498,6 +549,8 @@ def _handle_media(
             pending_document_mime_type=None if drive_link else mime_type,
         )
 
+    if persisted_count > 0:
+        _maybe_send_sheet_backlog_notice(route, send_text=send_text)
     if persisted_count == 0:
         _safe_send_reaction(route, REACTION_SUCCESS, reason="already exported reaction", send_reaction=send_reaction)
         return "already_exported"
@@ -591,6 +644,25 @@ def _send_throttled_warning(
         return False
     _safe_send_text_message(route, text, reason=reason, send_text=send_text)
     return True
+
+
+def _maybe_send_sheet_backlog_notice(route: MessageRoute, *, send_text: SendTextFn) -> None:
+    try:
+        backlog = google_sheets.queue_status().get("pending_sheet_appends", 0)
+    except Exception as exc:
+        logger.warning("Could not inspect Google Sheets backlog for chat_id=%s: %s", route.chat_id, exc)
+        return
+
+    if backlog < _BACKLOG_NOTICE_THRESHOLD:
+        return
+
+    _send_throttled_warning(
+        route,
+        MSG_SHEET_BACKLOG_NOTICE,
+        warning_key="sheet_backlog_notice",
+        reason="sheet backlog notice",
+        send_text=send_text,
+    )
 
 
 def _record_meets_minimum_fields(record: BillRecord, category: DocumentCategory) -> bool:

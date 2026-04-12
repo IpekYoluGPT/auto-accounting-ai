@@ -202,6 +202,34 @@ class TestExtractBill:
         assert "El yazili hafriyat/malzeme formu" in prompt
         assert "never copy company names" in mock_generate.call_args.kwargs["system_instruction"]
 
+    def test_strict_split_retry_prompt_requests_exact_document_count_for_checks(self, monkeypatch):
+        monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
+        expected = AIMultiExtractionResult(
+            documents=[AIExtractionResult(company_name="Yapı Kredi", currency="TRY", confidence=0.8)]
+        )
+
+        with patch(
+            "app.services.accounting.gemini_extractor.gemini_client.generate_structured_content",
+            return_value=expected,
+        ) as mock_generate:
+            extract_bills(
+                b"fake_image",
+                mime_type="image/jpeg",
+                source_message_id="msg-checks-1",
+                source_filename="checks.jpg",
+                source_type="image",
+                category_hint=DocumentCategory.CEK,
+                document_count_hint=3,
+                strict_document_count=3,
+                split_retry=True,
+            )
+
+        prompt = mock_generate.call_args.kwargs["prompt"]
+        assert "Bu denemede tam olarak 3 ayri belge cikarilmasi gerekiyor." in prompt
+        assert "Bu ikinci geciste kismi sonuc kabul edilmez" in prompt
+        assert "her fiziksel cek yapragini ayri belge say" in prompt
+        assert "Ayrik belgeleri ASLA birlestirme" in prompt
+
     def test_dekont_prompt_requests_name_not_phone_for_sender(self, monkeypatch):
         monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
         expected = AIMultiExtractionResult(

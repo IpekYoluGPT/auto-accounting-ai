@@ -269,10 +269,17 @@ def _amount_token(value: float | None) -> str | None:
     return f"{float(value):.2f}"
 
 
+def _is_multi_document_source_message(message_id: str | None) -> bool:
+    if not message_id:
+        return False
+    prefix, separator, suffix = message_id.rpartition("__doc")
+    return bool(prefix and separator and suffix.isdigit())
+
+
 def _content_fingerprints(record: BillRecord) -> set[str]:
     fingerprints: set[str] = set()
 
-    if record.source_media_sha256:
+    if record.source_media_sha256 and not _is_multi_document_source_message(record.source_message_id):
         fingerprints.add(f"media:{record.source_media_sha256}")
 
     identifier_tokens = [

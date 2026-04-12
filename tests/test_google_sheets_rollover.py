@@ -29,6 +29,20 @@ def test_next_month_rollover_boundary_uses_configured_timezone():
 def test_tab_total_and_summary_formulas_use_dedicated_total_cells():
     assert google_sheets._build_tab_total_formula("🧾 Faturalar") == "=IFERROR(SUM(K3:K);0)"
     assert google_sheets._build_summary_formula("🧾 Faturalar") == "=IFERROR('🧾 Faturalar'!K2;0)"
+    assert [tab_name for _, tab_name in google_sheets._summary_rows()] == [
+        "🧾 Faturalar",
+        "💳 Dekontlar",
+        "⛽ Harcama Fişleri",
+        "📝 Çekler",
+        "💵 Elden Ödemeler",
+        "🏗️ Malzeme",
+    ]
+
+
+
+def test_active_layout_excludes_iade_tab_and_uses_wide_belge_column():
+    assert "↩️ İadeler" not in google_sheets._TABS
+    assert google_sheets._COL_WIDTHS["Belge"] == 100
 
 
 def test_month_drive_folder_name_uses_fisler_prefix():
@@ -77,8 +91,8 @@ def test_elden_odeme_row_includes_drive_verification_cell():
 
     assert row[4] == 1500.0
     assert row[-2] == "905551112233"
-    assert row[-1] == '=HYPERLINK("https://drive.google.com/file/d/example/view";"📄 Görüntüle")'
-    assert google_sheets._TABS["💵 Elden Ödemeler"][0][-1] == "📎 Belge"
+    assert row[-1] == '=HYPERLINK("https://drive.google.com/file/d/example/view";"Görüntüle")'
+    assert google_sheets._TABS["💵 Elden Ödemeler"][0][-1] == "Belge"
 
 
 def test_dekont_row_prefers_sender_name_over_phone_number():
@@ -127,15 +141,15 @@ def test_dekont_row_falls_back_to_source_sender_name_but_not_phone_number():
 def test_repair_drive_link_formulas_rewrites_old_comma_separator():
     ws = MagicMock()
     ws.get.return_value = [
-        ['=HYPERLINK("https://drive.google.com/file/d/a/view","📄 Görüntüle")'],
-        ['=HYPERLINK("https://drive.google.com/file/d/b/view";"📄 Görüntüle")'],
+        ['=HYPERLINK("https://drive.google.com/file/d/a/view","Görüntüle")'],
+        ['=HYPERLINK("https://drive.google.com/file/d/b/view";"Görüntüle")'],
         [""],
     ]
 
     google_sheets._repair_drive_link_formulas(ws, "💳 Dekontlar")
 
     ws.update.assert_called_once_with(
-        [['=HYPERLINK("https://drive.google.com/file/d/a/view";"📄 Görüntüle")']],
+        [['=HYPERLINK("https://drive.google.com/file/d/a/view";"Görüntüle")']],
         "K3",
         value_input_option="USER_ENTERED",
     )

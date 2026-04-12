@@ -80,6 +80,15 @@ _EXTRACTION_EXAMPLES = """Kisa ornekler:
 2. Ayni fotografta 3 cek varsa 3 ayri document dondur ve siralamayi soldan saga yap.
 3. Iade faturasinda iade oldugu acikca gorunuyorsa tutarlari goruldugu gibi cikar; normal faturaya cevirme."""
 
+_MULTI_DOCUMENT_RETRY_INSTRUCTIONS = """Bu goruntude birden fazla belge var ve onceki denemede belge ayrimi eksik kaldi.
+- Bu turda gorunur her ayri belgeyi ayri object olarak dondur.
+- Ayrik belgeleri ASLA birlestirme.
+- Belgeleri soldan saga, sonra yukaridan asagiya sirala.
+- Eger ayni firmaya, ayni vergi numarasina veya ayni tutara sahip birden fazla belge varsa yine de her birini AYRI object olarak dondur.
+- Tek bir object dondurup diger belgeleri yoksayma.
+- Belge sayisi kesin olarak verildiyse tam o sayida object dondur; eksik veya fazla dondurme.
+"""
+
 
 def _parse_tr_number(value: str) -> Optional[float]:
     """Backward-compatible wrapper for tests."""
@@ -148,6 +157,8 @@ def extract_bills(
     category_hint: DocumentCategory | None = None,
     document_count_hint: int | None = None,
     is_return_hint: bool = False,
+    strict_document_count: int | None = None,
+    split_retry: bool = False,
 ) -> list[BillRecord]:
     """
     Extract one or more bookkeeping records from media.
@@ -160,13 +171,17 @@ def extract_bills(
         category_hint=category_hint,
         document_count_hint=document_count_hint,
         is_return_hint=is_return_hint,
+        strict_document_count=strict_document_count,
+        split_retry=split_retry,
     )
 
     logger.info(
-        "Sending media (%d bytes, %s) to Gemini model %s for extraction",
+        "Sending media (%d bytes, %s) to Gemini model %s for extraction (split_retry=%s strict_document_count=%s)",
         len(image_bytes),
         mime_type,
         model_name,
+        split_retry,
+        strict_document_count,
     )
 
     multi_result = gemini_client.generate_structured_content(
@@ -245,27 +260,49 @@ def _build_extraction_prompt(
     category_hint: DocumentCategory | None,
     document_count_hint: int | None,
     is_return_hint: bool,
+    strict_document_count: int | None,
+    split_retry: bool,
 ) -> str:
     category = category_hint or DocumentCategory.BELIRSIZ
     category_instructions = _CATEGORY_SPECIFIC_INSTRUCTIONS.get(
         category,
         _CATEGORY_SPECIFIC_INSTRUCTIONS[DocumentCategory.BELIRSIZ],
     )
-    count_text = (
-        f"Goruntude yaklasik {document_count_hint} ayri belge bekleniyor."
-        if document_count_hint and document_count_hint > 1
-        else "Tek belge de olabilir, birden fazla belge de olabilir."
-    )
+
+    count_hint = strict_document_count or document_count_hint
+    if strict_document_count and strict_document_count > 1:
+        count_text = f"Bu denemede tam olarak {strict_document_count} ayri belge cikarilmasi gerekiyor."
+    elif document_count_hint and document_count_hint > 1:
+        count_text = f"Goruntude yaklasik {document_count_hint} ayri belge bekleniyor."
+    else:
+        count_text = "Tek belge de olabilir, birden fazla belge de olabilir."
+
     return_text = (
         "Belge muhtemelen bir iade/iptal niteligi tasiyor."
         if is_return_hint
         else "Iade ipucu yok."
     )
-    return (
-        f"{_EXTRACTION_PROMPT}\n\n"
-        f"Belge ailesi ipucu: {category.value}\n"
-        f"{return_text}\n"
-        f"{count_text}\n\n"
-        f"{category_instructions}\n\n"
-        f"{_EXTRACTION_EXAMPLES}"
-    )
+
+    retry_lines: list[str] = []
+    if split_retry:
+        retry_lines.append(_MULTI_DOCUMENT_RETRY_INSTRUCTIONS.strip())
+        if strict_document_count and strict_document_count > 1:
+            retry_lines.append(
+                f"Bu ikinci geciste kismi sonuc kabul edilmez; ya tam olarak {strict_document_count} ayri document dondur ya da hic document dondurma."
+            )
+        if category == DocumentCategory.CEK:
+            retry_lines.append(
+                "CEK icin: her fiziksel cek yapragini ayri belge say. Banka, vergi numarasi veya duzenleyen sirket ayni olsa bile cekleri BIRLESTIRME. Vade tarihi, seri numarasi, lehdar, el yazisi ve konuma gore ayir."
+            )
+
+    prompt_parts = [
+        _EXTRACTION_PROMPT,
+        f"Belge ailesi ipucu: {category.value}",
+        return_text,
+        count_text,
+        category_instructions,
+    ]
+    if retry_lines:
+        prompt_parts.append("\n\n".join(retry_lines))
+    prompt_parts.append(_EXTRACTION_EXAMPLES)
+    return "\n\n".join(prompt_parts)
