@@ -2665,6 +2665,83 @@ def _iter_invoice_line_items(record: BillRecord) -> list[dict[str, object]]:
     return rows
 
 
+def _invoice_primary_line_item(record: BillRecord) -> dict[str, object] | None:
+    populated_items = [
+        item
+        for item in _iter_invoice_line_items(record)
+        if any(item.get(key) not in (None, "") for key in ("description", "quantity", "unit", "unit_price", "line_amount"))
+    ]
+    if len(populated_items) == 1:
+        return populated_items[0]
+    return None
+
+
+def _is_generic_invoice_description(record: BillRecord, description: str | None) -> bool:
+    normalized = " ".join(str(description or "").split()).casefold()
+    if not normalized:
+        return True
+
+    invoice_type = " ".join(str(record.invoice_type or "").split()).casefold()
+    if invoice_type and normalized == invoice_type:
+        return True
+
+    return normalized in {
+        "fatura",
+        "e-fatura",
+        "e arşiv",
+        "e-arşiv",
+        "e arsiv",
+        "e-arsiv",
+        "satış faturası",
+        "satis faturasi",
+        "toptan satış faturası",
+        "toptan satis faturasi",
+        "iade faturası",
+        "iade faturasi",
+        "toptan satış iade",
+        "toptan satis iade",
+    }
+
+
+def _invoice_summary_description(
+    record: BillRecord,
+    *,
+    category: DocumentCategory,
+    return_source_category: DocumentCategory | None = None,
+) -> str:
+    description = str(record.description or "").strip()
+    if description and not _is_generic_invoice_description(record, description):
+        return description
+
+    line_descriptions: list[str] = []
+    seen: set[str] = set()
+    for item in _iter_invoice_line_items(record):
+        item_description = str(item.get("description") or "").strip()
+        if not item_description:
+            continue
+        key = item_description.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        line_descriptions.append(item_description)
+
+    if line_descriptions:
+        if len(line_descriptions) == 1:
+            return line_descriptions[0]
+        summary = ", ".join(line_descriptions[:2])
+        if len(line_descriptions) > 2:
+            summary += f" +{len(line_descriptions) - 2} kalem"
+        return summary
+
+    if description:
+        return description
+    if record.invoice_type:
+        return str(record.invoice_type)
+    if _is_return_record(record, category, return_source_category):
+        return _return_source_label(return_source_category)
+    return "Fatura"
+
+
 def _masraf_paid_formula(row_number: int) -> str:
     sep = _formula_arg_separator()
     settled_ref = f"{_header_letter('Masraf Kayıtları', _HIDDEN_SETTLED_AMOUNT_HEADER)}{row_number}"
@@ -2700,6 +2777,12 @@ def _build_row_for_tab(
     drive_value = _drive_cell(drive_link)
 
     if tab_name == 'Faturalar':
+        primary_line_item = _invoice_primary_line_item(record)
+        line_quantity = record.line_quantity if record.line_quantity is not None else (primary_line_item or {}).get('quantity')
+        unit_price = record.unit_price if record.unit_price is not None else (primary_line_item or {}).get('unit_price')
+        line_amount = record.subtotal
+        if line_amount is None:
+            line_amount = record.line_amount if record.line_amount is not None else (primary_line_item or {}).get('line_amount')
         return [
             _safe(record.invoice_number or record.document_number),
             _safe(record.document_date),
@@ -2707,10 +2790,10 @@ def _build_row_for_tab(
             _safe(record.company_name),
             _safe(record.tax_number),
             _safe(record.buyer_name or record.recipient_name),
-            _safe(record.description),
-            _safe(record.line_quantity),
-            _safe(record.unit_price),
-            _safe(record.subtotal if record.subtotal is not None else record.line_amount),
+            _safe(_invoice_summary_description(record, category=category, return_source_category=return_source_category)),
+            _safe(line_quantity),
+            _safe(unit_price),
+            _safe(line_amount),
             _safe(record.vat_rate),
             _safe(record.vat_amount),
             _withholding_label(record),

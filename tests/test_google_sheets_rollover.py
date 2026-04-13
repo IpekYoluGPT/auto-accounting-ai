@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.models.schemas import BillRecord, DocumentCategory
+from app.models.schemas import BillRecord, DocumentCategory, InvoiceLineItem
 from app.services.providers import google_sheets
 
 
@@ -151,6 +151,90 @@ def test_dekont_row_falls_back_to_source_sender_name_but_not_phone_number():
     )
 
     assert row[3] == "Ayşe Demir"
+
+
+def test_invoice_row_uses_single_line_item_fallbacks_for_visible_columns():
+    row = google_sheets._build_row_for_tab(
+        BillRecord(
+            document_date="2026-04-03",
+            invoice_type="Toptan Satış Faturası",
+            company_name="YILMAZ YAPIM",
+            total_amount=750.0,
+            vat_rate=0.0,
+            vat_amount=0.0,
+            line_items=[
+                InvoiceLineItem(
+                    description="ARKİM ARPLAST HAND-EL SIVASI 7111 25 KG",
+                    quantity=5.0,
+                    unit="TRB",
+                    unit_price=150.0,
+                    line_amount=750.0,
+                )
+            ],
+        ),
+        "Faturalar",
+        category=DocumentCategory.FATURA,
+        row_id="row-1",
+        row_number=3,
+        drive_link="https://drive.google.com/file/d/example/view",
+        source_doc_id="row-1",
+    )
+
+    assert row[6] == "ARKİM ARPLAST HAND-EL SIVASI 7111 25 KG"
+    assert row[7] == 5.0
+    assert row[8] == 150.0
+    assert row[9] == 750.0
+    assert row[17] == '=HYPERLINK("https://drive.google.com/file/d/example/view";"Görüntüle")'
+
+
+
+def test_invoice_row_uses_line_item_summary_when_description_is_generic():
+    row = google_sheets._build_row_for_tab(
+        BillRecord(
+            document_date="2026-02-28",
+            invoice_type="Toptan Satış Faturası",
+            company_name="ŞEMSETTİN YILMAZ",
+            subtotal=3214.95,
+            vat_rate=20.0,
+            vat_amount=642.99,
+            total_amount=3857.94,
+            description="Toptan Satış Faturası",
+            line_items=[
+                InvoiceLineItem(
+                    description="PVC ATIK SU BORUSU TİP1 50/500 MM",
+                    quantity=10.0,
+                    unit="ADET",
+                    unit_price=69.92,
+                    line_amount=699.20,
+                ),
+                InvoiceLineItem(
+                    description="PVC ATIK SU BORUSU TİP1 50/250 MM",
+                    quantity=10.0,
+                    unit="ADET",
+                    unit_price=43.09,
+                    line_amount=430.90,
+                ),
+                InvoiceLineItem(
+                    description="PVC ATIK SU DİRSEK 87* 50 MM",
+                    quantity=20.0,
+                    unit="ADET",
+                    unit_price=27.56,
+                    line_amount=551.20,
+                ),
+            ],
+        ),
+        "Faturalar",
+        category=DocumentCategory.FATURA,
+        row_id="row-2",
+        row_number=4,
+        drive_link=None,
+        source_doc_id="row-2",
+    )
+
+    assert row[6] == "PVC ATIK SU BORUSU TİP1 50/500 MM, PVC ATIK SU BORUSU TİP1 50/250 MM +1 kalem"
+    assert row[7] == ""
+    assert row[8] == ""
+    assert row[9] == 3214.95
 
 
 def test_repair_drive_link_formulas_rewrites_old_comma_separator():
@@ -356,8 +440,8 @@ def test_audit_repair_hides_ignored_orphan_tabs(monkeypatch):
     archived_ws.spreadsheet = MagicMock()
 
     monkeypatch.setattr(google_sheets, "_list_worksheets", lambda _sh: [archived_ws])
-    monkeypatch.setattr(google_sheets, "_audit_data_tab", lambda sh, tab_name, findings, repair: None)
-    monkeypatch.setattr(google_sheets, "_audit_summary_tab", lambda sh, findings, repair: None)
+    monkeypatch.setattr(google_sheets, "_audit_data_tab", lambda sh, tab_name, findings, repair, refresh_formatting=False: None)
+    monkeypatch.setattr(google_sheets, "_audit_summary_tab", lambda sh, findings, repair, refresh_formatting=False: None)
     monkeypatch.setattr(google_sheets, "_archive_legacy_iade_tabs", lambda sh: [])
 
     findings = google_sheets._audit_spreadsheet_layout(MagicMock(), repair=True)
