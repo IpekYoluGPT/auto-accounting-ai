@@ -101,8 +101,8 @@ _TAB_SPECS: dict[str, SheetSpec] = {
         visible_headers=(
             "Alıcı / Tedarikçi",
             "Açıklama",
-            "Borç Tarihi",
-            "Kişi Toplam Borcu (TL)",
+            "Referans No",
+            "Gönderen",
             "Ödeme Tutarı (TL)",
             "Ödeme Tarihi",
             "Kalan Bakiye (TL)",
@@ -139,8 +139,8 @@ _TAB_SPECS: dict[str, SheetSpec] = {
             "Tevkifat Var mı?",
             "Tevkifat Tutarı (TL)",
             "Ödenecek Tutar (TL)",
-            "IBAN",
-            "Banka",
+            "Para Birimi",
+            "Ek Detay",
             _VISIBLE_DRIVE_LINK_HEADER,
         ),
         hidden_headers=(
@@ -155,17 +155,14 @@ _TAB_SPECS: dict[str, SheetSpec] = {
     ),
     "Sevk Fişleri": SheetSpec(
         visible_headers=(
-            "Fiş No",
+            "Fiş / Belge No",
             "Tarih",
+            "Satıcı",
             "Alıcı",
             "Ürün Cinsi",
-            "Palet Sayısı",
-            "Adet/Palet",
             "Ürün Miktarı",
-            "Plaka",
-            "Satıcı",
-            "Çıkış Yeri",
             "Sevk Yeri",
+            "Açıklama",
             _VISIBLE_DRIVE_LINK_HEADER,
         ),
         hidden_headers=(
@@ -333,6 +330,8 @@ _COL_WIDTHS: dict[str, int] = {
     "Kalan Borç (TL)": 94,
     "Borç Tarihi": 78,
     "Kişi Toplam Borcu (TL)": 96,
+    "Referans No": 98,
+    "Gönderen": 140,
     "Ödeme Tutarı (TL)": 92,
     "Ödeme Tarihi": 78,
     "Kalan Bakiye (TL)": 94,
@@ -354,7 +353,10 @@ _COL_WIDTHS: dict[str, int] = {
     "Ödenecek Tutar (TL)": 82,
     "IBAN": 112,
     "Banka": 84,
+    "Para Birimi": 72,
+    "Ek Detay": 170,
     "Fiş No": 90,
+    "Fiş / Belge No": 96,
     "Ürün Cinsi": 140,
     "Palet Sayısı": 72,
     "Adet/Palet": 72,
@@ -368,8 +370,6 @@ _COL_WIDTHS: dict[str, int] = {
     "Vergi No": 130,
     "Belge No": 120,
     "Toplam": 110,
-    "Para Birimi": 85,
-    "Gönderen": 160,
     "Notlar": 220,
     "Birim": 58,
     "Tutar": 110,
@@ -408,9 +408,9 @@ _TAB_COLUMN_WIDTHS: dict[str, dict[str, int]] = {
     },
     "Banka Ödemeleri": {
         "Alıcı / Tedarikçi": 132,
-        "Açıklama": 150,
-        "Borç Tarihi": 74,
-        "Kişi Toplam Borcu (TL)": 92,
+        "Açıklama": 154,
+        "Referans No": 92,
+        "Gönderen": 126,
         "Ödeme Tutarı (TL)": 88,
         "Ödeme Tarihi": 74,
         "Kalan Bakiye (TL)": 90,
@@ -433,22 +433,19 @@ _TAB_COLUMN_WIDTHS: dict[str, dict[str, int]] = {
         "Tevkifat Var mı?": 66,
         "Tevkifat Tutarı (TL)": 76,
         "Ödenecek Tutar (TL)": 76,
-        "IBAN": 100,
-        "Banka": 78,
+        "Para Birimi": 68,
+        "Ek Detay": 146,
         "Belge": 62,
     },
     "Sevk Fişleri": {
-        "Fiş No": 80,
+        "Fiş / Belge No": 88,
         "Tarih": 74,
-        "Alıcı": 120,
-        "Ürün Cinsi": 148,
-        "Palet Sayısı": 68,
-        "Adet/Palet": 68,
-        "Ürün Miktarı": 78,
-        "Plaka": 72,
-        "Satıcı": 120,
-        "Çıkış Yeri": 100,
-        "Sevk Yeri": 100,
+        "Satıcı": 118,
+        "Alıcı": 118,
+        "Ürün Cinsi": 150,
+        "Ürün Miktarı": 80,
+        "Sevk Yeri": 110,
+        "Açıklama": 168,
         "Belge": 64,
     },
 }
@@ -467,7 +464,7 @@ _STATUS_RED = {"red": 0.97, "green": 0.78, "blue": 0.80}
 
 # Columns that should wrap text (long free-text fields)
 _WRAP_COLUMNS = {
-    "Açıklama", "Açıklama / Hizmet", "Notlar", "Ürün Cinsi",
+    "Açıklama", "Açıklama / Hizmet", "Ek Detay", "Notlar", "Ürün Cinsi",
     "Çıkış Yeri", "Sevk Yeri", "Aliaslar",
 }
 
@@ -571,6 +568,53 @@ _PENDING_SHEET_BATCH_SIZE = 25
 _LEGACY_IADE_TITLES = {"↩️ İadeler", "İadeler"}
 _LEGACY_IADE_PREFIX = "↩️ İadeler LEGACY"
 _MANUAL_DRIFT_MARKER = " MANUAL_DRIFT "
+_LEGACY_VISIBLE_HEADER_VARIANTS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "Banka Ödemeleri": ((
+        "Alıcı / Tedarikçi",
+        "Açıklama",
+        "Borç Tarihi",
+        "Kişi Toplam Borcu (TL)",
+        "Ödeme Tutarı (TL)",
+        "Ödeme Tarihi",
+        "Kalan Bakiye (TL)",
+        "Durum",
+        _VISIBLE_DRIVE_LINK_HEADER,
+    ),),
+    "Faturalar": ((
+        "Fatura No",
+        "Fatura Tarihi",
+        "Fatura Tipi",
+        "Satıcı (Düzenleyen)",
+        "Satıcı VKN/TCKN",
+        "Alıcı",
+        "Açıklama / Hizmet",
+        "Miktar",
+        "Birim Fiyat (TL)",
+        "Mal/Hizmet Tutarı (TL)",
+        "KDV %",
+        "KDV Tutarı (TL)",
+        "Tevkifat Var mı?",
+        "Tevkifat Tutarı (TL)",
+        "Ödenecek Tutar (TL)",
+        "IBAN",
+        "Banka",
+        _VISIBLE_DRIVE_LINK_HEADER,
+    ),),
+    "Sevk Fişleri": ((
+        "Fiş No",
+        "Tarih",
+        "Alıcı",
+        "Ürün Cinsi",
+        "Palet Sayısı",
+        "Adet/Palet",
+        "Ürün Miktarı",
+        "Plaka",
+        "Satıcı",
+        "Çıkış Yeri",
+        "Sevk Yeri",
+        _VISIBLE_DRIVE_LINK_HEADER,
+    ),),
+}
 
 
 def _get_business_timezone():
@@ -1895,20 +1939,31 @@ def _backfill_internal_row_ids(ws, tab_name: str) -> int:
     return repaired
 
 
-def _legacy_header_variant(expected_headers: list[str]) -> list[str]:
-    return list(expected_headers)
+def _trimmed_row(values: list[object]) -> list[object]:
+    trimmed = list(values)
+    while trimmed and not str(trimmed[-1] or "").strip():
+        trimmed.pop()
+    return trimmed
+
+
+def _legacy_header_variants(tab_name: str) -> list[list[str]]:
+    canonical_tab_name = _canonical_tab_name(tab_name)
+    hidden_headers = _hidden_headers(canonical_tab_name)
+    return [
+        list(visible_headers) + hidden_headers
+        for visible_headers in _LEGACY_VISIBLE_HEADER_VARIANTS.get(canonical_tab_name, ())
+    ]
 
 
 def _tab_headers_match(ws, tab_name: str) -> bool:
     expected_headers = _headers(tab_name)
-    actual_headers = _row_values(ws, 1)[: len(expected_headers)]
+    actual_headers = _trimmed_row(_row_values(ws, 1))
     return actual_headers == expected_headers
 
 
 def _tab_headers_can_migrate_in_place(ws, tab_name: str) -> bool:
-    expected_headers = _headers(tab_name)
-    actual_headers = _row_values(ws, 1)[: len(expected_headers)]
-    return actual_headers == _legacy_header_variant(expected_headers)
+    actual_headers = _trimmed_row(_row_values(ws, 1))
+    return any(actual_headers == variant for variant in _legacy_header_variants(tab_name))
 
 
 def _tab_total_row_is_valid(ws, tab_name: str) -> bool:
@@ -1998,6 +2053,171 @@ def _audit_summary_tab(sh, findings: list[dict[str, object]], *, repair: bool, r
         finding["repaired"] = True
 
 
+def _row_dict_from_headers(row: list[object], headers: list[str]) -> dict[str, object]:
+    padded = list(row) + [""] * max(0, len(headers) - len(row))
+    return {headers[index]: padded[index] if index < len(padded) else "" for index in range(len(headers))}
+
+
+def _worksheet_rows_for_headers(
+    ws,
+    headers: list[str],
+    *,
+    visible_count: int,
+    value_render_option: str | None = None,
+) -> list[list[object]]:
+    last_col = _col_letter(len(headers) - 1)
+    try:
+        rows = _get_range_values(ws, f"A3:{last_col}", value_render_option=value_render_option)
+    except Exception:
+        return []
+
+    result: list[list[object]] = []
+    for row in rows:
+        padded = list(row) + [""] * max(0, len(headers) - len(row))
+        if not any(_text_value(cell) for cell in padded[:visible_count]):
+            continue
+        result.append(padded[: len(headers)])
+    return result
+
+
+def _doc_row_map(sh, tab_name: str) -> dict[str, dict[str, object]]:
+    ws = _ensure_tab_exists(sh, tab_name, lightweight=True)
+    rows = _worksheet_rows_as_dicts(ws, tab_name)
+    result: dict[str, dict[str, object]] = {}
+    for row in rows:
+        doc_id = _coalesce_text(row.get("Belge ID"))
+        if doc_id and doc_id not in result:
+            result[doc_id] = row
+    return result
+
+
+def _legacy_row_hidden_values(tab_name: str, row_map: dict[str, object]) -> list[object]:
+    return [row_map.get(header, "") for header in _hidden_headers(tab_name)]
+
+
+def _remap_legacy_visible_row(
+    tab_name: str,
+    row: list[object],
+    *,
+    legacy_headers: list[str],
+    raw_by_doc_id: dict[str, dict[str, object]],
+    payment_detail_by_doc_id: dict[str, dict[str, object]],
+) -> list[object]:
+    row_map = _row_dict_from_headers(row, legacy_headers)
+    source_doc_id = _coalesce_text(row_map.get(_HIDDEN_SOURCE_DOC_ID_HEADER))
+    raw_row = raw_by_doc_id.get(source_doc_id, {})
+    detail_row = payment_detail_by_doc_id.get(source_doc_id, {})
+    drive_value = row_map.get(_VISIBLE_DRIVE_LINK_HEADER, "")
+
+    if tab_name == "Banka Ödemeleri":
+        visible_values = [
+            row_map.get("Alıcı / Tedarikçi", ""),
+            row_map.get("Açıklama", ""),
+            _coalesce_text(detail_row.get("Referans"), raw_row.get("Fatura No"), raw_row.get("Belge No"), raw_row.get("Fiş No")),
+            _coalesce_text(detail_row.get("Gönderen"), raw_row.get("Gönderen"), raw_row.get("Firma")),
+            row_map.get("Ödeme Tutarı (TL)", ""),
+            row_map.get("Ödeme Tarihi", ""),
+            row_map.get("Kalan Bakiye (TL)", ""),
+            row_map.get("Durum", ""),
+            drive_value,
+        ]
+        return visible_values + _legacy_row_hidden_values(tab_name, row_map)
+
+    if tab_name == "Faturalar":
+        visible_values = [
+            row_map.get("Fatura No", ""),
+            row_map.get("Fatura Tarihi", ""),
+            row_map.get("Fatura Tipi", ""),
+            row_map.get("Satıcı (Düzenleyen)", ""),
+            row_map.get("Satıcı VKN/TCKN", ""),
+            row_map.get("Alıcı", ""),
+            row_map.get("Açıklama / Hizmet", ""),
+            row_map.get("Miktar", ""),
+            row_map.get("Birim Fiyat (TL)", ""),
+            row_map.get("Mal/Hizmet Tutarı (TL)", ""),
+            row_map.get("KDV %", ""),
+            row_map.get("KDV Tutarı (TL)", ""),
+            row_map.get("Tevkifat Var mı?", ""),
+            row_map.get("Tevkifat Tutarı (TL)", ""),
+            row_map.get("Ödenecek Tutar (TL)", ""),
+            _coalesce_text(raw_row.get("Para Birimi"), "TRY"),
+            _join_labeled_parts([
+                ("Banka", _coalesce_text(raw_row.get("Banka"), row_map.get("Banka"))),
+                ("IBAN", _coalesce_text(raw_row.get("IBAN"), row_map.get("IBAN"))),
+                ("Not", raw_row.get("Notlar")),
+            ]),
+            drive_value,
+        ]
+        return visible_values + _legacy_row_hidden_values(tab_name, row_map)
+
+    if tab_name == "Sevk Fişleri":
+        visible_values = [
+            _coalesce_text(row_map.get("Fiş No"), raw_row.get("Fiş No"), raw_row.get("Belge No")),
+            row_map.get("Tarih", ""),
+            _coalesce_text(row_map.get("Satıcı"), raw_row.get("Firma")),
+            row_map.get("Alıcı", ""),
+            row_map.get("Ürün Cinsi", ""),
+            row_map.get("Ürün Miktarı", ""),
+            row_map.get("Sevk Yeri", ""),
+            _join_labeled_parts([
+                ("Çıkış", row_map.get("Çıkış Yeri", "")),
+                ("Plaka", row_map.get("Plaka", "")),
+                ("Palet", row_map.get("Palet Sayısı", "")),
+                ("Adet/Palet", row_map.get("Adet/Palet", "")),
+                ("Not", raw_row.get("Notlar")),
+            ]),
+            drive_value,
+        ]
+        return visible_values + _legacy_row_hidden_values(tab_name, row_map)
+
+    return list(row)
+
+
+def _rewrite_legacy_visible_schema_in_place(sh, ws, tab_name: str) -> bool:
+    actual_headers = _trimmed_row(_row_values(ws, 1))
+    legacy_headers = next((variant for variant in _legacy_header_variants(tab_name) if actual_headers == variant), None)
+    if legacy_headers is None:
+        return False
+
+    legacy_visible_count = len(legacy_headers) - len(_hidden_headers(tab_name))
+    legacy_rows = _worksheet_rows_for_headers(
+        ws,
+        legacy_headers,
+        visible_count=legacy_visible_count,
+        value_render_option="FORMULA",
+    )
+    raw_by_doc_id = _doc_row_map(sh, "__Raw Belgeler")
+    payment_detail_by_doc_id = _doc_row_map(sh, "__Çek_Dekont_Detay")
+    remapped_rows = [
+        _remap_legacy_visible_row(
+            tab_name,
+            row,
+            legacy_headers=legacy_headers,
+            raw_by_doc_id=raw_by_doc_id,
+            payment_detail_by_doc_id=payment_detail_by_doc_id,
+        )
+        for row in legacy_rows
+    ]
+
+    target_cols = len(_headers(tab_name)) + 2
+    target_rows = max(int(getattr(ws, "row_count", 1000) or 1000), 1000)
+    try:
+        ws.resize(rows=target_rows, cols=target_cols)
+    except Exception as exc:
+        logger.warning("Could not resize worksheet '%s' during visible schema migration: %s", tab_name, exc)
+
+    _setup_worksheet(ws, tab_name, lightweight=True)
+    last_col = _col_letter(len(_headers(tab_name)) - 1)
+    try:
+        _retry_on_rate_limit(lambda: ws.batch_clear([f"A3:{last_col}{target_rows}"]))
+    except Exception as exc:
+        logger.warning("Could not clear worksheet '%s' during visible schema migration: %s", tab_name, exc)
+    if remapped_rows:
+        ws.update(remapped_rows, "A3", value_input_option="USER_ENTERED")
+    _ensure_tab_total_row(ws, tab_name)
+    return True
+
+
 def _audit_data_tab(sh, tab_name: str, findings: list[dict[str, object]], *, repair: bool, refresh_formatting: bool = False) -> None:
     import gspread
 
@@ -2027,7 +2247,9 @@ def _audit_data_tab(sh, tab_name: str, findings: list[dict[str, object]], *, rep
         findings.append(finding)
         if repair:
             if _tab_headers_can_migrate_in_place(ws, tab_name):
-                _setup_worksheet(ws, tab_name, lightweight=True)
+                migrated = _rewrite_legacy_visible_schema_in_place(sh, ws, tab_name)
+                if not migrated:
+                    _setup_worksheet(ws, tab_name, lightweight=True)
             elif _worksheet_has_visible_data(ws, tab_name):
                 finding["archived_to"] = _archive_drifted_tab(sh, ws, tab_name)
                 ws = _ensure_tab_exists(sh, tab_name, lightweight=True)
@@ -2744,8 +2966,57 @@ def _sender_display_name(record: BillRecord) -> str:
     return ""
 
 
+def _text_value(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value)
+    return str(value).strip()
+
+
+def _coalesce_text(*values: object) -> str:
+    for value in values:
+        text = _text_value(value)
+        if text:
+            return text
+    return ""
+
+
+def _join_labeled_parts(parts: list[tuple[str, object]]) -> str:
+    rendered: list[str] = []
+    for label, value in parts:
+        text = _text_value(value)
+        if text:
+            rendered.append(f"{label}: {text}")
+    return " | ".join(rendered)
+
+
+def _display_sender_or_company(record: BillRecord) -> str:
+    return _sender_display_name(record) or _coalesce_text(record.company_name)
+
+
 def _document_reference(record: BillRecord) -> str:
     return str(record.invoice_number or record.document_number or record.receipt_number or record.cheque_serial_number or "")
+
+
+def _invoice_extra_detail(record: BillRecord) -> str:
+    return _join_labeled_parts([
+        ("Banka", record.bank_name),
+        ("IBAN", record.iban),
+        ("Not", record.notes),
+    ])
+
+
+def _shipment_extra_detail(record: BillRecord) -> str:
+    return _join_labeled_parts([
+        ("Çıkış", record.shipment_origin),
+        ("Plaka", record.vehicle_plate),
+        ("Palet", record.pallet_count),
+        ("Adet/Palet", record.items_per_pallet),
+        ("Not", record.notes),
+    ])
 
 
 def _document_source_id(record: BillRecord, row_id: str) -> str:
@@ -2967,8 +3238,8 @@ def _build_row_for_tab(
             _withholding_label(record),
             _safe(record.withholding_amount),
             _safe(record.payable_amount if record.payable_amount is not None else record.total_amount),
-            _safe(record.iban),
-            _safe(record.bank_name),
+            _safe(record.currency or 'TRY'),
+            _safe(_invoice_extra_detail(record)),
             drive_value,
             row_id,
             _party_key(record, role='debt'),
@@ -3000,17 +3271,14 @@ def _build_row_for_tab(
 
     if tab_name == 'Sevk Fişleri':
         return [
-            _safe(record.document_number or record.receipt_number),
+            _safe(record.document_number or record.receipt_number or record.invoice_number),
             _safe(record.document_date),
-            _safe(record.recipient_name or record.buyer_name),
-            _safe(record.description),
-            _safe(record.pallet_count),
-            _safe(record.items_per_pallet),
-            _safe(record.product_quantity or record.line_quantity),
-            _safe(record.vehicle_plate),
             _safe(record.company_name),
-            _safe(record.shipment_origin),
+            _safe(record.recipient_name or record.buyer_name),
+            _safe(record.description or record.notes),
+            _safe(record.product_quantity or record.line_quantity),
             _safe(record.shipment_destination),
+            _safe(_shipment_extra_detail(record)),
             drive_value,
             row_id,
             _party_key(record, role='debt'),
@@ -3090,8 +3358,8 @@ def _build_payment_allocation_row(
     *,
     party_name: str,
     description: str,
-    debt_date: str,
-    debt_total: float | int | str | None,
+    reference_number: str,
+    sender_name: str,
     payment_amount: float | int | str | None,
     payment_date: str,
     remaining_balance: float | int | str | None,
@@ -3108,8 +3376,8 @@ def _build_payment_allocation_row(
     return [
         _safe(party_name),
         _safe(description),
-        _safe(debt_date),
-        _safe(debt_total),
+        _safe(reference_number),
+        _safe(sender_name),
         _safe(payment_amount),
         _safe(payment_date),
         _safe(remaining_balance),
@@ -3299,6 +3567,8 @@ def _build_payment_projection_rows(
     payment_date = str(record.document_date or record.cheque_due_date or record.cheque_issue_date or '')
     description = str(record.description or record.notes or _document_reference(record) or '')
     payment_party_name = _counterparty_name(record, DocumentCategory.ODEME_DEKONTU)
+    payment_reference = _document_reference(record)
+    payment_sender_name = _display_sender_or_company(record)
     payment_tax_number = str(record.tax_number or '')
     matching_rows = _payment_matching_rows(debt_state)
     match = ledger.match_payment_party(record.model_dump(mode='json'), matching_rows)
@@ -3346,8 +3616,8 @@ def _build_payment_projection_rows(
             visible_rows.append(_build_payment_allocation_row(
                 party_name=matched_display_name,
                 description=description,
-                debt_date=str(debt.get('date') or ''),
-                debt_total=debt.get('original_amount'),
+                reference_number=payment_reference,
+                sender_name=payment_sender_name,
                 payment_amount=applied,
                 payment_date=payment_date,
                 remaining_balance=debt.get('remaining_amount'),
@@ -3378,8 +3648,8 @@ def _build_payment_projection_rows(
         visible_rows.append(_build_payment_allocation_row(
             party_name=matched_display_name,
             description=description,
-            debt_date='',
-            debt_total='',
+            reference_number=payment_reference,
+            sender_name=payment_sender_name,
             payment_amount=amount,
             payment_date=payment_date,
             remaining_balance=amount,
@@ -3397,8 +3667,8 @@ def _build_payment_projection_rows(
         visible_rows.append(_build_payment_allocation_row(
             party_name=matched_display_name,
             description=description,
-            debt_date='',
-            debt_total='',
+            reference_number=payment_reference,
+            sender_name=payment_sender_name,
             payment_amount=amount,
             payment_date=payment_date,
             remaining_balance=amount,
@@ -3416,8 +3686,8 @@ def _build_payment_projection_rows(
         visible_rows.append(_build_payment_allocation_row(
             party_name=matched_display_name,
             description=description,
-            debt_date='',
-            debt_total='',
+            reference_number=payment_reference,
+            sender_name=payment_sender_name,
             payment_amount=remaining_payment,
             payment_date=payment_date,
             remaining_balance=remaining_payment,

@@ -237,6 +237,139 @@ def test_invoice_row_uses_line_item_summary_when_description_is_generic():
     assert row[9] == 3214.95
 
 
+def test_invoice_row_uses_currency_and_extra_detail_visible_columns():
+    row = google_sheets._build_row_for_tab(
+        BillRecord(
+            document_date="2026-04-03",
+            invoice_type="Toptan Satış Faturası",
+            company_name="YILMAZ YAPIM",
+            total_amount=750.0,
+            payable_amount=750.0,
+            currency="USD",
+            bank_name="Yapı Kredi",
+            iban="TR123",
+            notes="Vadeli ödeme",
+        ),
+        "Faturalar",
+        category=DocumentCategory.FATURA,
+        row_id="row-extra-1",
+        row_number=3,
+        drive_link=None,
+        source_doc_id="row-extra-1",
+    )
+
+    assert row[15] == "USD"
+    assert row[16] == "Banka: Yapı Kredi | IBAN: TR123 | Not: Vadeli ödeme"
+
+
+
+def test_sevk_row_uses_dense_visible_columns_and_summary_detail():
+    row = google_sheets._build_row_for_tab(
+        BillRecord(
+            document_number="9677",
+            document_date="2026-03-07",
+            company_name="KUM - ÇAKIL - HAFRİYAT",
+            recipient_name="H. Karakaya İnş.",
+            description="SİYAH KUM",
+            product_quantity=18.0,
+            shipment_destination="KARAKAYA İNŞ Kuzey Organize",
+            shipment_origin="ELAZIĞ",
+            vehicle_plate="23ABC123",
+            pallet_count=3,
+            items_per_pallet=6,
+            notes="Saha teslim",
+        ),
+        "Sevk Fişleri",
+        category=DocumentCategory.MALZEME,
+        row_id="row-sevk-1",
+        row_number=3,
+        drive_link=None,
+        source_doc_id="row-sevk-1",
+    )
+
+    assert row[:8] == [
+        "9677",
+        "2026-03-07",
+        "KUM - ÇAKIL - HAFRİYAT",
+        "H. Karakaya İnş.",
+        "SİYAH KUM",
+        18.0,
+        "KARAKAYA İNŞ Kuzey Organize",
+        "Çıkış: ELAZIĞ | Plaka: 23ABC123 | Palet: 3 | Adet/Palet: 6 | Not: Saha teslim",
+    ]
+
+
+
+def test_payment_allocation_row_uses_reference_and_sender_columns():
+    row = google_sheets._build_payment_allocation_row(
+        party_name="MUZAFFER KARAKAŞ",
+        description="GİDEN FAST",
+        reference_number="581829",
+        sender_name="Yapı Kredi",
+        payment_amount=444000.0,
+        payment_date="2026-08-30",
+        remaining_balance=444000.0,
+        status="Eşleşmedi",
+        drive_link=None,
+        row_id="odeme-1",
+        party_key="party-1",
+        source_doc_id="doc-1",
+        debt_row_id="",
+    )
+
+    assert row[:4] == ["MUZAFFER KARAKAŞ", "GİDEN FAST", "581829", "Yapı Kredi"]
+
+
+
+def test_remap_legacy_fatura_row_replaces_sparse_bank_columns_with_dense_fields():
+    legacy_headers = google_sheets._legacy_header_variants("Faturalar")[0]
+    row = [
+        "81",
+        "2026-03-18",
+        "Toptan Satış İade",
+        "ŞEMSETTİN YILMAZ",
+        "4540007255",
+        "H.KARAKAYA",
+        "PVC ATIK SU BORUSU",
+        "13",
+        "1051.86",
+        "6837.09",
+        "20",
+        "1367.42",
+        "HAYIR",
+        "0",
+        "8204.51",
+        "TR-OLD",
+        "OLD BANK",
+        '=HYPERLINK("https://drive.google.com/file/d/test/view";"Görüntüle")',
+        "row-1",
+        "party-1",
+        "doc-1",
+        "4540007255",
+        "fatura",
+    ]
+
+    remapped = google_sheets._remap_legacy_visible_row(
+        "Faturalar",
+        row,
+        legacy_headers=legacy_headers,
+        raw_by_doc_id={
+            "doc-1": {
+                "Para Birimi": "TRY",
+                "Banka": "Yapı Kredi",
+                "IBAN": "TR123",
+                "Notlar": "İade notu",
+            }
+        },
+        payment_detail_by_doc_id={},
+    )
+
+    assert remapped[15] == "TRY"
+    assert remapped[16] == "Banka: Yapı Kredi | IBAN: TR123 | Not: İade notu"
+    assert remapped[17] == '=HYPERLINK("https://drive.google.com/file/d/test/view";"Görüntüle")'
+
+
+
 def test_formula_arg_separator_uses_comma_for_english_locale():
     spreadsheet = MagicMock()
     spreadsheet.id = 'sheet-en'

@@ -810,6 +810,32 @@ def test_audit_missing_tab_repair_uses_lightweight_creation(monkeypatch):
     assert findings[1]["repaired"] is True
 
 
+def test_audit_data_tab_uses_visible_schema_migration_for_legacy_headers(monkeypatch):
+    ws = MagicMock()
+
+    monkeypatch.setattr(google_sheets, "_get_worksheet", lambda _sh, _title: ws)
+    monkeypatch.setattr(google_sheets, "_tab_headers_match", lambda _ws, _tab_name: False)
+    monkeypatch.setattr(google_sheets, "_tab_headers_can_migrate_in_place", lambda _ws, _tab_name: True)
+    monkeypatch.setattr(google_sheets, "_tab_total_row_is_valid", lambda _ws, _tab_name: True)
+    monkeypatch.setattr(google_sheets, "_repair_drive_link_formulas", lambda _ws, _tab_name: None)
+    monkeypatch.setattr(google_sheets, "_backfill_internal_row_ids", lambda _ws, _tab_name: 0)
+    setup_calls = []
+    migrate_calls = []
+    monkeypatch.setattr(google_sheets, "_setup_worksheet", lambda _ws, _tab_name, *, lightweight=False: setup_calls.append((_tab_name, lightweight)))
+    monkeypatch.setattr(google_sheets, "_rewrite_legacy_visible_schema_in_place", lambda _sh, _ws, _tab_name: migrate_calls.append(_tab_name) or True)
+    monkeypatch.setattr(google_sheets, "_worksheet_has_visible_data", lambda _ws, _tab_name: True)
+    monkeypatch.setattr(google_sheets, "_archive_drifted_tab", lambda _sh, _ws, _tab_name: (_ for _ in ()).throw(AssertionError("should not archive legacy visible schema")))
+
+    findings = []
+    google_sheets._audit_data_tab(object(), "Sevk Fişleri", findings, repair=True)
+
+    assert migrate_calls == ["Sevk Fişleri"]
+    assert setup_calls == []
+    assert findings[0]["code"] == "header_drift"
+    assert findings[0]["repaired"] is True
+
+
+
 def test_audit_data_tab_repair_does_not_reapply_formatting_by_default(monkeypatch):
     ws = MagicMock()
 
