@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
@@ -16,6 +17,20 @@ from app.models.schemas import BillRecord
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+_HYPERLINK_FORMULA_RE = re.compile(r'^=HYPERLINK\("(?P<url>[^"]+)"[;,]"(?P<label>[^"]*)"\)$')
+
+
+def _hyperlink_parts(value: object) -> tuple[str, str] | None:
+    raw = str(value or '').strip()
+    if not raw:
+        return None
+    match = _HYPERLINK_FORMULA_RE.match(raw)
+    if match:
+        return match.group('url'), match.group('label') or match.group('url')
+    if raw.startswith('http://') or raw.startswith('https://'):
+        return raw, raw
+    return None
 
 # Ordered mapping: internal field → Turkish export column
 COLUMN_MAP: dict[str, str] = {
@@ -149,7 +164,16 @@ def tabular_rows_to_xlsx_bytes(
 
     for row_idx, row in enumerate(rows, start=2):
         for col_idx, header in enumerate(workbook_headers, start=1):
-            ws.cell(row=row_idx, column=col_idx, value=row.get(header, ""))
+            value = row.get(header, "")
+            cell = ws.cell(row=row_idx, column=col_idx)
+            hyperlink = _hyperlink_parts(value) if header == "Belge" else None
+            if hyperlink:
+                url, label = hyperlink
+                cell.value = label
+                cell.hyperlink = url
+                cell.style = "Hyperlink"
+            else:
+                cell.value = value
 
     # Auto-fit column widths (approximate)
     for col in ws.columns:
