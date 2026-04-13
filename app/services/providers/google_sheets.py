@@ -1717,10 +1717,15 @@ def _ensure_worksheet_dimensions(ws, tab_name: str) -> None:
 
 def _repair_drive_link_formulas(ws, tab_name: str) -> None:
     drive_col = _drive_column_letter(tab_name)
+    drive_range = f"{drive_col}3:{drive_col}"
     try:
-        values = ws.get(
-            f"{drive_col}3:{drive_col}",
+        formula_values = ws.get(
+            drive_range,
             value_render_option="FORMULA",
+        )
+        rendered_values = ws.get(
+            drive_range,
+            value_render_option="UNFORMATTED_VALUE",
         )
     except Exception:
         return
@@ -1729,20 +1734,30 @@ def _repair_drive_link_formulas(ws, tab_name: str) -> None:
     separator = _formula_arg_separator(spreadsheet=ws.spreadsheet)
     current_separator = '","' if separator == ',' else '";"'
     alternate_separator = '";"' if separator == ',' else '","'
-    for row_number, row in enumerate(values, start=3):
-        formula = row[0] if row else ""
-        if not formula or not str(formula).startswith('=HYPERLINK("'):
-            continue
-        formula = str(formula)
-        if current_separator in formula:
-            continue
-        if alternate_separator not in formula:
+    for row_number, row in enumerate(formula_values, start=3):
+        raw_value = str((row[0] if row else "") or "")
+        normalized_value = raw_value.lstrip()
+        if normalized_value.startswith("'=HYPERLINK(\""):
+            normalized_value = normalized_value[1:]
+        if not normalized_value.startswith('=HYPERLINK("'):
             continue
 
-        fixed_formula = formula.replace(alternate_separator, current_separator, 1)
+        desired_formula = normalized_value
+        if alternate_separator in desired_formula:
+            desired_formula = desired_formula.replace(alternate_separator, current_separator, 1)
+
+        rendered_row = rendered_values[row_number - 3] if row_number - 3 < len(rendered_values) else []
+        rendered_value = str((rendered_row[0] if rendered_row else "") or "").lstrip()
+        if rendered_value.startswith("'=HYPERLINK(\""):
+            rendered_value = rendered_value[1:]
+
+        needs_rewrite = desired_formula != raw_value or rendered_value.startswith('=HYPERLINK("')
+        if not needs_rewrite:
+            continue
+
         _retry_on_rate_limit(
-            lambda fixed_formula=fixed_formula, row_number=row_number: ws.update(
-                [[fixed_formula]],
+            lambda desired_formula=desired_formula, row_number=row_number: ws.update(
+                [[desired_formula]],
                 f"{drive_col}{row_number}",
                 value_input_option="USER_ENTERED",
             )

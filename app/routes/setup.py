@@ -43,6 +43,12 @@ class ResetSheetRequest(BaseModel):
     clear_storage: bool = True
 
 
+class RepairSheetRequest(BaseModel):
+    spreadsheet_id: str | None = None
+    refresh_formatting: bool = False
+    tab_name: list[str] | None = None
+
+
 class EnsureSandboxRequest(BaseModel):
     session_id: str | None = None
 
@@ -331,6 +337,32 @@ async def reset_sheet(request: Request, payload: ResetSheetRequest) -> dict[str,
         return response
     except Exception as exc:
         logger.error("Sheet reset failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/repair-sheet")
+async def repair_sheet(request: Request, payload: RepairSheetRequest) -> dict[str, object]:
+    """Authenticated helper to repair the live spreadsheet layout and formulas."""
+    _verify_admin_token(request)
+
+    try:
+        target_tabs = {tab for tab in (payload.tab_name or []) if tab}
+        report = google_sheets.audit_current_month_spreadsheet(
+            spreadsheet_id=payload.spreadsheet_id,
+            repair=True,
+            target_tabs=target_tabs or None,
+            refresh_formatting=payload.refresh_formatting,
+        )
+        response = {
+            "status": "ok",
+            **report,
+            "sheet_url": _sandbox_sheet_url(report["spreadsheet_id"]),
+        }
+        if target_tabs:
+            response["audited_tabs"] = sorted(target_tabs)
+        return response
+    except Exception as exc:
+        logger.error("Sheet repair failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

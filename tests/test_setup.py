@@ -184,6 +184,48 @@ def test_reset_sheet_can_skip_storage_clear():
     clear_mock.assert_not_called()
 
 
+def test_repair_sheet_runs_google_sheets_audit_in_repair_mode():
+    with _lifespan_patches(), patch(
+        "app.routes.setup.settings.periskope_tool_token",
+        "secret-token",
+    ), patch(
+        "app.routes.setup.google_sheets.audit_current_month_spreadsheet",
+        return_value={
+            "spreadsheet_id": "sheet-123",
+            "month_key": "2026-04",
+            "findings": [{"tab_name": "Faturalar", "message": "Repaired 3 Drive link formula(s)."}],
+            "queue": {"pending_sheet_appends": 0, "pending_drive_uploads": 0},
+        },
+    ) as audit_mock:
+        with TestClient(app) as client:
+            response = client.post(
+                "/setup/repair-sheet",
+                json={
+                    "spreadsheet_id": "sheet-123",
+                    "tab_name": ["Faturalar"],
+                    "refresh_formatting": False,
+                },
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "spreadsheet_id": "sheet-123",
+        "month_key": "2026-04",
+        "findings": [{"tab_name": "Faturalar", "message": "Repaired 3 Drive link formula(s)."}],
+        "queue": {"pending_sheet_appends": 0, "pending_drive_uploads": 0},
+        "sheet_url": "https://docs.google.com/spreadsheets/d/sheet-123/edit",
+        "audited_tabs": ["Faturalar"],
+    }
+    audit_mock.assert_called_once_with(
+        spreadsheet_id="sheet-123",
+        repair=True,
+        target_tabs={"Faturalar"},
+        refresh_formatting=False,
+    )
+
+
 def test_drain_queues_requires_valid_tool_token():
     with _lifespan_patches(), patch(
         "app.routes.setup.settings.periskope_tool_token",

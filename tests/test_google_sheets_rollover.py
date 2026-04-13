@@ -258,8 +258,13 @@ def test_drive_cell_uses_comma_separator_for_english_locale():
 def test_repair_drive_link_formulas_rewrites_old_semicolon_separator_for_comma_locale():
     ws = MagicMock()
     ws.spreadsheet.locale = 'en_US'
-    ws.get.return_value = [
-        ['=HYPERLINK("https://drive.google.com/file/d/a/view";"Görüntüle")'],
+    ws.get.side_effect = [
+        [
+            ['=HYPERLINK("https://drive.google.com/file/d/a/view";"Görüntüle")'],
+        ],
+        [
+            ['=HYPERLINK("https://drive.google.com/file/d/a/view";"Görüntüle")'],
+        ],
     ]
 
     google_sheets._repair_drive_link_formulas(ws, 'Faturalar')
@@ -273,10 +278,17 @@ def test_repair_drive_link_formulas_rewrites_old_semicolon_separator_for_comma_l
 
 def test_repair_drive_link_formulas_rewrites_old_comma_separator():
     ws = MagicMock()
-    ws.get.return_value = [
-        ['=HYPERLINK("https://drive.google.com/file/d/a/view","Görüntüle")'],
-        ['=HYPERLINK("https://drive.google.com/file/d/b/view";"Görüntüle")'],
-        [""],
+    ws.get.side_effect = [
+        [
+            ['=HYPERLINK("https://drive.google.com/file/d/a/view","Görüntüle")'],
+            ['=HYPERLINK("https://drive.google.com/file/d/b/view";"Görüntüle")'],
+            [""],
+        ],
+        [
+            ['=HYPERLINK("https://drive.google.com/file/d/a/view","Görüntüle")'],
+            ['Görüntüle'],
+            [""],
+        ],
     ]
 
     google_sheets._repair_drive_link_formulas(ws, "💳 Dekontlar")
@@ -286,6 +298,44 @@ def test_repair_drive_link_formulas_rewrites_old_comma_separator():
         "I3",
         value_input_option="USER_ENTERED",
     )
+
+
+def test_repair_drive_link_formulas_rewrites_formula_like_text_even_with_current_separator():
+    ws = MagicMock()
+    ws.spreadsheet.locale = 'en_US'
+    ws.get.side_effect = [
+        [
+            ['=HYPERLINK("https://drive.google.com/file/d/a/view","Görüntüle")'],
+        ],
+        [
+            ['=HYPERLINK("https://drive.google.com/file/d/a/view","Görüntüle")'],
+        ],
+    ]
+
+    google_sheets._repair_drive_link_formulas(ws, 'Faturalar')
+
+    ws.update.assert_called_once_with(
+        [['=HYPERLINK("https://drive.google.com/file/d/a/view","Görüntüle")']],
+        'R3',
+        value_input_option='USER_ENTERED',
+    )
+
+
+def test_repair_drive_link_formulas_skips_real_formula_cells():
+    ws = MagicMock()
+    ws.spreadsheet.locale = 'en_US'
+    ws.get.side_effect = [
+        [
+            ['=HYPERLINK("https://drive.google.com/file/d/a/view","Görüntüle")'],
+        ],
+        [
+            ['Görüntüle'],
+        ],
+    ]
+
+    google_sheets._repair_drive_link_formulas(ws, 'Faturalar')
+
+    ws.update.assert_not_called()
 
 
 def test_create_spreadsheet_sets_turkish_locale_and_timezone():
