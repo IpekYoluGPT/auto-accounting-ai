@@ -2543,6 +2543,26 @@ def force_rewrite_drive_links(*, spreadsheet_id: Optional[str] = None, target_ta
         return repaired_by_tab
 
 
+def hide_nonvisible_tabs(*, spreadsheet_id: Optional[str] = None) -> dict[str, int]:
+    client = _get_client()
+    if client is None:
+        raise RuntimeError("Google Sheets client unavailable.")
+
+    with _lock:
+        sh = _open_spreadsheet_by_key(client, spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
+        hidden_counts = {"canonical_hidden": 0, "ignored_orphans": 0}
+        for ws in _list_worksheets(sh):
+            title = getattr(ws, "title", "")
+            if title in _TABS and _tab_spec(title).hidden_tab:
+                _set_worksheet_hidden(ws, hidden=True)
+                hidden_counts["canonical_hidden"] += 1
+                continue
+            if _is_ignored_orphan_title(title):
+                _set_worksheet_hidden(ws, hidden=True)
+                hidden_counts["ignored_orphans"] += 1
+        return hidden_counts
+
+
 def audit_current_month_spreadsheet(
     *,
     spreadsheet_id: Optional[str] = None,

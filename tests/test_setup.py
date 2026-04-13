@@ -258,6 +258,31 @@ def test_rewrite_belge_links_forces_live_sheet_update():
     )
 
 
+def test_hide_hidden_tabs_rehides_technical_and_orphan_tabs():
+    with _lifespan_patches(), patch(
+        "app.routes.setup.settings.periskope_tool_token",
+        "secret-token",
+    ), patch(
+        "app.routes.setup.google_sheets.hide_nonvisible_tabs",
+        return_value={"canonical_hidden": 5, "ignored_orphans": 2},
+    ) as hide_mock:
+        with TestClient(app) as client:
+            response = client.post(
+                "/setup/hide-hidden-tabs",
+                json={"spreadsheet_id": "sheet-123"},
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "spreadsheet_id": "sheet-123",
+        "hidden_tabs": {"canonical_hidden": 5, "ignored_orphans": 2},
+        "sheet_url": "https://docs.google.com/spreadsheets/d/sheet-123/edit",
+    }
+    hide_mock.assert_called_once_with(spreadsheet_id="sheet-123")
+
+
 def test_drain_queues_requires_valid_tool_token():
     with _lifespan_patches(), patch(
         "app.routes.setup.settings.periskope_tool_token",

@@ -54,6 +54,10 @@ class RewriteBelgeLinksRequest(BaseModel):
     tab_name: list[str] | None = None
 
 
+class HideHiddenTabsRequest(BaseModel):
+    spreadsheet_id: str | None = None
+
+
 class EnsureSandboxRequest(BaseModel):
     session_id: str | None = None
 
@@ -394,6 +398,25 @@ async def rewrite_belge_links(request: Request, payload: RewriteBelgeLinksReques
         return response
     except Exception as exc:
         logger.error("Belge link rewrite failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/hide-hidden-tabs")
+async def hide_hidden_tabs(request: Request, payload: HideHiddenTabsRequest) -> dict[str, object]:
+    """Authenticated helper to re-hide technical and ignored orphan worksheets."""
+    _verify_admin_token(request)
+
+    try:
+        hidden_counts = google_sheets.hide_nonvisible_tabs(spreadsheet_id=payload.spreadsheet_id)
+        spreadsheet_id = payload.spreadsheet_id or settings.google_sheets_spreadsheet_id
+        return {
+            "status": "ok",
+            "spreadsheet_id": spreadsheet_id,
+            "hidden_tabs": hidden_counts,
+            "sheet_url": _sandbox_sheet_url(spreadsheet_id),
+        }
+    except Exception as exc:
+        logger.error("Hide hidden tabs failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
