@@ -370,6 +370,27 @@ def test_remap_legacy_fatura_row_replaces_sparse_bank_columns_with_dense_fields(
 
 
 
+def test_tab_headers_can_migrate_in_place_accepts_visible_only_legacy_headers():
+    ws = MagicMock()
+    ws.row_values.return_value = [
+        "Fiş No",
+        "Tarih",
+        "Alıcı",
+        "Ürün Cinsi",
+        "Palet Sayısı",
+        "Adet/Palet",
+        "Ürün Miktarı",
+        "Plaka",
+        "Satıcı",
+        "Çıkış Yeri",
+        "Sevk Yeri",
+        "Belge",
+    ]
+
+    assert google_sheets._tab_headers_can_migrate_in_place(ws, "Sevk Fişleri") is True
+
+
+
 def test_formula_arg_separator_uses_comma_for_english_locale():
     spreadsheet = MagicMock()
     spreadsheet.id = 'sheet-en'

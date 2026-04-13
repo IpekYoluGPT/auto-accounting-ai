@@ -819,6 +819,7 @@ def test_audit_data_tab_uses_visible_schema_migration_for_legacy_headers(monkeyp
     monkeypatch.setattr(google_sheets, "_tab_total_row_is_valid", lambda _ws, _tab_name: True)
     monkeypatch.setattr(google_sheets, "_repair_drive_link_formulas", lambda _ws, _tab_name: None)
     monkeypatch.setattr(google_sheets, "_backfill_internal_row_ids", lambda _ws, _tab_name: 0)
+    monkeypatch.setattr(google_sheets, "_restore_archived_drifted_visible_schema", lambda _sh, _ws, _tab_name: False)
     setup_calls = []
     migrate_calls = []
     monkeypatch.setattr(google_sheets, "_setup_worksheet", lambda _ws, _tab_name, *, lightweight=False: setup_calls.append((_tab_name, lightweight)))
@@ -836,6 +837,26 @@ def test_audit_data_tab_uses_visible_schema_migration_for_legacy_headers(monkeyp
 
 
 
+def test_restore_archived_drifted_visible_schema_uses_latest_archived_tab(monkeypatch):
+    canonical_ws = MagicMock()
+    canonical_ws.title = "Sevk Fişleri"
+    archived_old = MagicMock()
+    archived_old.title = "Sevk Fişleri MANUAL_DRIFT 20260412090000"
+    archived_new = MagicMock()
+    archived_new.title = "Sevk Fişleri MANUAL_DRIFT 20260413115348"
+
+    monkeypatch.setattr(google_sheets, "_list_worksheets", lambda _sh: [canonical_ws, archived_old, archived_new])
+    monkeypatch.setattr(google_sheets, "_remapped_legacy_visible_rows", lambda _sh, ws, tab_name: [[ws.title, tab_name]])
+    applied = []
+    monkeypatch.setattr(google_sheets, "_apply_remapped_visible_rows", lambda ws, tab_name, rows: applied.append((ws, tab_name, rows)))
+
+    restored = google_sheets._restore_archived_drifted_visible_schema(object(), canonical_ws, "Sevk Fişleri")
+
+    assert restored is True
+    assert applied == [(canonical_ws, "Sevk Fişleri", [["Sevk Fişleri MANUAL_DRIFT 20260413115348", "Sevk Fişleri"]])]
+
+
+
 def test_audit_data_tab_repair_does_not_reapply_formatting_by_default(monkeypatch):
     ws = MagicMock()
 
@@ -844,6 +865,7 @@ def test_audit_data_tab_repair_does_not_reapply_formatting_by_default(monkeypatc
     monkeypatch.setattr(google_sheets, "_tab_total_row_is_valid", lambda _ws, _tab_name: True)
     monkeypatch.setattr(google_sheets, "_repair_drive_link_formulas", lambda _ws, _tab_name: None)
     monkeypatch.setattr(google_sheets, "_backfill_internal_row_ids", lambda _ws, _tab_name: 0)
+    monkeypatch.setattr(google_sheets, "_restore_archived_drifted_visible_schema", lambda _sh, _ws, _tab_name: False)
     setup_calls = []
     monkeypatch.setattr(google_sheets, "_setup_worksheet", lambda _ws, _tab_name, *, lightweight=False: setup_calls.append((_tab_name, lightweight)))
 
@@ -863,6 +885,7 @@ def test_audit_data_tab_reapplies_formatting_when_explicitly_requested(monkeypat
     monkeypatch.setattr(google_sheets, "_tab_total_row_is_valid", lambda _ws, _tab_name: True)
     monkeypatch.setattr(google_sheets, "_repair_drive_link_formulas", lambda _ws, _tab_name: None)
     monkeypatch.setattr(google_sheets, "_backfill_internal_row_ids", lambda _ws, _tab_name: 0)
+    monkeypatch.setattr(google_sheets, "_restore_archived_drifted_visible_schema", lambda _sh, _ws, _tab_name: False)
     setup_calls = []
     monkeypatch.setattr(google_sheets, "_setup_worksheet", lambda _ws, _tab_name, *, lightweight=False: setup_calls.append((_tab_name, lightweight)))
 

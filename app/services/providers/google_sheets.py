@@ -1955,6 +1955,17 @@ def _legacy_header_variants(tab_name: str) -> list[list[str]]:
     ]
 
 
+def _legacy_header_match(tab_name: str, actual_headers: list[object]) -> list[str] | None:
+    canonical_tab_name = _canonical_tab_name(tab_name)
+    hidden_headers = _hidden_headers(canonical_tab_name)
+    for visible_headers in _LEGACY_VISIBLE_HEADER_VARIANTS.get(canonical_tab_name, ()):
+        visible_list = list(visible_headers)
+        full_headers = visible_list + hidden_headers
+        if actual_headers == full_headers or actual_headers == visible_list:
+            return full_headers
+    return None
+
+
 def _tab_headers_match(ws, tab_name: str) -> bool:
     expected_headers = _headers(tab_name)
     actual_headers = _trimmed_row(_row_values(ws, 1))
@@ -1963,7 +1974,7 @@ def _tab_headers_match(ws, tab_name: str) -> bool:
 
 def _tab_headers_can_migrate_in_place(ws, tab_name: str) -> bool:
     actual_headers = _trimmed_row(_row_values(ws, 1))
-    return any(actual_headers == variant for variant in _legacy_header_variants(tab_name))
+    return _legacy_header_match(tab_name, actual_headers) is not None
 
 
 def _tab_total_row_is_valid(ws, tab_name: str) -> bool:
@@ -2173,11 +2184,11 @@ def _remap_legacy_visible_row(
     return list(row)
 
 
-def _rewrite_legacy_visible_schema_in_place(sh, ws, tab_name: str) -> bool:
+def _remapped_legacy_visible_rows(sh, ws, tab_name: str) -> list[list[object]] | None:
     actual_headers = _trimmed_row(_row_values(ws, 1))
-    legacy_headers = next((variant for variant in _legacy_header_variants(tab_name) if actual_headers == variant), None)
+    legacy_headers = _legacy_header_match(tab_name, actual_headers)
     if legacy_headers is None:
-        return False
+        return None
 
     legacy_visible_count = len(legacy_headers) - len(_hidden_headers(tab_name))
     legacy_rows = _worksheet_rows_for_headers(
@@ -2188,7 +2199,7 @@ def _rewrite_legacy_visible_schema_in_place(sh, ws, tab_name: str) -> bool:
     )
     raw_by_doc_id = _doc_row_map(sh, "__Raw Belgeler")
     payment_detail_by_doc_id = _doc_row_map(sh, "__Çek_Dekont_Detay")
-    remapped_rows = [
+    return [
         _remap_legacy_visible_row(
             tab_name,
             row,
@@ -2199,6 +2210,8 @@ def _rewrite_legacy_visible_schema_in_place(sh, ws, tab_name: str) -> bool:
         for row in legacy_rows
     ]
 
+
+def _apply_remapped_visible_rows(ws, tab_name: str, remapped_rows: list[list[object]]) -> None:
     target_cols = len(_headers(tab_name)) + 2
     target_rows = max(int(getattr(ws, "row_count", 1000) or 1000), 1000)
     try:
@@ -2215,6 +2228,35 @@ def _rewrite_legacy_visible_schema_in_place(sh, ws, tab_name: str) -> bool:
     if remapped_rows:
         ws.update(remapped_rows, "A3", value_input_option="USER_ENTERED")
     _ensure_tab_total_row(ws, tab_name)
+
+
+
+def _latest_archived_drift_worksheet(sh, tab_name: str):
+    prefix = f"{tab_name}{_MANUAL_DRIFT_MARKER}"
+    candidates = [ws for ws in _list_worksheets(sh) if str(getattr(ws, "title", "")).startswith(prefix)]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda candidate: str(getattr(candidate, "title", "")))
+
+
+
+def _rewrite_legacy_visible_schema_in_place(sh, ws, tab_name: str) -> bool:
+    remapped_rows = _remapped_legacy_visible_rows(sh, ws, tab_name)
+    if remapped_rows is None:
+        return False
+    _apply_remapped_visible_rows(ws, tab_name, remapped_rows)
+    return True
+
+
+
+def _restore_archived_drifted_visible_schema(sh, ws, tab_name: str) -> bool:
+    archived_ws = _latest_archived_drift_worksheet(sh, tab_name)
+    if archived_ws is None:
+        return False
+    remapped_rows = _remapped_legacy_visible_rows(sh, archived_ws, tab_name)
+    if remapped_rows is None:
+        return False
+    _apply_remapped_visible_rows(ws, tab_name, remapped_rows)
     return True
 
 
@@ -2256,6 +2298,16 @@ def _audit_data_tab(sh, tab_name: str, findings: list[dict[str, object]], *, rep
             else:
                 _setup_worksheet(ws, tab_name, lightweight=True)
             finding["repaired"] = True
+
+    if repair and not _worksheet_has_visible_data(ws, tab_name):
+        if _restore_archived_drifted_visible_schema(sh, ws, tab_name):
+            findings.append({
+                "tab_name": tab_name,
+                "code": "archived_drift_restored",
+                "severity": "info",
+                "repaired": True,
+                "message": "Recovered visible rows from the latest archived drift worksheet.",
+            })
 
     if not _tab_total_row_is_valid(ws, tab_name):
         finding = {
