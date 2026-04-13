@@ -221,6 +221,27 @@ def test_upload_document_serializes_concurrent_drive_requests(monkeypatch):
     assert state["max_active"] == 1
 
 
+def test_force_rewrite_drive_links_falls_back_to_raw_document_links(monkeypatch):
+    fake_sheet = MagicMock()
+    fake_client = MagicMock()
+    target_ws = MagicMock()
+    target_ws.spreadsheet.locale = 'tr_TR'
+
+    monkeypatch.setattr(google_sheets, '_get_client', lambda: fake_client)
+    monkeypatch.setattr(google_sheets, '_open_spreadsheet_by_key', lambda client, spreadsheet_id: fake_sheet)
+    monkeypatch.setattr(google_sheets, '_raw_document_drive_link_map', lambda sh: {'doc-1': 'https://drive.google.com/file/d/raw/view'})
+    monkeypatch.setattr(google_sheets, '_iter_visible_row_maps', lambda ws, tab_name, value_render_option=None: [(3, {google_sheets._VISIBLE_DRIVE_LINK_HEADER: 'Görüntüle', google_sheets._HIDDEN_SOURCE_DOC_ID_HEADER: 'doc-1'})])
+    monkeypatch.setattr(google_sheets, '_ensure_tab_exists', lambda sh, tab_name, lightweight=True: target_ws)
+    rewrite_calls = []
+    monkeypatch.setattr(google_sheets, '_rewrite_drive_cells', lambda ws, tab_name, row_formulas: rewrite_calls.append((tab_name, row_formulas)) or len(row_formulas))
+
+    rewritten = google_sheets.force_rewrite_drive_links(spreadsheet_id='sheet-1', target_tabs={'Sevk Fişleri'})
+
+    assert rewritten == {'Sevk Fişleri': 1}
+    assert rewrite_calls == [('Sevk Fişleri', [(3, '=HYPERLINK("https://drive.google.com/file/d/raw/view";"Görüntüle")')])]
+
+
+
 def test_process_pending_document_uploads_backfills_missing_drive_links(tmp_path, monkeypatch):
     monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
     monkeypatch.setattr(

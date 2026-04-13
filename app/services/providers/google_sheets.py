@@ -2227,6 +2227,18 @@ def _apply_remapped_visible_rows(ws, tab_name: str, remapped_rows: list[list[obj
         logger.warning("Could not clear worksheet '%s' during visible schema migration: %s", tab_name, exc)
     if remapped_rows:
         ws.update(remapped_rows, "A3", value_input_option="USER_ENTERED")
+        drive_index = _header_index(tab_name, _VISIBLE_DRIVE_LINK_HEADER)
+        if drive_index is not None:
+            row_formulas = []
+            for row_number, row in enumerate(remapped_rows, start=3):
+                if drive_index >= len(row):
+                    continue
+                url = _extract_drive_link_from_cell_value(row[drive_index])
+                if not url:
+                    continue
+                row_formulas.append((row_number, _drive_cell(url, spreadsheet=ws.spreadsheet)))
+            if row_formulas:
+                _rewrite_drive_cells(ws, tab_name, row_formulas)
     _ensure_tab_total_row(ws, tab_name)
 
 
@@ -2433,6 +2445,54 @@ def _extract_drive_link_from_cell_value(value: object) -> str | None:
     return url
 
 
+def _raw_document_drive_link_map(sh) -> dict[str, str]:
+    ws = _ensure_tab_exists(sh, '__Raw Belgeler', lightweight=True)
+    rows = _worksheet_rows_as_dicts(ws, '__Raw Belgeler', value_render_option='FORMULA')
+    links: dict[str, str] = {}
+    for row in rows:
+        source_doc_id = _coalesce_text(row.get('Belge ID'))
+        if not source_doc_id:
+            continue
+        drive_link = _extract_drive_link_from_cell_value(row.get(_HIDDEN_DRIVE_LINK_HEADER))
+        if drive_link:
+            links[source_doc_id] = drive_link
+    return links
+
+
+def _iter_visible_row_maps(ws, tab_name: str, *, value_render_option: str | None = None) -> list[tuple[int, dict[str, object]]]:
+    last_col = _internal_row_id_column_letter(tab_name)
+    try:
+        rows = _get_range_values(ws, f"A3:{last_col}", value_render_option=value_render_option)
+    except Exception:
+        return []
+
+    headers = _headers(tab_name)
+    visible_count = _visible_header_count(tab_name)
+    mapped_rows: list[tuple[int, dict[str, object]]] = []
+    for row_number, row in enumerate(rows, start=3):
+        padded = list(row) + [""] * max(0, len(headers) - len(row))
+        if not any(_text_value(cell) for cell in padded[:visible_count]):
+            continue
+        mapped_rows.append((row_number, {headers[idx]: padded[idx] if idx < len(padded) else "" for idx in range(len(headers))}))
+    return mapped_rows
+
+
+def _rewrite_drive_cells(ws, tab_name: str, row_formulas: list[tuple[int, str]]) -> int:
+    repaired = 0
+    drive_col = _drive_column_letter(tab_name)
+    for row_number, desired_formula in row_formulas:
+        _clear_drive_link_cell_number_format(ws, tab_name, row_number)
+        _retry_on_rate_limit(
+            lambda desired_formula=desired_formula, row_number=row_number: ws.update(
+                [[desired_formula]],
+                f"{drive_col}{row_number}",
+                value_input_option='USER_ENTERED',
+            )
+        )
+        repaired += 1
+    return repaired
+
+
 def force_rewrite_drive_links(*, spreadsheet_id: Optional[str] = None, target_tabs: set[str] | None = None) -> dict[str, int]:
     client = _get_client()
     if client is None:
@@ -2454,6 +2514,7 @@ def force_rewrite_drive_links(*, spreadsheet_id: Optional[str] = None, target_ta
                     continue
                 resolved_tabs.append(tab_name)
 
+        raw_drive_links = _raw_document_drive_link_map(sh)
         repaired_by_tab: dict[str, int] = {}
         for tab_name in resolved_tabs:
             if _header_index(tab_name, _VISIBLE_DRIVE_LINK_HEADER) is None:
@@ -2461,24 +2522,17 @@ def force_rewrite_drive_links(*, spreadsheet_id: Optional[str] = None, target_ta
                 continue
 
             ws = _ensure_tab_exists(sh, tab_name, lightweight=True)
-            drive_col = _drive_column_letter(tab_name)
-            values = _get_range_values(ws, f"{drive_col}3:{drive_col}", value_render_option="FORMULA")
-            repaired = 0
-            for row_number, row in enumerate(values, start=3):
-                url = _extract_drive_link_from_cell_value(row[0] if row else '')
+            row_formulas: list[tuple[int, str]] = []
+            for row_number, row_map in _iter_visible_row_maps(ws, tab_name, value_render_option='FORMULA'):
+                url = _extract_drive_link_from_cell_value(row_map.get(_VISIBLE_DRIVE_LINK_HEADER))
+                if not url:
+                    source_doc_id = _coalesce_text(row_map.get(_HIDDEN_SOURCE_DOC_ID_HEADER))
+                    url = raw_drive_links.get(source_doc_id, '')
                 if not url:
                     continue
-                desired_formula = _drive_cell(url, spreadsheet=ws.spreadsheet)
-                _clear_drive_link_cell_number_format(ws, tab_name, row_number)
-                _retry_on_rate_limit(
-                    lambda desired_formula=desired_formula, row_number=row_number: ws.update(
-                        [[desired_formula]],
-                        f"{drive_col}{row_number}",
-                        value_input_option="USER_ENTERED",
-                    )
-                )
-                repaired += 1
+                row_formulas.append((row_number, _drive_cell(url, spreadsheet=ws.spreadsheet)))
 
+            repaired = _rewrite_drive_cells(ws, tab_name, row_formulas)
             repaired_by_tab[tab_name] = repaired
             if repaired:
                 logger.info("Force-rewrote %d Drive link cell(s) on '%s'.", repaired, tab_name)

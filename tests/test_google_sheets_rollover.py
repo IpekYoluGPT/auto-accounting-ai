@@ -370,6 +370,30 @@ def test_remap_legacy_fatura_row_replaces_sparse_bank_columns_with_dense_fields(
 
 
 
+def test_apply_remapped_visible_rows_rewrites_drive_cells_after_bulk_update(monkeypatch):
+    ws = MagicMock()
+    ws.spreadsheet.locale = 'tr_TR'
+    ws.row_count = 1000
+
+    monkeypatch.setattr(google_sheets, '_setup_worksheet', lambda _ws, _tab_name, *, lightweight=False: None)
+    monkeypatch.setattr(google_sheets, '_ensure_tab_total_row', lambda _ws, _tab_name: None)
+    rewrite_calls = []
+    monkeypatch.setattr(google_sheets, '_rewrite_drive_cells', lambda _ws, _tab_name, row_formulas: rewrite_calls.append((_tab_name, row_formulas)) or len(row_formulas))
+
+    row = [
+        '81', '2026-03-18', 'Fatura', 'ŞEMSETTİN YILMAZ', '4540007255', 'H.KARAKAYA',
+        'PVC ATIK SU BORUSU', '', '', '6837.09', '20', '1367.42', 'HAYIR', '0', '8204.51',
+        'TRY', 'Banka: Yapı Kredi', '=HYPERLINK("https://drive.google.com/file/d/test/view";"Görüntüle")',
+        'row-1', 'party-1', 'doc-1', '4540007255', 'fatura'
+    ]
+
+    google_sheets._apply_remapped_visible_rows(ws, 'Faturalar', [row])
+
+    assert ws.update.call_args_list[0].args[1] == 'A3'
+    assert rewrite_calls == [('Faturalar', [(3, '=HYPERLINK("https://drive.google.com/file/d/test/view";"Görüntüle")')])]
+
+
+
 def test_tab_headers_can_migrate_in_place_accepts_visible_only_legacy_headers():
     ws = MagicMock()
     ws.row_values.return_value = [
