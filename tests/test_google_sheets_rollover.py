@@ -237,6 +237,40 @@ def test_invoice_row_uses_line_item_summary_when_description_is_generic():
     assert row[9] == 3214.95
 
 
+def test_formula_arg_separator_uses_comma_for_english_locale():
+    spreadsheet = MagicMock()
+    spreadsheet.id = 'sheet-en'
+    spreadsheet.locale = 'en_US'
+
+    assert google_sheets._formula_arg_separator(spreadsheet=spreadsheet) == ','
+
+
+
+def test_drive_cell_uses_comma_separator_for_english_locale():
+    spreadsheet = MagicMock()
+    spreadsheet.id = 'sheet-en'
+    spreadsheet.locale = 'en_US'
+
+    assert google_sheets._drive_cell('https://drive.google.com/file/d/example/view', spreadsheet=spreadsheet) == '=HYPERLINK("https://drive.google.com/file/d/example/view","Görüntüle")'
+
+
+
+def test_repair_drive_link_formulas_rewrites_old_semicolon_separator_for_comma_locale():
+    ws = MagicMock()
+    ws.spreadsheet.locale = 'en_US'
+    ws.get.return_value = [
+        ['=HYPERLINK("https://drive.google.com/file/d/a/view";"Görüntüle")'],
+    ]
+
+    google_sheets._repair_drive_link_formulas(ws, 'Faturalar')
+
+    ws.update.assert_called_once_with(
+        [['=HYPERLINK("https://drive.google.com/file/d/a/view","Görüntüle")']],
+        'R3',
+        value_input_option='USER_ENTERED',
+    )
+
+
 def test_repair_drive_link_formulas_rewrites_old_comma_separator():
     ws = MagicMock()
     ws.get.return_value = [

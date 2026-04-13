@@ -35,6 +35,8 @@ from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+_SPREADSHEET_LOCALE_CACHE: dict[str, str] = {}
+
 # ─── Tab definitions ──────────────────────────────────────────────────────────
 
 _HIDDEN_ROW_ID_HEADER = "__row_id"
@@ -1146,7 +1148,49 @@ def _col_letter(idx: int) -> str:
     return result
 
 
-def _formula_arg_separator() -> str:
+def _spreadsheet_locale(*, spreadsheet=None, spreadsheet_id: str | None = None) -> str:
+    resolved_id = str(spreadsheet_id or getattr(spreadsheet, "id", "") or "").strip()
+    if resolved_id and resolved_id in _SPREADSHEET_LOCALE_CACHE:
+        return _SPREADSHEET_LOCALE_CACHE[resolved_id]
+
+    locale_value = str(getattr(spreadsheet, "locale", "") or "").strip()
+    if not locale_value and spreadsheet is not None and hasattr(spreadsheet, "fetch_sheet_metadata"):
+        try:
+            metadata = spreadsheet.fetch_sheet_metadata(params={"fields": "properties.locale"})
+            properties = metadata.get("properties", {}) if isinstance(metadata, dict) else {}
+            locale_value = str(properties.get("locale") or "").strip()
+        except Exception:
+            locale_value = ""
+
+    if not locale_value and resolved_id:
+        try:
+            client = _get_client()
+            if client is not None:
+                remote_sheet = client.open_by_key(resolved_id)
+                locale_value = str(getattr(remote_sheet, "locale", "") or "").strip()
+                if not locale_value and hasattr(remote_sheet, "fetch_sheet_metadata"):
+                    metadata = remote_sheet.fetch_sheet_metadata(params={"fields": "properties.locale"})
+                    properties = metadata.get("properties", {}) if isinstance(metadata, dict) else {}
+                    locale_value = str(properties.get("locale") or "").strip()
+        except Exception:
+            locale_value = ""
+
+    if not locale_value:
+        target_month_key = _month_key()
+        registered_id = _registered_spreadsheet_id_for_month(target_month_key)
+        registered_id = str(registered_id or "").strip()
+        if registered_id and registered_id != resolved_id:
+            return _spreadsheet_locale(spreadsheet_id=registered_id)
+
+    if resolved_id and locale_value:
+        _SPREADSHEET_LOCALE_CACHE[resolved_id] = locale_value
+    return locale_value
+
+
+def _formula_arg_separator(*, spreadsheet=None, spreadsheet_id: str | None = None) -> str:
+    locale_value = _spreadsheet_locale(spreadsheet=spreadsheet, spreadsheet_id=spreadsheet_id).lower()
+    if locale_value.startswith("en"):
+        return ","
     return ";"
 
 
@@ -1229,29 +1273,29 @@ def _tab_total_column_letter(tab_name: str) -> str | None:
     return _header_letter(tab_name, total_header)
 
 
-def _build_tab_total_formula(tab_name: str) -> str | None:
+def _build_tab_total_formula(tab_name: str, *, spreadsheet=None, spreadsheet_id: str | None = None) -> str | None:
     total_col = _tab_total_column_letter(tab_name)
     if not total_col:
         return None
-    sep = _formula_arg_separator()
+    sep = _formula_arg_separator(spreadsheet=spreadsheet, spreadsheet_id=spreadsheet_id)
     return f"=IFERROR(SUM({total_col}3:{total_col}){sep}0)"
 
 
-def _build_summary_formula(tab_name: str) -> str:
+def _build_summary_formula(tab_name: str, *, spreadsheet=None, spreadsheet_id: str | None = None) -> str:
     canonical_tab_name = _canonical_tab_name(tab_name)
     total_col = _tab_total_column_letter(canonical_tab_name)
     if not total_col:
         raise KeyError(f"No total column configured for {canonical_tab_name}")
-    sep = _formula_arg_separator()
+    sep = _formula_arg_separator(spreadsheet=spreadsheet, spreadsheet_id=spreadsheet_id)
     return f"=IFERROR('{canonical_tab_name}'!{total_col}2{sep}0)"
 
 
-def _total_row_values(tab_name: str) -> list[str]:
+def _total_row_values(tab_name: str, *, spreadsheet=None, spreadsheet_id: str | None = None) -> list[str]:
     headers = _headers(tab_name)
     values = [""] * len(headers)
     if headers:
         values[0] = "TOPLAM"
-    total_formula = _build_tab_total_formula(tab_name)
+    total_formula = _build_tab_total_formula(tab_name, spreadsheet=spreadsheet, spreadsheet_id=spreadsheet_id)
     total_col = _tab_total_column_letter(tab_name)
     if total_formula and total_col:
         total_col_idx = _header_index(tab_name, _tab_spec(tab_name).total_header or "")
@@ -1329,7 +1373,7 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
     visible_data_range = f"A3:{visible_last_col}1000"
 
     ws.update([headers], "A1", value_input_option="RAW")
-    ws.update([_total_row_values(tab_name)], "A2", value_input_option="USER_ENTERED")
+    ws.update([_total_row_values(tab_name, spreadsheet=ws.spreadsheet)], "A2", value_input_option="USER_ENTERED")
     ws.freeze(rows=2)
 
     if lightweight:
@@ -1574,7 +1618,7 @@ def _setup_summary_tab(ws, month_label: str, *, lightweight: bool = False) -> No
             pass
 
     values = [["📊 ÖZET — " + month_label, ""]]
-    values.extend([[label, _build_summary_formula(tab_name)] for label, tab_name in summary_rows])
+    values.extend([[label, _build_summary_formula(tab_name, spreadsheet=ws.spreadsheet)] for label, tab_name in summary_rows])
     values.append(["", ""])
     values.append(["💰 GENEL TOPLAM (TL)", total_formula])
     ws.update(values, "A1", value_input_option="USER_ENTERED")
@@ -1642,7 +1686,7 @@ def _ensure_tab_total_row(ws, tab_name: str) -> None:
     # Row 2 is reserved for the canonical TOPLAM row. Rewriting it in place is
     # safer than inserting a new row after manual edits, because insertion can
     # shift real data rows and intermittently fail against live Sheets.
-    ws.update([_total_row_values(tab_name)], "A2", value_input_option="USER_ENTERED")
+    ws.update([_total_row_values(tab_name, spreadsheet=ws.spreadsheet)], "A2", value_input_option="USER_ENTERED")
     ws.format(f"A2:{last_col}2", {
         "backgroundColor": {"red": 0.96, "green": 0.96, "blue": 0.96},
         "textFormat": {"bold": True, "fontSize": 10},
@@ -1682,17 +1726,20 @@ def _repair_drive_link_formulas(ws, tab_name: str) -> None:
         return
 
     repaired = 0
-    separator = _formula_arg_separator()
+    separator = _formula_arg_separator(spreadsheet=ws.spreadsheet)
+    current_separator = '","' if separator == ',' else '";"'
+    alternate_separator = '";"' if separator == ',' else '","'
     for row_number, row in enumerate(values, start=3):
         formula = row[0] if row else ""
-        if not formula or not formula.startswith('=HYPERLINK("'):
+        if not formula or not str(formula).startswith('=HYPERLINK("'):
             continue
-        if f'"{separator}"' in formula:
+        formula = str(formula)
+        if current_separator in formula:
             continue
-        if '","' not in formula:
+        if alternate_separator not in formula:
             continue
 
-        fixed_formula = formula.replace('","', f'"{separator}"', 1)
+        fixed_formula = formula.replace(alternate_separator, current_separator, 1)
         _retry_on_rate_limit(
             lambda fixed_formula=fixed_formula, row_number=row_number: ws.update(
                 [[fixed_formula]],
@@ -1831,7 +1878,7 @@ def _tab_total_row_is_valid(ws, tab_name: str) -> bool:
     if not row or not _looks_like_total_row(row[0] if row else ""):
         return False
 
-    total_formula = _build_tab_total_formula(tab_name)
+    total_formula = _build_tab_total_formula(tab_name, spreadsheet=ws.spreadsheet)
     if not total_formula:
         return True
 
@@ -1858,7 +1905,7 @@ def _summary_tab_is_valid(ws) -> bool:
     if not title.startswith("📊 ÖZET — "):
         return False
 
-    expected_formulas = [_build_summary_formula(tab_name) for _, tab_name in summary_rows]
+    expected_formulas = [_build_summary_formula(tab_name, spreadsheet=ws.spreadsheet) for _, tab_name in summary_rows]
     for index, formula in enumerate(expected_formulas, start=1):
         row = rows[index] if len(rows) > index else []
         actual_formula = str(row[1]).strip() if len(row) > 1 else ""
@@ -2541,10 +2588,10 @@ def _internal_row_id_column_letter(tab_name: str) -> str:
     return _header_letter(tab_name, _HIDDEN_ROW_ID_HEADER) or _col_letter(len(_headers(tab_name)))
 
 
-def _drive_cell(drive_link: Optional[str]) -> str:
+def _drive_cell(drive_link: Optional[str], *, spreadsheet=None, spreadsheet_id: str | None = None) -> str:
     """Return a HYPERLINK formula if we have a link, otherwise empty string."""
     if drive_link:
-        sep = _formula_arg_separator()
+        sep = _formula_arg_separator(spreadsheet=spreadsheet, spreadsheet_id=spreadsheet_id)
         return f'=HYPERLINK("{drive_link}"{sep}"Görüntüle")'
     return ""
 
@@ -2742,8 +2789,8 @@ def _invoice_summary_description(
     return "Fatura"
 
 
-def _masraf_paid_formula(row_number: int) -> str:
-    sep = _formula_arg_separator()
+def _masraf_paid_formula(row_number: int, *, spreadsheet=None, spreadsheet_id: str | None = None) -> str:
+    sep = _formula_arg_separator(spreadsheet=spreadsheet, spreadsheet_id=spreadsheet_id)
     settled_ref = f"{_header_letter('Masraf Kayıtları', _HIDDEN_SETTLED_AMOUNT_HEADER)}{row_number}"
     row_id_ref = f"{_header_letter('Masraf Kayıtları', _HIDDEN_ROW_ID_HEADER)}{row_number}"
     debt_col = _header_letter('__Ödeme_Dağıtımları', 'Borç Row ID')
@@ -2754,8 +2801,8 @@ def _masraf_paid_formula(row_number: int) -> str:
     )
 
 
-def _masraf_remaining_formula(row_number: int) -> str:
-    sep = _formula_arg_separator()
+def _masraf_remaining_formula(row_number: int, *, spreadsheet=None, spreadsheet_id: str | None = None) -> str:
+    sep = _formula_arg_separator(spreadsheet=spreadsheet, spreadsheet_id=spreadsheet_id)
     balance_ref = f"{_header_letter('Masraf Kayıtları', 'Bakiye (TL)')}{row_number}"
     paid_ref = f"{_header_letter('Masraf Kayıtları', 'Ödenen (TL)')}{row_number}"
     return f"=IFERROR({balance_ref}-{paid_ref}{sep}0)"
@@ -2771,10 +2818,13 @@ def _build_row_for_tab(
     drive_link: Optional[str] = None,
     return_source_category: DocumentCategory | None = None,
     source_doc_id: str | None = None,
+    spreadsheet=None,
 ) -> list:
     source_doc_id = source_doc_id or _document_source_id(record, row_id)
     tax_number = str(record.tax_number or "")
-    drive_value = _drive_cell(drive_link)
+    separator_spreadsheet_id = _registered_spreadsheet_id_for_month(_month_key()) or None
+    separator_spreadsheet = spreadsheet
+    drive_value = _drive_cell(drive_link, spreadsheet=separator_spreadsheet, spreadsheet_id=separator_spreadsheet_id)
 
     if tab_name == 'Faturalar':
         primary_line_item = _invoice_primary_line_item(record)
@@ -2819,8 +2869,8 @@ def _build_row_for_tab(
             _safe(record.description or record.notes),
             _safe(_document_reference(record)),
             _safe(signed_amount),
-            _masraf_paid_formula(row_number),
-            _masraf_remaining_formula(row_number),
+            _masraf_paid_formula(row_number, spreadsheet=separator_spreadsheet, spreadsheet_id=separator_spreadsheet_id),
+            _masraf_remaining_formula(row_number, spreadsheet=separator_spreadsheet, spreadsheet_id=separator_spreadsheet_id),
             drive_value,
             row_id,
             _party_key(record, role='debt'),
@@ -2935,6 +2985,7 @@ def _build_payment_allocation_row(
     debt_row_id: str,
     tax_number: str = '',
     allocation_id: str = '',
+    spreadsheet=None,
 ) -> list:
     return [
         _safe(party_name),
@@ -2945,7 +2996,7 @@ def _build_payment_allocation_row(
         _safe(payment_date),
         _safe(remaining_balance),
         _safe(status),
-        _drive_cell(drive_link),
+        _drive_cell(drive_link, spreadsheet=spreadsheet),
         row_id,
         _safe(party_key),
         _safe(source_doc_id),
@@ -3123,6 +3174,7 @@ def _build_payment_projection_rows(
     item_id: str,
     debt_state: list[dict[str, object]],
     drive_link: Optional[str],
+    spreadsheet=None,
 ) -> tuple[list[list], list[list], list[dict[str, object]]]:
     source_doc_id = item_id
     amount = float(_primary_amount(record) or 0)
@@ -3189,6 +3241,7 @@ def _build_payment_projection_rows(
                 debt_row_id=str(debt.get('row_id') or ''),
                 tax_number=str(debt.get('tax_number') or payment_tax_number or ''),
                 allocation_id=allocation_id,
+                spreadsheet=spreadsheet,
             ))
             allocation_rows.append(_build_allocation_detail_row(
                 allocation_id=allocation_id,
@@ -3220,6 +3273,7 @@ def _build_payment_projection_rows(
             debt_row_id='',
             tax_number=payment_tax_number,
             allocation_id=f'{item_id}__alloc0',
+            spreadsheet=spreadsheet,
         ))
     elif allocation_index == 0:
         visible_rows.append(_build_payment_allocation_row(
@@ -3238,6 +3292,7 @@ def _build_payment_projection_rows(
             debt_row_id='',
             tax_number=match.tax_number or payment_tax_number,
             allocation_id=f'{item_id}__alloc0',
+            spreadsheet=spreadsheet,
         ))
     elif remaining_payment > 0:
         visible_rows.append(_build_payment_allocation_row(
@@ -3256,6 +3311,7 @@ def _build_payment_projection_rows(
             debt_row_id='',
             tax_number=match.tax_number or payment_tax_number,
             allocation_id=f'{item_id}__alloc{allocation_index + 1}',
+            spreadsheet=spreadsheet,
         ))
 
     return visible_rows, allocation_rows, party_cards
@@ -3413,7 +3469,7 @@ def _write_drive_link_to_target(target: dict[str, str | int], drive_link: str) -
     cell_a1 = f"{_drive_column_letter(tab_name)}{row_number}"
 
     _retry_on_rate_limit(
-        lambda: ws.update([[_drive_cell(drive_link)]], cell_a1, value_input_option="USER_ENTERED")
+        lambda: ws.update([[_drive_cell(drive_link, spreadsheet=ws.spreadsheet)]], cell_a1, value_input_option="USER_ENTERED")
     )
 
 
@@ -4013,6 +4069,7 @@ def process_pending_sheet_appends(*, max_items: int | None = None) -> int:
                                 item_id=item_id,
                                 debt_state=debt_state,
                                 drive_link=str(item.get('drive_link') or '') or None,
+                                spreadsheet=sh,
                             )
                             row_targets_by_item[item_id] = []
                             row_start = start_row_number + len(visible_rows)
@@ -4069,6 +4126,7 @@ def process_pending_sheet_appends(*, max_items: int | None = None) -> int:
                                 drive_link=str(item.get('drive_link') or '') or None,
                                 return_source_category=return_source_category,
                                 source_doc_id=item_id,
+                                spreadsheet=sh,
                             )
                             rows.append(row)
                             if _header_index(tab_name, _VISIBLE_DRIVE_LINK_HEADER) is not None or _header_index(tab_name, _HIDDEN_DRIVE_LINK_HEADER) is not None:
