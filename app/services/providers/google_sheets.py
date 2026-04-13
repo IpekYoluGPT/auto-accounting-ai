@@ -2372,6 +2372,9 @@ def _audit_data_tab(sh, tab_name: str, findings: list[dict[str, object]], *, rep
                 "count": missing_count,
             })
 
+    if repair:
+        _set_worksheet_hidden(ws, hidden=_tab_spec(tab_name).hidden_tab)
+
     if repair and refresh_formatting and not _tab_spec(tab_name).hidden_tab:
         _setup_worksheet(ws, tab_name)
 

@@ -897,6 +897,25 @@ def test_audit_data_tab_repair_does_not_reapply_formatting_by_default(monkeypatc
     assert setup_calls == []
 
 
+def test_audit_data_tab_repair_reapplies_hidden_state_for_hidden_tabs(monkeypatch):
+    ws = MagicMock()
+
+    monkeypatch.setattr(google_sheets, "_get_worksheet", lambda _sh, _title: ws)
+    monkeypatch.setattr(google_sheets, "_tab_headers_match", lambda _ws, _tab_name: True)
+    monkeypatch.setattr(google_sheets, "_tab_total_row_is_valid", lambda _ws, _tab_name: True)
+    monkeypatch.setattr(google_sheets, "_repair_drive_link_formulas", lambda _ws, _tab_name: None)
+    monkeypatch.setattr(google_sheets, "_backfill_internal_row_ids", lambda _ws, _tab_name: 0)
+    monkeypatch.setattr(google_sheets, "_restore_archived_drifted_visible_schema", lambda _sh, _ws, _tab_name: False)
+    hidden_calls = []
+    monkeypatch.setattr(google_sheets, "_set_worksheet_hidden", lambda _ws, *, hidden=True: hidden_calls.append(hidden))
+
+    findings = []
+    google_sheets._audit_data_tab(object(), "__Raw Belgeler", findings, repair=True)
+
+    assert findings == []
+    assert hidden_calls == [True]
+
+
 
 def test_audit_data_tab_reapplies_formatting_when_explicitly_requested(monkeypatch):
     ws = MagicMock()
