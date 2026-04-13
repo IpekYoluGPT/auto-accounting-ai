@@ -555,6 +555,32 @@ def test_process_pending_sheet_appends_retries_rate_limited_batch(tmp_path, monk
 
 
 
+def test_select_pending_sheet_batch_defers_banka_odemeleri_until_other_ready_tabs_are_processed(tmp_path, monkeypatch):
+    monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
+
+    items = [
+        {
+            "id": "banka-1",
+            "spreadsheet_id": "sheet-1",
+            "month_key": "2026-04",
+            "tab_name": "Banka Ödemeleri",
+            "next_attempt_at": 0,
+        },
+        {
+            "id": "masraf-1",
+            "spreadsheet_id": "sheet-1",
+            "month_key": "2026-04",
+            "tab_name": "Masraf Kayıtları",
+            "next_attempt_at": 0,
+        },
+    ]
+    monkeypatch.setattr(google_sheets, "_load_pending_sheet_appends", lambda: items)
+
+    batch = google_sheets._select_pending_sheet_batch(batch_size=10)
+
+    assert [item["id"] for item in batch] == ["masraf-1"]
+
+
 def test_reset_current_month_spreadsheet_data_clears_only_data_rows(monkeypatch):
     fake_summary_ws = MagicMock()
     fake_summary_ws.row_count = 1000

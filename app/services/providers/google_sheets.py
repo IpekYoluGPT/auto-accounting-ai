@@ -3795,6 +3795,14 @@ def _pending_sheet_item_is_ready(item: dict) -> bool:
     return float(item.get("next_attempt_at") or 0.0) <= time.time()
 
 
+def _pending_sheet_batch_priority(item: dict) -> tuple[int, int]:
+    tab_name = str(item.get("tab_name") or "")
+    # Payments depend on debt tabs already being present; let debt-producing tabs win first.
+    if tab_name == "Banka Ödemeleri":
+        return (1, 0)
+    return (0, 0)
+
+
 def _select_pending_sheet_batch(*, batch_size: int) -> list[dict]:
     with _pending_sheet_appends_lock:
         items = _load_pending_sheet_appends()
@@ -3802,9 +3810,18 @@ def _select_pending_sheet_batch(*, batch_size: int) -> list[dict]:
     if not items:
         return []
 
-    first_ready = next((item for item in items if _pending_sheet_item_is_ready(item)), None)
-    if first_ready is None:
+    ready_candidates = [
+        (index, item)
+        for index, item in enumerate(items)
+        if _pending_sheet_item_is_ready(item)
+    ]
+    if not ready_candidates:
         return []
+
+    _, first_ready = min(
+        ready_candidates,
+        key=lambda pair: (_pending_sheet_batch_priority(pair[1]), pair[0]),
+    )
 
     batch_key = (
         str(first_ready.get("spreadsheet_id") or ""),
