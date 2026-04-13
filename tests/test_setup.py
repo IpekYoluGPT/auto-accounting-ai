@@ -226,6 +226,38 @@ def test_repair_sheet_runs_google_sheets_audit_in_repair_mode():
     )
 
 
+def test_rewrite_belge_links_forces_live_sheet_update():
+    with _lifespan_patches(), patch(
+        "app.routes.setup.settings.periskope_tool_token",
+        "secret-token",
+    ), patch(
+        "app.routes.setup.google_sheets.force_rewrite_drive_links",
+        return_value={"Faturalar": 3},
+    ) as rewrite_mock:
+        with TestClient(app) as client:
+            response = client.post(
+                "/setup/rewrite-belge-links",
+                json={
+                    "spreadsheet_id": "sheet-123",
+                    "tab_name": ["Faturalar"],
+                },
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "spreadsheet_id": "sheet-123",
+        "rewritten_tabs": {"Faturalar": 3},
+        "sheet_url": "https://docs.google.com/spreadsheets/d/sheet-123/edit",
+        "audited_tabs": ["Faturalar"],
+    }
+    rewrite_mock.assert_called_once_with(
+        spreadsheet_id="sheet-123",
+        target_tabs={"Faturalar"},
+    )
+
+
 def test_drain_queues_requires_valid_tool_token():
     with _lifespan_patches(), patch(
         "app.routes.setup.settings.periskope_tool_token",

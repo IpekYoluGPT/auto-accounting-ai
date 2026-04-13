@@ -49,6 +49,11 @@ class RepairSheetRequest(BaseModel):
     tab_name: list[str] | None = None
 
 
+class RewriteBelgeLinksRequest(BaseModel):
+    spreadsheet_id: str | None = None
+    tab_name: list[str] | None = None
+
+
 class EnsureSandboxRequest(BaseModel):
     session_id: str | None = None
 
@@ -363,6 +368,32 @@ async def repair_sheet(request: Request, payload: RepairSheetRequest) -> dict[st
         return response
     except Exception as exc:
         logger.error("Sheet repair failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/rewrite-belge-links")
+async def rewrite_belge_links(request: Request, payload: RewriteBelgeLinksRequest) -> dict[str, object]:
+    """Authenticated helper to force-rewrite visible Belge formulas on the live spreadsheet."""
+    _verify_admin_token(request)
+
+    try:
+        target_tabs = {tab for tab in (payload.tab_name or []) if tab}
+        rewritten = google_sheets.force_rewrite_drive_links(
+            spreadsheet_id=payload.spreadsheet_id,
+            target_tabs=target_tabs or None,
+        )
+        spreadsheet_id = payload.spreadsheet_id or settings.google_sheets_spreadsheet_id
+        response = {
+            "status": "ok",
+            "spreadsheet_id": spreadsheet_id,
+            "rewritten_tabs": rewritten,
+            "sheet_url": _sandbox_sheet_url(spreadsheet_id),
+        }
+        if target_tabs:
+            response["audited_tabs"] = sorted(target_tabs)
+        return response
+    except Exception as exc:
+        logger.error("Belge link rewrite failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

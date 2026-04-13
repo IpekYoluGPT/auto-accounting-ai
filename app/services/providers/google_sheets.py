@@ -2139,6 +2139,79 @@ def queue_status() -> dict[str, int]:
     }
 
 
+def _extract_drive_link_from_cell_value(value: object) -> str | None:
+    raw = str(value or '').strip()
+    if raw.startswith("'"):
+        raw = raw[1:].lstrip()
+    if raw.startswith('http://') or raw.startswith('https://'):
+        return raw
+
+    prefix = '=HYPERLINK("'
+    if not raw.startswith(prefix):
+        return None
+
+    remainder = raw[len(prefix):]
+    url, quote, tail = remainder.partition('"')
+    if not quote or not url:
+        return None
+    if not tail.startswith(',') and not tail.startswith(';'):
+        return None
+    return url
+
+
+def force_rewrite_drive_links(*, spreadsheet_id: Optional[str] = None, target_tabs: set[str] | None = None) -> dict[str, int]:
+    client = _get_client()
+    if client is None:
+        raise RuntimeError("Google Sheets client unavailable.")
+
+    with _lock:
+        sh = _open_spreadsheet_by_key(client, spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
+        resolved_tabs = []
+        if target_tabs:
+            for tab_name in target_tabs:
+                canonical = _canonical_tab_name(tab_name)
+                if canonical not in resolved_tabs:
+                    resolved_tabs.append(canonical)
+        else:
+            for tab_name in _TABS:
+                if _header_index(tab_name, _VISIBLE_DRIVE_LINK_HEADER) is None:
+                    continue
+                if _tab_spec(tab_name).hidden_tab:
+                    continue
+                resolved_tabs.append(tab_name)
+
+        repaired_by_tab: dict[str, int] = {}
+        for tab_name in resolved_tabs:
+            if _header_index(tab_name, _VISIBLE_DRIVE_LINK_HEADER) is None:
+                repaired_by_tab[tab_name] = 0
+                continue
+
+            ws = _ensure_tab_exists(sh, tab_name, lightweight=True)
+            drive_col = _drive_column_letter(tab_name)
+            values = _get_range_values(ws, f"{drive_col}3:{drive_col}", value_render_option="FORMULA")
+            repaired = 0
+            for row_number, row in enumerate(values, start=3):
+                url = _extract_drive_link_from_cell_value(row[0] if row else '')
+                if not url:
+                    continue
+                desired_formula = _drive_cell(url, spreadsheet=ws.spreadsheet)
+                _clear_drive_link_cell_number_format(ws, tab_name, row_number)
+                _retry_on_rate_limit(
+                    lambda desired_formula=desired_formula, row_number=row_number: ws.update(
+                        [[desired_formula]],
+                        f"{drive_col}{row_number}",
+                        value_input_option="USER_ENTERED",
+                    )
+                )
+                repaired += 1
+
+            repaired_by_tab[tab_name] = repaired
+            if repaired:
+                logger.info("Force-rewrote %d Drive link cell(s) on '%s'.", repaired, tab_name)
+
+        return repaired_by_tab
+
+
 def audit_current_month_spreadsheet(
     *,
     spreadsheet_id: Optional[str] = None,
