@@ -1148,6 +1148,35 @@ def _col_letter(idx: int) -> str:
     return result
 
 
+def _drive_column_index(tab_name: str) -> int | None:
+    return _header_index(tab_name, _VISIBLE_DRIVE_LINK_HEADER) or _header_index(tab_name, _HIDDEN_DRIVE_LINK_HEADER)
+
+
+def _clear_drive_link_cell_number_format(ws, tab_name: str, row_number: int) -> None:
+    col_index = _drive_column_index(tab_name)
+    if col_index is None:
+        return
+
+    try:
+        ws.spreadsheet.batch_update({
+            "requests": [{
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": row_number - 1,
+                        "endRowIndex": row_number,
+                        "startColumnIndex": col_index,
+                        "endColumnIndex": col_index + 1,
+                    },
+                    "cell": {"userEnteredFormat": {}},
+                    "fields": "userEnteredFormat.numberFormat",
+                }
+            }]
+        })
+    except Exception as exc:
+        logger.debug("Could not clear Drive link number format on %s row %s: %s", tab_name, row_number, exc)
+
+
 def _spreadsheet_locale(*, spreadsheet=None, spreadsheet_id: str | None = None) -> str:
     resolved_id = str(spreadsheet_id or getattr(spreadsheet, "id", "") or "").strip()
     if resolved_id and resolved_id in _SPREADSHEET_LOCALE_CACHE:
@@ -1755,6 +1784,7 @@ def _repair_drive_link_formulas(ws, tab_name: str) -> None:
         if not needs_rewrite:
             continue
 
+        _clear_drive_link_cell_number_format(ws, tab_name, row_number)
         _retry_on_rate_limit(
             lambda desired_formula=desired_formula, row_number=row_number: ws.update(
                 [[desired_formula]],
