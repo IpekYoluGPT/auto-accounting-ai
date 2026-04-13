@@ -4339,7 +4339,8 @@ def ensure_current_month_spreadsheet_ready() -> str | None:
         try:
             sh = _get_or_create_spreadsheet(client)
             if _was_recently_prepared(sh):
-                logger.info("Spreadsheet %s was prepared recently; skipping immediate repair.", sh.id)
+                logger.info("Spreadsheet %s was prepared recently; running lightweight repair.", sh.id)
+                _audit_spreadsheet_layout(sh, repair=True, refresh_formatting=False)
             else:
                 _repair_monthly_spreadsheet_layout(sh)
             logger.info("Google Sheets monthly spreadsheet is ready for %s.", _month_key())

@@ -411,7 +411,7 @@ def test_app_startup_prepares_current_month_sheet_and_scheduler():
     stop_mock.assert_called_once_with()
 
 
-def test_ensure_current_month_spreadsheet_ready_skips_immediate_repair_for_recent_bootstrap():
+def test_ensure_current_month_spreadsheet_ready_runs_lightweight_repair_for_recent_bootstrap():
     fake_client = MagicMock()
     fake_sheet = MagicMock()
     fake_sheet.id = "sheet-123"
@@ -427,11 +427,14 @@ def test_ensure_current_month_spreadsheet_ready_skips_immediate_repair_for_recen
         return_value=fake_sheet,
     ), patch(
         "app.services.providers.google_sheets._repair_monthly_spreadsheet_layout",
-    ) as repair_mock:
+    ) as repair_mock, patch(
+        "app.services.providers.google_sheets._audit_spreadsheet_layout",
+    ) as audit_mock:
         result = google_sheets.ensure_current_month_spreadsheet_ready()
 
     assert result == "sheet-123"
     repair_mock.assert_not_called()
+    audit_mock.assert_called_once_with(fake_sheet, repair=True, refresh_formatting=False)
 
 
 def test_archive_drifted_tab_hides_archived_copy(monkeypatch):
