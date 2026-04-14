@@ -930,6 +930,75 @@ def test_process_pending_sheet_appends_repairs_target_tabs_before_append(tmp_pat
     ]
 
 
+def test_build_row_for_fatura_uses_line_count_for_multi_item_invoice():
+    record = google_sheets.BillRecord(
+        company_name="ŞEMSETTİN YILMAZ",
+        tax_number="4540007255",
+        document_number="1031",
+        document_date="2026-02-28",
+        subtotal=3214.95,
+        vat_rate=20,
+        vat_amount=642.99,
+        total_amount=3857.94,
+        currency="TRY",
+        notes="Satılan malzeme iade alınmaz.",
+        line_items=[
+            {"description": "PVC ATIK SU BORUSU TİP 1 50/500 MM", "quantity": 10, "unit": "ADET", "unit_price": 69.92, "line_amount": 699.20},
+            {"description": "PVC ATIK SU BORUSU TİP 1 50/250 MM", "quantity": 10, "unit": "ADET", "unit_price": 43.09, "line_amount": 430.90},
+            {"description": "PVC ATIK SU DİRSEK 87° 50 MM", "quantity": 20, "unit": "ADET", "unit_price": 27.56, "line_amount": 551.20},
+        ],
+    )
+
+    row = google_sheets._build_row_for_tab(
+        record,
+        'Faturalar',
+        category=google_sheets.DocumentCategory.FATURA,
+        row_id='row-1',
+        row_number=3,
+    )
+
+    assert row[0] == '1031'
+    assert row[7] == '3 kalem'
+    assert row[8] == ''
+    assert row[12] == 'HAYIR'
+    assert row[13] == 0
+    assert 'Kalem: 3' in row[16]
+
+
+
+def test_build_row_for_sevk_formats_quantity_with_unit_and_uses_line_item_summary():
+    record = google_sheets.BillRecord(
+        company_name='SOMAY PETROL SAN. VE TİC. LTD. ŞTİ.',
+        recipient_name='H. Karakaya İnş.',
+        document_number='8979',
+        document_date='2026-03-07',
+        description='Veresiye satış senedi',
+        line_unit='m3',
+        product_quantity=18,
+        shipment_destination='KARAKAYA İNŞ Kuzey Organize',
+        notes='Kuzey Organize',
+        line_items=[
+            {'description': '2m Mastar'},
+            {'description': '25cm Rulo'},
+            {'description': 'Saç 1.5mm'},
+        ],
+    )
+
+    row = google_sheets._build_row_for_tab(
+        record,
+        'Sevk Fişleri',
+        category=google_sheets.DocumentCategory.MALZEME,
+        row_id='row-2',
+        row_number=3,
+    )
+
+    assert row[4] == '2m Mastar, 25cm Rulo, Saç 1.5mm'
+    assert row[5] == '18 m3'
+    assert row[6] == 'KARAKAYA İNŞ Kuzey Organize'
+    assert row[7] == 'Veresiye satış senedi | 3 kalem | Not: Kuzey Organize'
+
+
+
 def test_ensure_tab_total_row_rewrites_in_place_without_inserting_rows():
     fake_ws = MagicMock()
 

@@ -181,7 +181,7 @@ def test_invoice_row_uses_single_line_item_fallbacks_for_visible_columns():
     )
 
     assert row[6] == "ARKİM ARPLAST HAND-EL SIVASI 7111 25 KG"
-    assert row[7] == 5.0
+    assert row[7] == "5 TRB"
     assert row[8] == 150.0
     assert row[9] == 750.0
     assert row[17] == '=HYPERLINK("https://drive.google.com/file/d/example/view";"Görüntüle")'
@@ -232,7 +232,7 @@ def test_invoice_row_uses_line_item_summary_when_description_is_generic():
     )
 
     assert row[6] == "PVC ATIK SU BORUSU TİP1 50/500 MM, PVC ATIK SU BORUSU TİP1 50/250 MM +1 kalem"
-    assert row[7] == ""
+    assert row[7] == "3 kalem"
     assert row[8] == ""
     assert row[9] == 3214.95
 
@@ -293,7 +293,7 @@ def test_sevk_row_uses_dense_visible_columns_and_summary_detail():
         "KUM - ÇAKIL - HAFRİYAT",
         "H. Karakaya İnş.",
         "SİYAH KUM",
-        18.0,
+        "18",
         "KARAKAYA İNŞ Kuzey Organize",
         "Çıkış: ELAZIĞ | Plaka: 23ABC123 | Palet: 3 | Adet/Palet: 6 | Not: Saha teslim",
     ]
