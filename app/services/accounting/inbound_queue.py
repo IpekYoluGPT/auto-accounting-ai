@@ -23,6 +23,7 @@ MSG_TERMINAL_RETRY_FAILURE = "Belge alındı ancak şu anda işlenemedi. Lütfen
 MSG_STORAGE_PRESSURE = "Sistem şu anda yoğun ve depolama sınırında. Lütfen biraz sonra tekrar gönderin."
 
 _RETRY_DELAYS_SECONDS = (30, 60, 120, 300, 600, 900, 1800, 3600)
+_PROCESSING_RECLAIM_TTL = timedelta(minutes=15)
 _JOB_LOCK = threading.Lock()
 _WORKER_LOCK = threading.Lock()
 _WORKER_WAKE_EVENT = threading.Event()
@@ -176,9 +177,21 @@ def _normalize_jobs_unlocked(items: list[dict]) -> list[dict]:
             changed = True
 
         if str(job.get("status") or "") == "processing":
-            job["status"] = "retry_wait"
-            job["next_attempt_at"] = time.time()
-            changed = True
+            processing_started_raw = str(job.get("processing_started_at") or "").strip()
+            processing_started = None
+            if processing_started_raw:
+                try:
+                    processing_started = datetime.fromisoformat(processing_started_raw)
+                except ValueError:
+                    processing_started = None
+                else:
+                    if processing_started.tzinfo is None:
+                        processing_started = processing_started.replace(tzinfo=timezone.utc)
+
+            if processing_started is None or (current - processing_started) > _PROCESSING_RECLAIM_TTL:
+                job["status"] = "retry_wait"
+                job["next_attempt_at"] = time.time()
+                changed = True
 
         if _job_age_exceeded(job, now=current) or _job_attempts_exceeded(job):
             _delete_payload(job.get("payload_path"))

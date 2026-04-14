@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from app.services.accounting import canonical_store
 from app.services.accounting.pipeline_context import pipeline_context_scope, sandbox_context
 from app.services.providers import google_sheets
 from app.services.providers.google_sheets import _retry_on_rate_limit
@@ -465,6 +466,7 @@ def test_append_record_reuses_pending_payload_for_split_documents(tmp_path, monk
     monkeypatch.setattr(google_sheets.settings, "google_sheets_spreadsheet_id", "sheet-split-1")
     monkeypatch.setattr(google_sheets, "_get_client", lambda: object())
     monkeypatch.setattr(google_sheets, "start_pending_sheet_append_worker", lambda: None)
+    monkeypatch.setattr(google_sheets, "start_pending_drive_upload_worker", lambda: None)
 
     first = google_sheets.BillRecord(
         company_name="Yapı Kredi",
@@ -500,23 +502,23 @@ def test_append_record_reuses_pending_payload_for_split_documents(tmp_path, monk
         pending_document_mime_type="image/jpeg",
     )
 
-    items = google_sheets._load_pending_sheet_appends()
-    payload_paths = {item["document_payload_path"] for item in items if item["document_payload_path"]}
-    assert len(payload_paths) == 1
-    assert Path(next(iter(payload_paths))).exists()
+    assert canonical_store.pending_projection_count() == 2
+    queued_uploads = google_sheets._load_pending_drive_uploads()
+    assert len(queued_uploads) == 1
+    assert queued_uploads[0]["source_message_id"] == "wamid-split"
+    assert queued_uploads[0]["source_doc_ids"] == ["wamid-split__doc1", "wamid-split__doc2"]
+    assert Path(queued_uploads[0]["payload_path"]).exists()
 
 
-def test_append_record_queues_pending_sheet_appends_and_starts_worker(tmp_path, monkeypatch):
+def test_append_record_queues_projection_and_pending_drive_upload(tmp_path, monkeypatch):
     monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
     monkeypatch.setattr(google_sheets.settings, "google_sheets_spreadsheet_id", "sheet-queue-1")
     monkeypatch.setattr(google_sheets, "_get_client", lambda: object())
 
-    worker_started = {"count": 0}
+    worker_started = {"sheet": 0, "drive": 0}
 
-    def _start_worker():
-        worker_started["count"] += 1
-
-    monkeypatch.setattr(google_sheets, "start_pending_sheet_append_worker", _start_worker)
+    monkeypatch.setattr(google_sheets, "start_pending_sheet_append_worker", lambda: worker_started.__setitem__("sheet", worker_started["sheet"] + 1))
+    monkeypatch.setattr(google_sheets, "start_pending_drive_upload_worker", lambda: worker_started.__setitem__("drive", worker_started["drive"] + 1))
 
     record = google_sheets.BillRecord(
         company_name="ABC Market",
@@ -527,7 +529,7 @@ def test_append_record_queues_pending_sheet_appends_and_starts_worker(tmp_path, 
         confidence=0.91,
     )
 
-    google_sheets.append_record(
+    queued = google_sheets.append_record(
         record,
         google_sheets.DocumentCategory.FATURA,
         is_return=True,
@@ -543,20 +545,19 @@ def test_append_record_queues_pending_sheet_appends_and_starts_worker(tmp_path, 
         },
     )
 
-    items = google_sheets._load_pending_sheet_appends()
-    assert len(items) == 3
-    assert sum(1 for item in items if item["is_visible_tab"]) == 2
-    assert {item["feedback_message_id"] for item in items if item["is_visible_tab"]} == {"wamid-sheet-1"}
-    assert worker_started["count"] == 1
-    assert [item["tab_name"] for item in items] == ["__Raw Belgeler", "Faturalar", "Masraf Kayıtları"]
-    assert [item["category"] for item in items] == ["fatura", "fatura", "fatura"]
-    assert all(item["spreadsheet_id"] == "sheet-queue-1" for item in items)
-    payload_paths = {item["document_payload_path"] for item in items}
-    assert len(payload_paths) == 1
-    assert all(Path(item["document_payload_path"]).exists() for item in items)
+    assert queued == [{"source_doc_id": "wamid-sheet-1", "category": "fatura"}]
+    assert canonical_store.pending_projection_count() == 1
+    documents = canonical_store.list_documents()
+    assert len(documents) == 1
+    assert documents[0].feedback_message_id == "wamid-sheet-1"
+    queued_uploads = google_sheets._load_pending_drive_uploads()
+    assert len(queued_uploads) == 1
+    assert queued_uploads[0]["source_doc_ids"] == ["wamid-sheet-1"]
+    assert Path(queued_uploads[0]["payload_path"]).exists()
+    assert worker_started == {"sheet": 1, "drive": 1}
 
 
-def test_process_pending_sheet_appends_sends_success_after_last_visible_tab(tmp_path, monkeypatch):
+def test_process_pending_sheet_appends_sends_success_after_visible_projection_flush(tmp_path, monkeypatch):
     monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
     monkeypatch.setattr(google_sheets.settings, "google_sheets_spreadsheet_id", "sheet-feedback-1")
 
@@ -583,33 +584,22 @@ def test_process_pending_sheet_appends_sends_success_after_last_visible_tab(tmp_
         },
     )
 
-    fake_ws = MagicMock()
-    fake_ws.get.return_value = []
-    fake_ws.col_values.return_value = ["#", "TOPLAM"]
     fake_sheet = MagicMock()
-    fake_sheet.worksheet.return_value = fake_ws
     fake_client = MagicMock()
     fake_client.open_by_key.return_value = fake_sheet
 
     monkeypatch.setattr(google_sheets, "_get_client", lambda: fake_client)
-    monkeypatch.setattr(google_sheets, "_audit_spreadsheet_layout", lambda sh, repair=False, target_tabs=None: [])
-    monkeypatch.setattr(google_sheets, "_upsert_party_cards", lambda sh, cards: None)
+    monkeypatch.setattr(google_sheets, "_write_visible_projection_rows", lambda sh, rows_by_tab: 4)
 
     with patch("app.services.providers.whatsapp.send_reaction_message") as reaction_mock:
-        assert google_sheets.process_pending_sheet_appends(max_items=1) == 1
-        reaction_mock.assert_not_called()
-
         assert google_sheets.process_pending_sheet_appends(max_items=1) == 1
         assert reaction_mock.call_args.args == ("120363410789660631@g.us", "wamid-sheet-feedback-1", "✅")
         assert reaction_mock.call_args.kwargs["recipient_type"] == "group"
 
-        assert google_sheets.process_pending_sheet_appends(max_items=1) == 1
-        assert reaction_mock.call_count == 1
-
-    assert google_sheets._load_pending_sheet_appends() == []
+    assert canonical_store.pending_projection_count() == 0
 
 
-def test_process_pending_sheet_appends_batches_rows_and_queues_drive_backfill(tmp_path, monkeypatch):
+def test_process_pending_sheet_appends_flushes_projection_and_leaves_drive_backfill_queued(tmp_path, monkeypatch):
     monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
     monkeypatch.setattr(google_sheets.settings, "google_sheets_spreadsheet_id", "sheet-batch-1")
 
@@ -624,6 +614,7 @@ def test_process_pending_sheet_appends_batches_rows_and_queues_drive_backfill(tm
 
     monkeypatch.setattr(google_sheets, "_get_client", lambda: object())
     monkeypatch.setattr(google_sheets, "start_pending_sheet_append_worker", lambda: None)
+    monkeypatch.setattr(google_sheets, "start_pending_drive_upload_worker", lambda: None)
     google_sheets.append_record(
         record,
         google_sheets.DocumentCategory.FATURA,
@@ -633,42 +624,27 @@ def test_process_pending_sheet_appends_batches_rows_and_queues_drive_backfill(tm
         pending_document_mime_type="image/jpeg",
     )
 
-    queued_items = google_sheets._load_pending_sheet_appends()
-    assert len(queued_items) == 3
-    pending_ids_by_tab = {item["tab_name"]: item["id"] for item in queued_items}
+    assert canonical_store.pending_projection_count() == 1
+    queued_uploads = google_sheets._load_pending_drive_uploads()
+    assert len(queued_uploads) == 1
 
-    fake_ws = MagicMock()
-    fake_ws.get.return_value = []
-    fake_ws.col_values.return_value = ["#", "TOPLAM"]
     fake_sheet = MagicMock()
-    fake_sheet.worksheet.return_value = fake_ws
     fake_client = MagicMock()
     fake_client.open_by_key.return_value = fake_sheet
-
-    queue_mock = MagicMock()
     monkeypatch.setattr(google_sheets, "_get_client", lambda: fake_client)
-    monkeypatch.setattr(google_sheets, "queue_pending_document_upload", queue_mock)
-    monkeypatch.setattr(google_sheets, "_audit_spreadsheet_layout", lambda sh, repair=False, target_tabs=None: [])
-    monkeypatch.setattr(google_sheets, "_upsert_party_cards", lambda sh, cards: None)
+    monkeypatch.setattr(google_sheets, "_write_visible_projection_rows", lambda sh, rows_by_tab: 6)
 
     processed = google_sheets.process_pending_sheet_appends()
 
-    assert processed == 3
-    assert fake_client.open_by_key.call_count == 3
-    assert {call.args[0] for call in fake_client.open_by_key.call_args_list} == {"sheet-batch-1"}
-    assert fake_ws.append_rows.call_count == 3
-    assert queue_mock.call_count == 3
-    queued_target_tabs = {call.kwargs["targets"][0]["tab_name"] for call in queue_mock.call_args_list}
-    queued_target_row_ids = {call.kwargs["targets"][0]["row_id"] for call in queue_mock.call_args_list}
-    assert queued_target_tabs == {"__Raw Belgeler", "Faturalar", "Masraf Kayıtları"}
-    assert queued_target_row_ids == set(pending_ids_by_tab.values())
-    assert queue_mock.call_args.kwargs["source_message_id"] == "wamid-sheet-2"
-    assert google_sheets._load_pending_sheet_appends() == []
-    assert list((Path(tmp_path) / "state" / "pending_sheet_appends").glob("*")) == []
+    assert processed == 1
+    assert canonical_store.pending_projection_count() == 0
+    assert len(google_sheets._load_pending_drive_uploads()) == 1
+    assert canonical_store.get_state("sheet_flush_count") == "1"
+    assert canonical_store.get_state("sheet_write_request_count") == "6"
 
 
 
-def test_process_pending_sheet_appends_retries_rate_limited_batch(tmp_path, monkeypatch):
+def test_process_pending_sheet_appends_defers_rate_limited_projection_flush(tmp_path, monkeypatch):
     monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
     monkeypatch.setattr(google_sheets.settings, "google_sheets_spreadsheet_id", "sheet-batch-2")
 
@@ -689,29 +665,17 @@ def test_process_pending_sheet_appends_retries_rate_limited_batch(tmp_path, monk
         drive_link="https://drive.google.com/file/d/test/view",
     )
 
-    fake_ws = MagicMock()
-    fake_ws.get.return_value = []
-    fake_ws.col_values.return_value = ["#", "TOPLAM"]
-    fake_ws.append_rows.side_effect = FakeApiError("429 rate limit")
     fake_sheet = MagicMock()
-    fake_sheet.worksheet.return_value = fake_ws
     fake_client = MagicMock()
     fake_client.open_by_key.return_value = fake_sheet
 
     monkeypatch.setattr(google_sheets, "_get_client", lambda: fake_client)
-    monkeypatch.setattr(google_sheets, "_retry_on_rate_limit", lambda fn, **kwargs: fn())
+    monkeypatch.setattr(google_sheets, "_write_visible_projection_rows", lambda sh, rows_by_tab: (_ for _ in ()).throw(FakeApiError("429 rate limit")))
 
     processed = google_sheets.process_pending_sheet_appends()
 
     assert processed == 0
-    items = google_sheets._load_pending_sheet_appends()
-    assert len(items) == 3
-    items_by_tab = {item["tab_name"]: item for item in items}
-    assert items_by_tab["Faturalar"]["attempts"] == 1
-    assert "429" in items_by_tab["Faturalar"]["last_error"]
-    assert float(items_by_tab["Faturalar"]["next_attempt_at"]) > 0
-    assert items_by_tab["Masraf Kayıtları"]["attempts"] == 0
-    assert items_by_tab["__Raw Belgeler"]["attempts"] == 0
+    assert canonical_store.pending_projection_count() == 1
 
 
 
@@ -741,11 +705,11 @@ def test_select_pending_sheet_batch_defers_banka_odemeleri_until_other_ready_tab
     assert [item["id"] for item in batch] == ["masraf-1"]
 
 
-def test_reset_current_month_spreadsheet_data_clears_only_data_rows(monkeypatch):
+def test_reset_current_month_spreadsheet_data_clears_only_visible_projection_rows(monkeypatch):
     fake_summary_ws = MagicMock()
     fake_summary_ws.row_count = 1000
     fake_tab_wss = {}
-    for tab_name in google_sheets._TABS:
+    for tab_name in google_sheets._ACTIVE_WORKBOOK_TABS:
         if tab_name == "📊 Özet":
             continue
         ws = MagicMock()
@@ -770,7 +734,7 @@ def test_reset_current_month_spreadsheet_data_clears_only_data_rows(monkeypatch)
 
     touched_tabs = google_sheets.reset_current_month_spreadsheet_data(spreadsheet_id="sheet-reset-1")
 
-    assert touched_tabs == len(google_sheets._TABS)
+    assert touched_tabs == len(google_sheets._ACTIVE_WORKBOOK_TABS)
     fake_client.open_by_key.assert_called_once_with("sheet-reset-1")
     fake_summary_ws.batch_clear.assert_not_called()
     for tab_name, ws in fake_tab_wss.items():
@@ -780,12 +744,12 @@ def test_reset_current_month_spreadsheet_data_clears_only_data_rows(monkeypatch)
     assert recent_marks == ["sheet-reset-1"]
 
 
-def test_append_record_skips_pending_payload_when_storage_budget_is_exceeded(tmp_path, monkeypatch):
+def test_append_record_skips_pending_drive_payload_when_storage_budget_is_exceeded(tmp_path, monkeypatch):
     monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
     monkeypatch.setattr(google_sheets.settings, "google_sheets_spreadsheet_id", "sheet-budget-1")
-    monkeypatch.setattr(google_sheets.settings, "pending_payload_storage_limit_mb", 1)
     monkeypatch.setattr(google_sheets, "_get_client", lambda: object())
     monkeypatch.setattr(google_sheets, "start_pending_sheet_append_worker", lambda: None)
+    monkeypatch.setattr(google_sheets.storage_guard, "should_stop_payload_writes", lambda: True)
 
     record = google_sheets.BillRecord(
         company_name="ABC Market",
@@ -805,10 +769,9 @@ def test_append_record_skips_pending_payload_when_storage_budget_is_exceeded(tmp
         pending_document_mime_type="image/jpeg",
     )
 
-    items = google_sheets._load_pending_sheet_appends()
-    assert len(items) == 3
-    assert all(item["document_payload_path"] == "" for item in items)
-    assert list((Path(tmp_path) / "state" / "pending_sheet_appends").glob("*.bin")) == []
+    assert canonical_store.pending_projection_count() == 1
+    assert google_sheets._load_pending_drive_uploads() == []
+    assert list((Path(tmp_path) / "state" / "pending_drive_uploads").glob("*.bin")) == []
 
 
 def test_load_pending_sheet_appends_skips_legacy_iade_items(tmp_path, monkeypatch):
@@ -885,7 +848,7 @@ def test_start_pending_sheet_worker_is_noop_in_sandbox(monkeypatch):
     assert thread_started["count"] == 0
 
 
-def test_process_pending_sheet_appends_repairs_target_tabs_before_append(tmp_path, monkeypatch):
+def test_process_pending_sheet_appends_skips_hot_path_layout_audits(tmp_path, monkeypatch):
     monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
     monkeypatch.setattr(google_sheets.settings, "google_sheets_spreadsheet_id", "sheet-batch-audit")
 
@@ -906,28 +869,19 @@ def test_process_pending_sheet_appends_repairs_target_tabs_before_append(tmp_pat
         drive_link="https://drive.google.com/file/d/test/view",
     )
 
-    fake_ws = MagicMock()
-    fake_ws.get.return_value = []
-    fake_ws.col_values.return_value = ["#", "TOPLAM"]
     fake_sheet = MagicMock()
-    fake_sheet.worksheet.return_value = fake_ws
     fake_client = MagicMock()
     fake_client.open_by_key.return_value = fake_sheet
-
     audit_calls = []
-    monkeypatch.setattr(google_sheets, "_get_client", lambda: fake_client)
-    monkeypatch.setattr(google_sheets, "_audit_spreadsheet_layout", lambda sh, repair=False, target_tabs=None: audit_calls.append((sh, repair, target_tabs)) or [])
 
-    monkeypatch.setattr(google_sheets, "_upsert_party_cards", lambda sh, cards: None)
+    monkeypatch.setattr(google_sheets, "_get_client", lambda: fake_client)
+    monkeypatch.setattr(google_sheets, "_audit_spreadsheet_layout", lambda *args, **kwargs: audit_calls.append((args, kwargs)) or [])
+    monkeypatch.setattr(google_sheets, "_write_visible_projection_rows", lambda sh, rows_by_tab: 4)
 
     processed = google_sheets.process_pending_sheet_appends()
 
-    assert processed == 3
-    assert audit_calls == [
-        (fake_sheet, True, {"Faturalar", "📊 Özet"}),
-        (fake_sheet, True, {"Masraf Kayıtları", "📊 Özet"}),
-        (fake_sheet, True, {"__Raw Belgeler", "📊 Özet"}),
-    ]
+    assert processed == 1
+    assert audit_calls == []
 
 
 def test_build_row_for_fatura_uses_line_count_for_multi_item_invoice():

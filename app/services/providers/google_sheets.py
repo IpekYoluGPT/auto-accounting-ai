@@ -823,6 +823,11 @@ def _get_oauth_sheets_service():
         return None
 
 
+def _is_rate_limit_exception(exc: Exception) -> bool:
+    exc_str = str(exc)
+    return "429" in exc_str or "Quota exceeded" in exc_str or "RATE_LIMIT" in exc_str.upper()
+
+
 def _retry_on_rate_limit(fn, *, max_retries: int = 5, base_delay: float = 5.0):
     """Execute *fn()* with exponential backoff on Google API 429 rate-limit errors.
 
@@ -833,8 +838,7 @@ def _retry_on_rate_limit(fn, *, max_retries: int = 5, base_delay: float = 5.0):
         try:
             return fn()
         except Exception as exc:
-            exc_str = str(exc)
-            is_rate_limit = "429" in exc_str or "Quota exceeded" in exc_str or "RATE_LIMIT" in exc_str.upper()
+            is_rate_limit = _is_rate_limit_exception(exc)
             if not is_rate_limit or attempt >= max_retries:
                 raise
             delay = base_delay * (2 ** attempt)
@@ -2306,7 +2310,7 @@ def _audit_data_tab(sh, tab_name: str, findings: list[dict[str, object]], *, rep
                     _setup_worksheet(ws, tab_name, lightweight=True)
             elif _worksheet_has_visible_data(ws, tab_name):
                 finding["archived_to"] = _archive_drifted_tab(sh, ws, tab_name)
-                ws = _ensure_tab_exists(sh, tab_name, lightweight=True)
+                ws = _ensure_tab_exists_for_projection(sh, tab_name)
             else:
                 _setup_worksheet(ws, tab_name, lightweight=True)
             finding["repaired"] = True
@@ -2543,7 +2547,7 @@ def force_rewrite_drive_links(*, spreadsheet_id: Optional[str] = None, target_ta
                 repaired_by_tab[tab_name] = 0
                 continue
 
-            ws = _ensure_tab_exists(sh, tab_name, lightweight=True)
+            ws = _ensure_tab_exists_for_projection(sh, tab_name)
             row_formulas: list[tuple[int, str]] = []
             for row_number, row_map in _iter_visible_row_maps(ws, tab_name, value_render_option='FORMULA'):
                 url = _extract_drive_link_from_cell_value(row_map.get(_VISIBLE_DRIVE_LINK_HEADER))
@@ -5327,3 +5331,952 @@ def ensure_summary_tab_exists(spreadsheet_id: Optional[str] = None) -> None:
         logger.info("📊 Özet tab ensured.")
     except Exception as exc:
         logger.warning("Could not ensure Özet tab: %s", exc)
+
+
+from app.services.accounting import canonical_store as _canonical_store
+
+_ACTIVE_WORKBOOK_TABS = ["📊 Özet", *_VISIBLE_TABS]
+_AUTHORITATIVE_FIELDS: dict[str, tuple[str, ...]] = {
+    "Masraf Kayıtları": ("Kategori", "Alıcı / Tedarikçi", "Açıklama", "Belge No / Referans"),
+    "Banka Ödemeleri": ("Alıcı / Tedarikçi", "Açıklama", "Referans No", "Gönderen"),
+    "Faturalar": ("Fatura Tipi", "Alıcı", "Açıklama / Hizmet"),
+    "Sevk Fişleri": ("Satıcı", "Alıcı", "Ürün Cinsi", "Ürün Miktarı", "Sevk Yeri", "Açıklama"),
+}
+_PROJECTION_WORKER_POLL_SECONDS = 30.0
+_OVERRIDE_SYNC_INTERVAL_SECONDS = 300.0
+
+
+def _projection_target_tabs() -> list[str]:
+    return list(_VISIBLE_TABS)
+
+
+def _authoritative_values_from_row(tab_name: str, row: list[object]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for header in _AUTHORITATIVE_FIELDS.get(tab_name, ()):
+        index = _header_index(tab_name, header)
+        if index is None:
+            continue
+        values[header] = _text_value(row[index] if index < len(row) else "")
+    return values
+
+
+def _authoritative_values_from_row_map(tab_name: str, row_map: dict[str, object]) -> dict[str, str]:
+    return {header: _text_value(row_map.get(header, "")) for header in _AUTHORITATIVE_FIELDS.get(tab_name, ())}
+
+
+def _authoritative_hash(values: dict[str, str]) -> str:
+    return hashlib.sha256(
+        json.dumps(values, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _apply_authoritative_overrides(
+    tab_name: str,
+    row: list[object],
+    overrides_by_doc_id: dict[str, dict[str, object]],
+    source_doc_id: str,
+) -> list[object]:
+    overrides = overrides_by_doc_id.get(source_doc_id)
+    if not isinstance(overrides, dict):
+        return row
+
+    updated = list(row)
+    for header in _AUTHORITATIVE_FIELDS.get(tab_name, ()):
+        index = _header_index(tab_name, header)
+        if index is None or header not in overrides:
+            continue
+        updated[index] = overrides.get(header, "")
+    return updated
+
+
+def _override_value(overrides: dict[str, object], header: str, fallback: object) -> object:
+    if header in overrides:
+        return overrides.get(header)
+    return fallback
+
+
+def _payment_record_with_overrides(record: BillRecord, overrides: dict[str, object]) -> BillRecord:
+    if not overrides:
+        return record
+
+    updates: dict[str, object] = {}
+    if "Alıcı / Tedarikçi" in overrides:
+        updates["recipient_name"] = _text_value(overrides.get("Alıcı / Tedarikçi"))
+    if "Açıklama" in overrides:
+        updates["description"] = _text_value(overrides.get("Açıklama"))
+    if "Referans No" in overrides:
+        updates["document_number"] = _text_value(overrides.get("Referans No"))
+    if "Gönderen" in overrides:
+        updates["sender_name"] = _text_value(overrides.get("Gönderen"))
+    if not updates:
+        return record
+    return record.model_copy(update=updates)
+
+
+def _build_projection_debt_state(documents: list[_canonical_store.StoredDocument]) -> list[dict[str, object]]:
+    overrides_by_doc_id = _canonical_store.override_map_for_tab("Masraf Kayıtları")
+    debt_state: list[dict[str, object]] = []
+
+    for sort_index, document in enumerate(documents):
+        if document.category not in {DocumentCategory.FATURA, DocumentCategory.HARCAMA_FISI, DocumentCategory.ELDEN_ODEME}:
+            continue
+
+        record = document.record
+        amount = _signed_amount(record, document.category, document.return_source_category)
+        if amount is None:
+            continue
+
+        overrides = overrides_by_doc_id.get(document.source_doc_id, {})
+        display_name = _text_value(_override_value(overrides, "Alıcı / Tedarikçi", _counterparty_name(record, document.category)))
+        description = _text_value(_override_value(overrides, "Açıklama", record.description or record.notes))
+        reference = _text_value(_override_value(overrides, "Belge No / Referans", _document_reference(record)))
+        category_label = _text_value(
+            _override_value(
+                overrides,
+                "Kategori",
+                record.expense_category or record.invoice_type or _return_source_label(document.return_source_category or document.category),
+            )
+        )
+
+        settled_amount = (
+            float(amount)
+            if _is_directly_settled(record, document.category)
+            and not _is_return_record(record, document.category, document.return_source_category)
+            else 0.0
+        )
+        remaining_amount = round(float(amount) - settled_amount, 2)
+        alias_candidates = tuple(
+            filter(
+                None,
+                [
+                    display_name,
+                    record.company_name,
+                    record.recipient_name,
+                    record.buyer_name,
+                    record.sender_name,
+                    record.source_sender_name,
+                ],
+            )
+        )
+        party_key = ledger.derive_party_key(
+            {
+                "tax_number": record.tax_number,
+                "company_name": display_name,
+                "recipient_name": display_name,
+                "aliases": alias_candidates,
+            },
+            role="debt",
+        )
+
+        debt_state.append(
+            {
+                "row_id": document.source_doc_id,
+                "source_doc_id": document.source_doc_id,
+                "party_key": party_key,
+                "display_name": display_name,
+                "description": description,
+                "reference": reference,
+                "category_label": category_label,
+                "tax_number": ledger.normalize_tax_number(record.tax_number),
+                "date": str(record.document_date or "").strip(),
+                "original_amount": round(float(amount), 2),
+                "remaining_amount": remaining_amount,
+                "settled_amount": round(settled_amount, 2),
+                "drive_link": document.drive_link or "",
+                "record_kind": document.category.value,
+                "aliases": alias_candidates,
+                "sort_index": sort_index,
+            }
+        )
+
+    return debt_state
+
+
+def _build_invoice_projection_rows(documents: list[_canonical_store.StoredDocument]) -> tuple[list[list[object]], dict[str, str]]:
+    overrides_by_doc_id = _canonical_store.override_map_for_tab("Faturalar")
+    rows: list[list[object]] = []
+    hashes: dict[str, str] = {}
+
+    for document in documents:
+        if document.category not in {DocumentCategory.FATURA, DocumentCategory.BELIRSIZ}:
+            continue
+        row = _build_row_for_tab(
+            document.record,
+            "Faturalar",
+            category=document.category,
+            row_id=document.source_doc_id,
+            row_number=3 + len(rows),
+            drive_link=document.drive_link,
+            return_source_category=document.return_source_category,
+            source_doc_id=document.source_doc_id,
+        )
+        row = _apply_authoritative_overrides("Faturalar", row, overrides_by_doc_id, document.source_doc_id)
+        rows.append(row)
+        hashes[document.source_doc_id] = _authoritative_hash(_authoritative_values_from_row("Faturalar", row))
+
+    return rows, hashes
+
+
+def _build_shipment_projection_rows(documents: list[_canonical_store.StoredDocument]) -> tuple[list[list[object]], dict[str, str]]:
+    overrides_by_doc_id = _canonical_store.override_map_for_tab("Sevk Fişleri")
+    rows: list[list[object]] = []
+    hashes: dict[str, str] = {}
+
+    for document in documents:
+        if document.category != DocumentCategory.MALZEME:
+            continue
+        row = _build_row_for_tab(
+            document.record,
+            "Sevk Fişleri",
+            category=document.category,
+            row_id=document.source_doc_id,
+            row_number=3 + len(rows),
+            drive_link=document.drive_link,
+            return_source_category=document.return_source_category,
+            source_doc_id=document.source_doc_id,
+        )
+        row = _apply_authoritative_overrides("Sevk Fişleri", row, overrides_by_doc_id, document.source_doc_id)
+        rows.append(row)
+        hashes[document.source_doc_id] = _authoritative_hash(_authoritative_values_from_row("Sevk Fişleri", row))
+
+    return rows, hashes
+
+
+def _build_payment_projection_rows_from_documents(
+    documents: list[_canonical_store.StoredDocument],
+    debt_state: list[dict[str, object]],
+) -> tuple[list[list[object]], dict[str, str]]:
+    overrides_by_doc_id = _canonical_store.override_map_for_tab("Banka Ödemeleri")
+    rows: list[list[object]] = []
+    hashes: dict[str, str] = {}
+
+    for document in documents:
+        if document.category not in {DocumentCategory.ODEME_DEKONTU, DocumentCategory.CEK}:
+            continue
+        overrides = overrides_by_doc_id.get(document.source_doc_id, {})
+        record = _payment_record_with_overrides(document.record, overrides)
+        visible_rows, _, _ = _build_payment_projection_rows(
+            record=record,
+            category=document.category,
+            item_id=document.source_doc_id,
+            debt_state=debt_state,
+            drive_link=document.drive_link,
+        )
+        if not visible_rows:
+            continue
+        visible_rows = [
+            _apply_authoritative_overrides("Banka Ödemeleri", row, overrides_by_doc_id, document.source_doc_id)
+            for row in visible_rows
+        ]
+        rows.extend(visible_rows)
+        hashes[document.source_doc_id] = _authoritative_hash(
+            _authoritative_values_from_row("Banka Ödemeleri", visible_rows[0])
+        )
+
+    return rows, hashes
+
+
+def _build_expense_projection_rows(
+    debt_state: list[dict[str, object]],
+) -> tuple[list[list[object]], dict[str, str]]:
+    overrides_by_doc_id = _canonical_store.override_map_for_tab("Masraf Kayıtları")
+    rows: list[list[object]] = []
+    hashes: dict[str, str] = {}
+
+    ordered_state = sorted(
+        debt_state,
+        key=lambda item: (
+            str(item.get("date") or ""),
+            int(item.get("sort_index") or 0),
+            str(item.get("source_doc_id") or ""),
+        ),
+    )
+
+    for debt in ordered_state:
+        source_doc_id = str(debt.get("source_doc_id") or "").strip()
+        original_amount = round(float(debt.get("original_amount") or 0.0), 2)
+        remaining_amount = round(float(debt.get("remaining_amount") or 0.0), 2)
+        paid_amount = round(max(original_amount - remaining_amount, 0.0), 2) if original_amount > 0 else 0.0
+        row = [
+            _safe(debt.get("date")),
+            _safe(debt.get("category_label")),
+            _safe(debt.get("display_name")),
+            _safe(debt.get("description")),
+            _safe(debt.get("reference")),
+            _safe(original_amount),
+            _safe(paid_amount),
+            _safe(remaining_amount),
+            _drive_cell(str(debt.get("drive_link") or "")),
+            _safe(debt.get("row_id")),
+            _safe(debt.get("party_key")),
+            _safe(source_doc_id),
+            _safe(debt.get("tax_number")),
+            _safe(debt.get("record_kind")),
+            _safe(paid_amount),
+        ]
+        row = _apply_authoritative_overrides("Masraf Kayıtları", row, overrides_by_doc_id, source_doc_id)
+        rows.append(row)
+        hashes[source_doc_id] = _authoritative_hash(_authoritative_values_from_row("Masraf Kayıtları", row))
+
+    return rows, hashes
+
+
+def _build_visible_projection_snapshot() -> tuple[dict[str, list[list[object]]], dict[str, dict[str, str]]]:
+    documents = _canonical_store.list_documents()
+    debt_state = _build_projection_debt_state(documents)
+    payment_rows, payment_hashes = _build_payment_projection_rows_from_documents(documents, debt_state)
+    expense_rows, expense_hashes = _build_expense_projection_rows(debt_state)
+    invoice_rows, invoice_hashes = _build_invoice_projection_rows(documents)
+    shipment_rows, shipment_hashes = _build_shipment_projection_rows(documents)
+
+    rows_by_tab = {
+        "Masraf Kayıtları": expense_rows,
+        "Banka Ödemeleri": payment_rows,
+        "Faturalar": invoice_rows,
+        "Sevk Fişleri": shipment_rows,
+    }
+    hashes_by_tab = {
+        "Masraf Kayıtları": expense_hashes,
+        "Banka Ödemeleri": payment_hashes,
+        "Faturalar": invoice_hashes,
+        "Sevk Fişleri": shipment_hashes,
+    }
+    return rows_by_tab, hashes_by_tab
+
+
+def _clear_projection_tab_rows(ws, tab_name: str, row_count: int) -> None:
+    _ensure_worksheet_dimensions(ws, tab_name)
+    last_col = _internal_row_id_column_letter(tab_name)
+    clear_end_row = max(int(getattr(ws, "row_count", 1000) or 1000), row_count + 10, 1000)
+    _retry_on_rate_limit(lambda: ws.batch_clear([f"A3:{last_col}{clear_end_row}"]))
+
+
+def _ensure_tab_exists_for_projection(sh, tab_name: str):
+    try:
+        return _ensure_tab_exists(sh, tab_name, lightweight=True)
+    except TypeError:
+        return _ensure_tab_exists(sh, tab_name)
+
+
+def _write_visible_projection_rows(sh, rows_by_tab: dict[str, list[list[object]]]) -> int:
+    request_count = 0
+    for tab_name in _projection_target_tabs():
+        ws = _ensure_tab_exists_for_projection(sh, tab_name)
+        if _trimmed_row(_row_values(ws, 1)) != _headers(tab_name):
+            _setup_worksheet(ws, tab_name, lightweight=True)
+        else:
+            _ensure_tab_total_row(ws, tab_name)
+            _apply_lightweight_layout(ws, tab_name)
+
+        rows = rows_by_tab.get(tab_name, [])
+        _clear_projection_tab_rows(ws, tab_name, len(rows))
+        request_count += 1
+        if rows:
+            _retry_on_rate_limit(lambda ws=ws, rows=rows: ws.update(rows, "A3", value_input_option="USER_ENTERED"))
+            request_count += 1
+    return request_count
+
+
+def _should_sync_visible_overrides() -> bool:
+    last_sync_raw = _canonical_store.last_override_sync_at()
+    if not last_sync_raw:
+        return True
+    try:
+        last_sync = datetime.fromisoformat(last_sync_raw)
+    except ValueError:
+        return True
+    if last_sync.tzinfo is None:
+        last_sync = last_sync.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - last_sync).total_seconds() >= _OVERRIDE_SYNC_INTERVAL_SECONDS
+
+
+def _sync_visible_overrides_from_sheet(sh=None) -> dict[str, int]:
+    client = _get_client()
+    if client is None:
+        return {"synced_rows": 0, "changed_docs": 0}
+
+    if sh is None:
+        with _lock:
+            sh = _get_or_create_spreadsheet(client)
+
+    changed_doc_ids: set[str] = set()
+    synced_rows = 0
+    for tab_name in _projection_target_tabs():
+        ws = _ensure_tab_exists(sh, tab_name, lightweight=True)
+        last_hashes = _canonical_store.last_sheet_hash_map(tab_name)
+        seen_doc_ids: set[str] = set()
+        for _, row_map in _iter_visible_row_maps(ws, tab_name, value_render_option="UNFORMATTED_VALUE"):
+            source_doc_id = _coalesce_text(row_map.get(_HIDDEN_SOURCE_DOC_ID_HEADER))
+            if not source_doc_id or source_doc_id in seen_doc_ids:
+                continue
+            seen_doc_ids.add(source_doc_id)
+            values = _authoritative_values_from_row_map(tab_name, row_map)
+            row_hash = _authoritative_hash(values)
+            previous_hash = last_hashes.get(source_doc_id, "")
+            _canonical_store.upsert_override(
+                tab_name=tab_name,
+                source_doc_id=source_doc_id,
+                overrides=values,
+                last_sheet_hash=row_hash,
+            )
+            synced_rows += 1
+            if previous_hash and previous_hash != row_hash:
+                changed_doc_ids.add(source_doc_id)
+
+    _canonical_store.touch_override_sync()
+    if changed_doc_ids:
+        _canonical_store.mark_projection_dirty(changed_doc_ids, reason="sheet_override_sync")
+    return {"synced_rows": synced_rows, "changed_docs": len(changed_doc_ids)}
+
+
+def _ensure_projection_workbook_layout(sh) -> None:
+    summary_ws = _ensure_tab_exists(sh, "📊 Özet", lightweight=True)
+    if not _summary_tab_is_valid(summary_ws):
+        _setup_summary_tab(summary_ws, _month_label(), lightweight=True)
+
+    for tab_name in _projection_target_tabs():
+        ws = _ensure_tab_exists(sh, tab_name, lightweight=True)
+        if _trimmed_row(_row_values(ws, 1)) != _headers(tab_name):
+            _setup_worksheet(ws, tab_name, lightweight=True)
+        else:
+            _ensure_tab_total_row(ws, tab_name)
+            _apply_lightweight_layout(ws, tab_name)
+            _ensure_worksheet_dimensions(ws, tab_name)
+
+    for ws in _list_worksheets(sh):
+        title = getattr(ws, "title", "")
+        if title in _HIDDEN_TABS or _is_ignored_orphan_title(title):
+            _set_worksheet_hidden(ws, hidden=True)
+
+    _mark_recently_prepared(sh)
+
+
+def _dispatch_projection_success_feedback(processed_doc_ids: list[str]) -> None:
+    feedback_targets = _canonical_store.feedback_targets_for_docs(processed_doc_ids)
+    deduped: dict[tuple[str, str, str], dict[str, str]] = {}
+    for item in feedback_targets:
+        key = (
+            str(item.get("platform") or ""),
+            str(item.get("chat_id") or ""),
+            str(item.get("message_id") or ""),
+        )
+        if all(key):
+            deduped.setdefault(key, item)
+
+    for item in deduped.values():
+        if _canonical_store.feedback_pending_for_message(
+            message_id=str(item.get("message_id") or ""),
+            chat_id=str(item.get("chat_id") or "") or None,
+            platform=str(item.get("platform") or "") or None,
+        ):
+            continue
+        _send_visible_sheet_success_feedback(
+            {
+                "feedback_platform": str(item.get("platform") or ""),
+                "feedback_chat_id": str(item.get("chat_id") or ""),
+                "feedback_recipient_type": str(item.get("recipient_type") or ""),
+                "feedback_message_id": str(item.get("message_id") or ""),
+                "is_visible_tab": True,
+            }
+        )
+
+
+def _migrate_legacy_pending_sheet_appends_to_canonical_store() -> int:
+    with _pending_sheet_appends_lock:
+        items = _load_pending_sheet_appends()
+        if not items:
+            return 0
+
+    migrated_doc_ids: set[str] = set()
+    queued_payloads: set[str] = set()
+    payloads_to_cleanup: set[str] = set()
+
+    for item in items:
+        try:
+            record = BillRecord.model_validate(item.get("record") or {})
+        except Exception:
+            continue
+        source_doc_id = str(record.source_message_id or item.get("id") or "").strip()
+        if not source_doc_id:
+            continue
+
+        category_raw = str(item.get("category") or DocumentCategory.BELIRSIZ.value).strip()
+        category = DocumentCategory(category_raw)
+        return_source_raw = str(item.get("return_source_category") or "").strip()
+        return_source_category = DocumentCategory(return_source_raw) if return_source_raw else None
+        feedback_target = None
+        if bool(item.get("is_visible_tab")):
+            feedback_target = {
+                "platform": str(item.get("feedback_platform") or ""),
+                "chat_id": str(item.get("feedback_chat_id") or ""),
+                "recipient_type": str(item.get("feedback_recipient_type") or ""),
+                "message_id": str(item.get("feedback_message_id") or ""),
+            }
+        _canonical_store.upsert_document(
+            source_doc_id=source_doc_id,
+            record=record,
+            category=category,
+            return_source_category=return_source_category,
+            drive_link=str(item.get("drive_link") or "") or None,
+            feedback_target=feedback_target,
+            projection_reason="legacy_pending_sheet_migration",
+        )
+        migrated_doc_ids.add(source_doc_id)
+
+        payload_path_raw = str(item.get("document_payload_path") or "")
+        if payload_path_raw and not str(item.get("drive_link") or "").strip() and payload_path_raw not in queued_payloads:
+            payload_path = Path(payload_path_raw)
+            if payload_path.exists():
+                queue_pending_document_upload(
+                    file_bytes=payload_path.read_bytes(),
+                    filename=str(item.get("document_filename") or payload_path.name),
+                    mime_type=str(item.get("document_mime_type") or "application/octet-stream"),
+                    targets=[],
+                    source_doc_ids=[source_doc_id],
+                    source_message_id=str(item.get("source_message_id") or record.source_message_id or "") or None,
+                )
+                queued_payloads.add(payload_path_raw)
+        elif payload_path_raw:
+            payloads_to_cleanup.add(payload_path_raw)
+
+    with _pending_sheet_appends_lock:
+        _save_pending_sheet_appends([])
+
+    for payload_path_raw in payloads_to_cleanup:
+        _cleanup_pending_sheet_payload_if_unused(payload_path_raw)
+
+    return len(migrated_doc_ids)
+
+
+def _load_pending_drive_uploads() -> list[dict]:
+    path = _pending_drive_uploads_state_path()
+    if not path.exists():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(raw, list):
+        return []
+
+    normalized_items: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        targets = []
+        for target in item.get("targets", []):
+            if not isinstance(target, dict):
+                continue
+            tab_name = str(target.get("tab_name") or "")
+            if tab_name in _LEGACY_IADE_TITLES or _is_ignored_orphan_title(tab_name):
+                continue
+            normalized_target = _normalize_drive_link_target(target)
+            if _is_ignored_orphan_title(str(normalized_target.get("tab_name") or "")):
+                continue
+            targets.append(normalized_target)
+        source_doc_ids = [
+            str(source_doc_id or "").strip()
+            for source_doc_id in item.get("source_doc_ids", [])
+            if str(source_doc_id or "").strip()
+        ]
+        if not targets and not source_doc_ids:
+            continue
+        normalized_item = dict(item)
+        normalized_item["targets"] = targets
+        normalized_item["source_doc_ids"] = source_doc_ids
+        normalized_items.append(normalized_item)
+    return normalized_items
+
+
+def queue_pending_document_upload(
+    *,
+    file_bytes: bytes,
+    filename: str,
+    mime_type: str,
+    targets: list[dict[str, str | int]],
+    source_doc_ids: list[str] | None = None,
+    source_message_id: str | None = None,
+) -> None:
+    normalized_targets = [_normalize_drive_link_target(target) for target in (targets or [])]
+    normalized_doc_ids = [str(source_doc_id or "").strip() for source_doc_id in (source_doc_ids or []) if str(source_doc_id or "").strip()]
+    if not normalized_targets and not normalized_doc_ids:
+        return
+
+    normalized_source_message_id = _root_source_message_id(source_message_id)
+    storage_guard.prune_stale_transient_storage()
+    if storage_guard.should_stop_payload_writes():
+        logger.warning(
+            "Skipping pending Drive upload queue for message id=%s because disk pressure forbids transient writes.",
+            normalized_source_message_id or "?",
+        )
+        return
+
+    with _pending_drive_uploads_lock:
+        items = _load_pending_drive_uploads()
+        if source_message_id:
+            for existing in items:
+                if (
+                    str(existing.get("source_message_id") or "") == normalized_source_message_id
+                    and str(existing.get("filename") or "") == filename
+                    and str(existing.get("mime_type") or "") == mime_type
+                ):
+                    known_targets = {
+                        _drive_link_target_key(target)
+                        for target in existing.get("targets", [])
+                    }
+                    for target in normalized_targets:
+                        target_key = _drive_link_target_key(target)
+                        if target_key not in known_targets:
+                            existing.setdefault("targets", []).append(target)
+                            known_targets.add(target_key)
+                    known_doc_ids = set(str(source_doc_id or "").strip() for source_doc_id in existing.get("source_doc_ids", []))
+                    for source_doc_id in normalized_doc_ids:
+                        if source_doc_id not in known_doc_ids:
+                            existing.setdefault("source_doc_ids", []).append(source_doc_id)
+                            known_doc_ids.add(source_doc_id)
+                    _save_pending_drive_uploads(items)
+                    start_pending_drive_upload_worker()
+                    return
+
+    pending_id = uuid4().hex
+    payload_path = _pending_drive_uploads_dir() / f"{pending_id}.bin"
+    payload_path.write_bytes(file_bytes)
+    item = {
+        "id": pending_id,
+        "filename": filename,
+        "mime_type": mime_type,
+        "payload_path": str(payload_path),
+        "targets": normalized_targets,
+        "source_doc_ids": normalized_doc_ids,
+        "source_message_id": normalized_source_message_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "attempts": 0,
+    }
+
+    with _pending_drive_uploads_lock:
+        items = _load_pending_drive_uploads()
+        items.append(item)
+        _save_pending_drive_uploads(items)
+
+    start_pending_drive_upload_worker()
+
+
+def process_pending_document_uploads(*, max_items: int | None = None) -> int:
+    processed = 0
+
+    while True:
+        if max_items is not None and processed >= max_items:
+            break
+
+        with _pending_drive_uploads_lock:
+            items = _load_pending_drive_uploads()
+            if not items:
+                break
+            item = dict(items[0])
+
+        payload_path = Path(str(item.get("payload_path", "")))
+        if not payload_path.exists():
+            with _pending_drive_uploads_lock:
+                items = [
+                    existing for existing in _load_pending_drive_uploads()
+                    if str(existing.get("id") or "") != str(item.get("id") or "")
+                ]
+                _save_pending_drive_uploads(items)
+            continue
+
+        drive_link = str(item.get("drive_link") or "").strip()
+        try:
+            if not drive_link:
+                drive_link = upload_document(
+                    payload_path.read_bytes(),
+                    filename=str(item.get("filename") or payload_path.name),
+                    mime_type=str(item.get("mime_type") or "application/octet-stream"),
+                )
+            if not drive_link:
+                raise RuntimeError("Drive upload returned no link.")
+
+            for source_doc_id in item.get("source_doc_ids", []):
+                _canonical_store.set_drive_link(str(source_doc_id), drive_link)
+            for target in item.get("targets", []):
+                _write_drive_link_to_target(target, drive_link)
+
+            with _pending_drive_uploads_lock:
+                items = [
+                    existing for existing in _load_pending_drive_uploads()
+                    if str(existing.get("id") or "") != str(item.get("id") or "")
+                ]
+                _save_pending_drive_uploads(items)
+            payload_path.unlink(missing_ok=True)
+            processed += 1
+        except Exception as exc:
+            with _pending_drive_uploads_lock:
+                items = _load_pending_drive_uploads()
+                for existing in items:
+                    if str(existing.get("id") or "") != str(item.get("id") or ""):
+                        continue
+                    existing["attempts"] = int(existing.get("attempts", 0)) + 1
+                    existing["last_error"] = str(exc)
+                    if drive_link:
+                        existing["drive_link"] = drive_link
+                    break
+                _save_pending_drive_uploads(items)
+            logger.warning(
+                "Pending Drive upload retry failed for message id=%s: %s",
+                item.get("source_message_id") or "?",
+                exc,
+            )
+            break
+
+    return processed
+
+
+def queue_status() -> dict[str, int]:
+    status: dict[str, int | str] = {
+        "pending_sheet_appends": _canonical_store.pending_projection_count(),
+        "pending_projection_rows": _canonical_store.pending_projection_count(),
+        "pending_drive_uploads": len(_load_pending_drive_uploads()),
+        "pending_drive_link_backfills": len(_load_pending_drive_uploads()),
+        "sheet_flush_count": int(_canonical_store.get_state("sheet_flush_count") or "0"),
+        "sheet_write_request_count": int(_canonical_store.get_state("sheet_write_request_count") or "0"),
+        "last_visible_flush_at": _canonical_store.last_visible_flush_at() or "",
+        "last_override_sync_at": _canonical_store.last_override_sync_at() or "",
+    }
+    try:
+        from app.services.accounting import inbound_queue
+
+        status.update(inbound_queue.queue_status())
+    except Exception:
+        status.setdefault("pending_inbound_jobs", 0)
+        status.setdefault("retry_waiting_inbound_jobs", 0)
+        status.setdefault("failed_inbound_jobs", 0)
+        status.setdefault("inbound_payload_storage_bytes", 0)
+
+    try:
+        status.update(storage_guard.storage_snapshot().as_dict())
+    except Exception:
+        status.setdefault("disk_total_bytes", 0)
+        status.setdefault("disk_used_bytes", 0)
+        status.setdefault("disk_free_bytes", 0)
+        status.setdefault("total_managed_storage_bytes", 0)
+        status.setdefault("disk_pressure_state", "unknown")
+    return status  # type: ignore[return-value]
+
+
+def has_pending_visible_appends(*, message_id: str, chat_id: str | None = None, platform: str | None = None) -> bool:
+    if _canonical_store.feedback_pending_for_message(message_id=message_id, chat_id=chat_id, platform=platform):
+        return True
+
+    normalized_message_id = (message_id or "").strip()
+    if not normalized_message_id:
+        return False
+
+    with _pending_sheet_appends_lock:
+        items = _load_pending_sheet_appends()
+    for item in items:
+        if not bool(item.get("is_visible_tab")):
+            continue
+        if str(item.get("feedback_message_id") or "").strip() != normalized_message_id:
+            continue
+        if chat_id is not None and str(item.get("feedback_chat_id") or "").strip() != chat_id:
+            continue
+        if platform is not None and str(item.get("feedback_platform") or "").strip() != platform:
+            continue
+        return True
+    return False
+
+
+def process_pending_sheet_appends(*, max_items: int | None = None) -> int:
+    _migrate_legacy_pending_sheet_appends_to_canonical_store()
+    pending_doc_ids = _canonical_store.pending_projection_doc_ids(limit=max_items)
+    if not pending_doc_ids:
+        return 0
+
+    client = _get_client()
+    if client is None:
+        raise RuntimeError("Google Sheets client unavailable for projection flush.")
+
+    rows_by_tab, hashes_by_tab = _build_visible_projection_snapshot()
+    try:
+        with _lock:
+            sh = _get_or_create_spreadsheet(client)
+            request_count = _write_visible_projection_rows(sh, rows_by_tab)
+    except Exception as exc:
+        if _is_rate_limit_exception(exc):
+            logger.warning(
+                "Projection flush deferred by Google Sheets rate limiting for %d document(s): %s",
+                len(pending_doc_ids),
+                exc,
+            )
+            return 0
+
+        with _lock:
+            sh = _get_or_create_spreadsheet(client)
+            _ensure_projection_workbook_layout(sh)
+            request_count = _write_visible_projection_rows(sh, rows_by_tab)
+
+    for tab_name, hashes in hashes_by_tab.items():
+        _canonical_store.update_last_sheet_hashes(tab_name, hashes)
+    _canonical_store.record_projection_flush(request_count=request_count, processed_doc_ids=pending_doc_ids)
+    _dispatch_projection_success_feedback(pending_doc_ids)
+    logger.info(
+        "Projection flush completed for %d document(s) with %d Sheets write request(s).",
+        len(pending_doc_ids),
+        request_count,
+    )
+    return len(pending_doc_ids)
+
+
+def _projection_worker_loop() -> None:
+    while True:
+        try:
+            processed = process_pending_sheet_appends()
+            if processed == 0 and _should_sync_visible_overrides():
+                client = _get_client()
+                if client is not None:
+                    with _lock:
+                        sh = _get_or_create_spreadsheet(client)
+                        _ensure_projection_workbook_layout(sh)
+                        _sync_visible_overrides_from_sheet(sh)
+        except Exception as exc:
+            logger.warning("Projection worker iteration failed: %s", exc, exc_info=True)
+
+        if _pending_sheet_worker_thread is None:
+            break
+        time.sleep(_PROJECTION_WORKER_POLL_SECONDS)
+
+
+def start_pending_sheet_append_worker() -> None:
+    if not current_pipeline_context().is_production:
+        return
+
+    global _pending_sheet_worker_thread
+    with _pending_sheet_worker_lock:
+        if _pending_sheet_worker_thread is not None and _pending_sheet_worker_thread.is_alive():
+            return
+        _pending_sheet_worker_thread = threading.Thread(
+            target=_projection_worker_loop,
+            name="google-sheets-projection-worker",
+            daemon=True,
+        )
+        _pending_sheet_worker_thread.start()
+
+
+def reset_current_month_spreadsheet_data(*, spreadsheet_id: Optional[str] = None) -> int:
+    client = _get_client()
+    if client is None:
+        raise RuntimeError("Google Sheets client unavailable.")
+
+    with _lock:
+        sh = _open_spreadsheet_by_key(client, spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
+        touched_tabs = 0
+        for tab_name in _ACTIVE_WORKBOOK_TABS:
+            ws = _ensure_tab_exists_for_projection(sh, tab_name)
+            touched_tabs += 1
+            if tab_name == "📊 Özet":
+                _setup_summary_tab(ws, _month_label(), lightweight=True)
+                continue
+            _clear_projection_tab_rows(ws, tab_name, 0)
+            _ensure_tab_total_row(ws, tab_name)
+        _mark_recently_prepared(sh)
+        return touched_tabs
+
+
+def append_record(
+    record: BillRecord,
+    category: DocumentCategory,
+    is_return: bool = False,
+    drive_link: Optional[str] = None,
+    *,
+    pending_document_bytes: bytes | None = None,
+    pending_document_filename: str | None = None,
+    pending_document_mime_type: str | None = None,
+    feedback_target: dict[str, str] | None = None,
+) -> list[dict[str, str | int]]:
+    try:
+        normalized_category = DocumentCategory.FATURA if category == DocumentCategory.IADE else category
+        source_doc_id = str(record.source_message_id or uuid4().hex).strip()
+        _canonical_store.upsert_document(
+            source_doc_id=source_doc_id,
+            record=record,
+            category=normalized_category,
+            return_source_category=category if category == DocumentCategory.IADE else None,
+            drive_link=drive_link,
+            feedback_target=feedback_target,
+            projection_reason="append_record",
+        )
+        if not drive_link and pending_document_bytes:
+            queue_pending_document_upload(
+                file_bytes=pending_document_bytes,
+                filename=pending_document_filename or (record.source_filename or f"{source_doc_id}.bin"),
+                mime_type=pending_document_mime_type or "application/octet-stream",
+                targets=[],
+                source_doc_ids=[source_doc_id],
+                source_message_id=record.source_message_id or source_doc_id,
+            )
+        start_pending_sheet_append_worker()
+        return [{"source_doc_id": source_doc_id, "category": normalized_category.value}]
+    except Exception as exc:
+        logger.error(
+            "Google Sheets canonical append queueing failed for category=%s message_id=%s: %s",
+            category,
+            record.source_message_id,
+            exc,
+            exc_info=True,
+        )
+        return []
+
+
+def ensure_current_month_spreadsheet_ready() -> str | None:
+    client = _get_client()
+    if client is None:
+        logger.debug("Google Sheets projection bootstrap skipped; client unavailable.")
+        return None
+
+    with _lock:
+        try:
+            sh = _get_or_create_spreadsheet(client)
+            if _was_recently_prepared(sh):
+                _audit_spreadsheet_layout(sh, repair=True, refresh_formatting=False)
+            else:
+                _ensure_projection_workbook_layout(sh)
+            logger.info("Google Sheets projection workbook is ready for %s.", _month_key())
+            return sh.id
+        except Exception as exc:
+            logger.warning("Could not prepare current month's spreadsheet: %s", exc)
+            return None
+
+
+def _bootstrap_spreadsheet_tabs(sh) -> None:
+    try:
+        summary_ws = sh.sheet1
+        summary_ws.update_title("📊 Özet")
+        for tab_name in _projection_target_tabs():
+            headers = _headers(tab_name)
+            new_ws = sh.add_worksheet(title=tab_name, rows=1000, cols=len(headers) + 2)
+            _setup_worksheet(new_ws, tab_name, lightweight=True)
+        _setup_summary_tab(summary_ws, _month_label(), lightweight=True)
+        _mark_recently_prepared(sh)
+        logger.info("Bootstrapped projection tabs on new spreadsheet.")
+    except Exception as exc:
+        logger.warning("Could not bootstrap projection tabs: %s", exc)
+
+
+def _safe_dimension_value(value: object, default: int = 0) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return default
+
+
+def _ensure_worksheet_dimensions(ws, tab_name: str) -> None:
+    headers = _headers(tab_name)
+    target_cols = len(headers) + 2
+    target_rows = max(_safe_dimension_value(getattr(ws, "row_count", 0)), 1000)
+    existing_cols = _safe_dimension_value(getattr(ws, "col_count", 0), target_cols)
+    existing_rows = _safe_dimension_value(getattr(ws, "row_count", 0), target_rows)
+
+    try:
+        if existing_cols < target_cols or existing_rows < target_rows:
+            ws.resize(rows=target_rows, cols=target_cols)
+    except Exception as exc:
+        logger.warning("Could not resize worksheet '%s': %s", tab_name, exc)
