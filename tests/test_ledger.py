@@ -13,6 +13,7 @@ from app.services.accounting.ledger import (
     match_payment_party,
     normalize_alias,
     normalize_name,
+    normalize_tax_number,
 )
 
 
@@ -48,6 +49,11 @@ def test_stable_party_key_prefers_tax_number_over_name():
         "tax_number": " 123-456-7890 ",
     }
     assert derive_party_key(record, role="debt") == "tax:1234567890"
+
+
+def test_normalize_tax_number_strips_sheet_float_suffix():
+    assert normalize_tax_number("4540007255.0") == "4540007255"
+    assert normalize_tax_number(4540007255.0) == "4540007255"
 
 
 def test_fifo_allocates_multiple_debts_oldest_first():

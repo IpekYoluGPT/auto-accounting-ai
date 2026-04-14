@@ -209,7 +209,26 @@ def normalize_name(value: str | None) -> str:
 def normalize_tax_number(value: str | None) -> str:
     if value is None:
         return ""
-    return "".join(char for char in str(value) if char.isdigit())
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, int):
+        return str(abs(value))
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(abs(int(value)))
+        return "".join(char for char in format(value, "f") if char.isdigit())
+
+    text = str(value).strip()
+    if not text:
+        return ""
+    try:
+        decimal_value = Decimal(text)
+    except Exception:
+        return "".join(char for char in text if char.isdigit())
+
+    if decimal_value == decimal_value.to_integral_value():
+        return str(abs(int(decimal_value)))
+    return "".join(char for char in text if char.isdigit())
 
 
 def _normalize_date_value(value: Any) -> str:

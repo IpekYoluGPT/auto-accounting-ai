@@ -3635,7 +3635,7 @@ def _load_expense_debt_state(sh) -> list[dict[str, object]]:
             continue
         party_key = str(row.get(_HIDDEN_PARTY_KEY_HEADER) or '').strip()
         display_name = str(row.get('Alıcı / Tedarikçi') or '').strip()
-        tax_number = str(row.get(_HIDDEN_TAX_NUMBER_HEADER) or '').strip()
+        tax_number = ledger.normalize_tax_number(row.get(_HIDDEN_TAX_NUMBER_HEADER))
         aliases = cards.get(party_key, {}).get('aliases', ()) if party_key else ()
         try:
             original_amount = float(row.get('Bakiye (TL)') or 0)
@@ -3659,9 +3659,18 @@ def _load_expense_debt_state(sh) -> list[dict[str, object]]:
     return result
 
 
-def _payment_matching_rows(debt_state: list[dict[str, object]]) -> list[dict[str, object]]:
+def _payment_matching_rows(
+    debt_state: list[dict[str, object]],
+    *,
+    balance_kind: str = 'any',
+) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for debt in debt_state:
+        remaining_amount = float(debt.get('remaining_amount') or 0)
+        if balance_kind == 'payable' and remaining_amount <= 0:
+            continue
+        if balance_kind == 'receivable' and remaining_amount >= 0:
+            continue
         rows.append({
             'row_id': debt['row_id'],
             'party_key': debt['party_key'],
@@ -3669,10 +3678,78 @@ def _payment_matching_rows(debt_state: list[dict[str, object]]) -> list[dict[str
             'recipient_name': debt['display_name'],
             'tax_number': debt['tax_number'],
             'aliases': debt.get('aliases', ()),
-            'amount': debt['remaining_amount'],
+            'amount': abs(remaining_amount) if balance_kind == 'receivable' else remaining_amount,
             'date': debt['date'],
         })
     return rows
+
+
+def _party_balance_rows(
+    balance_state: list[dict[str, object]],
+    *,
+    party_key: str,
+    balance_kind: str,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for balance in balance_state:
+        if balance.get('party_key') != party_key:
+            continue
+        remaining_amount = float(balance.get('remaining_amount') or 0)
+        if balance_kind == 'payable' and remaining_amount > 0:
+            rows.append(balance)
+        if balance_kind == 'receivable' and remaining_amount < 0:
+            rows.append(balance)
+    rows.sort(key=lambda balance: (str(balance.get('date') or ''), int(balance.get('sort_index') or 0)))
+    return rows
+
+
+def _party_display_name_from_state(balance_state: list[dict[str, object]], *, party_key: str) -> str:
+    for balance in balance_state:
+        if balance.get('party_key') != party_key:
+            continue
+        display_name = _text_value(balance.get('display_name'))
+        if display_name:
+            return display_name
+    return ''
+
+
+def _receivable_counterparty_name(record: BillRecord) -> str:
+    return _coalesce_text(
+        record.sender_name,
+        record.source_sender_name,
+        record.company_name,
+        record.recipient_name,
+        record.buyer_name,
+    )
+
+
+def _receivable_match_record(record: BillRecord) -> dict[str, object]:
+    primary_name = _receivable_counterparty_name(record)
+    aliases: list[str] = []
+    for candidate in (
+        primary_name,
+        record.sender_name,
+        record.source_sender_name,
+        record.company_name,
+        record.recipient_name,
+        record.buyer_name,
+        record.notes,
+    ):
+        text = _text_value(candidate)
+        if text and text not in aliases:
+            aliases.append(text)
+    return {
+        'tax_number': ledger.normalize_tax_number(record.tax_number),
+        'recipient_name': primary_name,
+        'company_name': primary_name,
+        'buyer_name': _coalesce_text(record.recipient_name, record.buyer_name),
+        'sender_name': _sender_display_name(record),
+        'aliases': tuple(aliases),
+    }
+
+
+def _signed_payment_value(source_amount: float, value: float) -> float:
+    return -value if source_amount < 0 else value
 
 
 def _allocation_status(remaining_amount: float, allocated_amount: float) -> str:
@@ -3686,6 +3763,7 @@ def _allocation_status(remaining_amount: float, allocated_amount: float) -> str:
 def _build_payment_projection_rows(
     *,
     record: BillRecord,
+    category: DocumentCategory,
     item_id: str,
     debt_state: list[dict[str, object]],
     drive_link: Optional[str],
@@ -3693,40 +3771,91 @@ def _build_payment_projection_rows(
 ) -> tuple[list[list], list[list], list[dict[str, object]]]:
     source_doc_id = item_id
     amount = float(_primary_amount(record) or 0)
+    payment_magnitude = abs(amount)
     payment_date = str(record.document_date or record.cheque_due_date or record.cheque_issue_date or '')
     description = str(record.description or record.notes or _document_reference(record) or '')
-    payment_party_name = _counterparty_name(record, DocumentCategory.ODEME_DEKONTU)
+    payment_party_name = _counterparty_name(record, category)
+    receivable_party_name = _receivable_counterparty_name(record)
     payment_reference = _document_reference(record)
     payment_sender_name = _display_sender_or_company(record)
-    payment_tax_number = str(record.tax_number or '')
-    matching_rows = _payment_matching_rows(debt_state)
-    match = ledger.match_payment_party(record.model_dump(mode='json'), matching_rows)
+    payment_tax_number = ledger.normalize_tax_number(record.tax_number)
+
+    payable_match = ledger.match_payment_party(
+        record.model_dump(mode='json'),
+        _payment_matching_rows(debt_state),
+    )
+    payable_rows = (
+        _party_balance_rows(debt_state, party_key=payable_match.party_key, balance_kind='payable')
+        if payable_match.party_key else []
+    )
+
+    receivable_match = None
+    receivable_rows: list[dict[str, object]] = []
+    if amount > 0 and category in {DocumentCategory.ODEME_DEKONTU, DocumentCategory.CEK}:
+        receivable_match = ledger.match_payment_party(
+            _receivable_match_record(record),
+            _payment_matching_rows(debt_state),
+        )
+        if receivable_match.party_key:
+            receivable_rows = _party_balance_rows(
+                debt_state,
+                party_key=receivable_match.party_key,
+                balance_kind='receivable',
+            )
 
     visible_rows: list[list] = []
     allocation_rows: list[list] = []
     party_cards: list[dict[str, object]] = []
 
-    if match.party_key:
-        matched_display_name = match.display_name or payment_party_name
-        party_cards.append({
-            'party_key': match.party_key,
-            'display_name': matched_display_name,
-            'tax_number': match.tax_number or payment_tax_number,
-            'aliases': tuple(filter(None, [payment_party_name])),
-        })
-    else:
-        matched_display_name = payment_party_name
+    selected_mode = 'unmatched'
+    selected_match = None
+    matched_display_name = payment_party_name
+    matched_alias = payment_party_name
 
-    remaining_payment = amount
+    if category == DocumentCategory.CEK and receivable_rows:
+        selected_mode = 'receivable'
+        selected_match = receivable_match
+        matched_display_name = receivable_match.display_name or receivable_party_name
+        matched_alias = receivable_party_name or matched_display_name
+    elif payable_rows:
+        selected_mode = 'payable'
+        selected_match = payable_match
+        matched_display_name = payable_match.display_name or payment_party_name
+        matched_alias = payment_party_name or matched_display_name
+    elif receivable_rows:
+        selected_mode = 'receivable'
+        selected_match = receivable_match
+        matched_display_name = receivable_match.display_name or receivable_party_name
+        matched_alias = receivable_party_name or matched_display_name
+    elif payable_match.party_key:
+        selected_mode = 'matched_no_open_balance'
+        selected_match = payable_match
+        matched_display_name = payable_match.display_name or payment_party_name
+        matched_alias = payment_party_name or matched_display_name
+    elif receivable_match and receivable_match.party_key:
+        selected_mode = 'matched_no_open_balance'
+        selected_match = receivable_match
+        matched_display_name = receivable_match.display_name or receivable_party_name
+        matched_alias = receivable_party_name or matched_display_name
+
+    if selected_match and selected_match.party_key:
+        state_display_name = _party_display_name_from_state(debt_state, party_key=selected_match.party_key)
+        if state_display_name:
+            matched_display_name = state_display_name
+
+    if selected_match and selected_match.party_key:
+        party_cards.append({
+            'party_key': selected_match.party_key,
+            'display_name': matched_display_name,
+            'tax_number': selected_match.tax_number or payment_tax_number,
+            'aliases': tuple(filter(None, [matched_alias])),
+        })
+
+    remaining_payment = payment_magnitude
     allocation_index = 0
 
-    if match.party_key:
-        party_debts = [
-            debt for debt in debt_state
-            if debt['party_key'] == match.party_key and float(debt['remaining_amount']) > 0
-        ]
-        party_debts.sort(key=lambda debt: (str(debt.get('date') or ''), int(debt.get('sort_index') or 0)))
-
+    if selected_mode == 'payable' and selected_match and selected_match.party_key:
+        party_debts = payable_rows
         for debt in party_debts:
             if remaining_payment <= 0:
                 break
@@ -3747,13 +3876,13 @@ def _build_payment_projection_rows(
                 description=description,
                 reference_number=payment_reference,
                 sender_name=payment_sender_name,
-                payment_amount=applied,
+                payment_amount=_signed_payment_value(amount, applied),
                 payment_date=payment_date,
                 remaining_balance=debt.get('remaining_amount'),
                 status=status,
                 drive_link=drive_link,
                 row_id=visible_row_id,
-                party_key=match.party_key,
+                party_key=selected_match.party_key,
                 source_doc_id=source_doc_id,
                 debt_row_id=str(debt.get('row_id') or ''),
                 tax_number=str(debt.get('tax_number') or payment_tax_number or ''),
@@ -3762,7 +3891,7 @@ def _build_payment_projection_rows(
             ))
             allocation_rows.append(_build_allocation_detail_row(
                 allocation_id=allocation_id,
-                party_key=match.party_key,
+                party_key=selected_match.party_key,
                 debt_row_id=str(debt.get('row_id') or ''),
                 payment_doc_id=source_doc_id,
                 payment_date=payment_date,
@@ -3773,7 +3902,42 @@ def _build_payment_projection_rows(
                 status=status,
             ))
 
-    if not match.party_key:
+    if selected_mode == 'receivable' and selected_match and selected_match.party_key:
+        for debt in receivable_rows:
+            if remaining_payment <= 0:
+                break
+            open_amount = abs(float(debt['remaining_amount']))
+            if open_amount <= 0:
+                continue
+            applied = min(open_amount, remaining_payment)
+            if applied <= 0:
+                continue
+            allocation_index += 1
+            debt['remaining_amount'] = round(float(debt['remaining_amount']) + applied, 2)
+            remaining_payment = round(remaining_payment - applied, 2)
+            remaining_receivable = abs(float(debt['remaining_amount']))
+            visible_row_id = f"{item_id}__row{allocation_index}"
+            status = _allocation_status(remaining_receivable, applied)
+            visible_rows.append(_build_payment_allocation_row(
+                party_name=matched_display_name,
+                description=description,
+                reference_number=payment_reference,
+                sender_name=payment_sender_name,
+                payment_amount=applied,
+                payment_date=payment_date,
+                remaining_balance=remaining_receivable,
+                status=status,
+                drive_link=drive_link,
+                row_id=visible_row_id,
+                party_key=selected_match.party_key,
+                source_doc_id=source_doc_id,
+                debt_row_id='receivable:' + str(debt.get('row_id') or ''),
+                tax_number=str(debt.get('tax_number') or payment_tax_number or ''),
+                allocation_id=f'{item_id}__alloc{allocation_index}',
+                spreadsheet=spreadsheet,
+            ))
+
+    if selected_mode == 'unmatched':
         visible_rows.append(_build_payment_allocation_row(
             party_name=matched_display_name,
             description=description,
@@ -3800,14 +3964,14 @@ def _build_payment_projection_rows(
             sender_name=payment_sender_name,
             payment_amount=amount,
             payment_date=payment_date,
-            remaining_balance=amount,
+            remaining_balance=0,
             status=ledger.STATUS_BORC_YOK,
             drive_link=drive_link,
             row_id=f'{item_id}__row1',
-            party_key=match.party_key,
+            party_key=selected_match.party_key if selected_match else '',
             source_doc_id=source_doc_id,
             debt_row_id='',
-            tax_number=match.tax_number or payment_tax_number,
+            tax_number=(selected_match.tax_number if selected_match else '') or payment_tax_number,
             allocation_id=f'{item_id}__alloc0',
             spreadsheet=spreadsheet,
         ))
@@ -3817,16 +3981,16 @@ def _build_payment_projection_rows(
             description=description,
             reference_number=payment_reference,
             sender_name=payment_sender_name,
-            payment_amount=remaining_payment,
+            payment_amount=_signed_payment_value(amount, remaining_payment),
             payment_date=payment_date,
             remaining_balance=remaining_payment,
             status=ledger.STATUS_FAZLA_ODEME,
             drive_link=drive_link,
             row_id=f'{item_id}__row{allocation_index + 1}',
-            party_key=match.party_key,
+            party_key=selected_match.party_key if selected_match else '',
             source_doc_id=source_doc_id,
             debt_row_id='',
-            tax_number=match.tax_number or payment_tax_number,
+            tax_number=(selected_match.tax_number if selected_match else '') or payment_tax_number,
             allocation_id=f'{item_id}__alloc{allocation_index + 1}',
             spreadsheet=spreadsheet,
         ))
@@ -4581,8 +4745,11 @@ def process_pending_sheet_appends(*, max_items: int | None = None) -> int:
                         for item in new_items:
                             item_id = str(item.get('id') or '')
                             record = BillRecord.model_validate(item.get('record') or {})
+                            category_raw = str(item.get('category') or '').strip()
+                            item_category = DocumentCategory(category_raw) if category_raw else DocumentCategory.ODEME_DEKONTU
                             built_visible_rows, built_allocation_rows, built_cards = _build_payment_projection_rows(
                                 record=record,
+                                category=item_category,
                                 item_id=item_id,
                                 debt_state=debt_state,
                                 drive_link=str(item.get('drive_link') or '') or None,

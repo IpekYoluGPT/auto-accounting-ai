@@ -320,6 +320,112 @@ def test_payment_allocation_row_uses_reference_and_sender_columns():
     assert row[:4] == ["MUZAFFER KARAKAŞ", "GİDEN FAST", "581829", "Yapı Kredi"]
 
 
+def test_build_payment_projection_rows_marks_borc_yok_when_party_matches_but_open_debt_missing():
+    rows, allocations, cards = google_sheets._build_payment_projection_rows(
+        record=BillRecord(
+            document_date="2026-03-31",
+            total_amount=-8008.37,
+            tax_number="4540007255",
+            recipient_name="MUZAFFER KARAKAŞ",
+            sender_name="H.KARAKAYA İNŞ.TİC.SAN.LTD.ŞTİ.",
+            description="GİDEN FAST",
+        ),
+        category=DocumentCategory.ODEME_DEKONTU,
+        item_id="odeme-1",
+        debt_state=[
+            {
+                "row_id": "debt-1",
+                "party_key": "tax:4540007255",
+                "display_name": "ŞEMSETTİN YILMAZ",
+                "tax_number": "4540007255.0",
+                "date": "2026-03-18",
+                "original_amount": -8204.51,
+                "remaining_amount": -8204.51,
+                "aliases": ("H.KARAKAYA İNŞAAT TİCARET SAN.TİC.LTD.ŞTİ.",),
+                "sort_index": 0,
+            },
+        ],
+        drive_link=None,
+    )
+
+    assert allocations == []
+    assert cards[0]["party_key"] == "tax:4540007255"
+    assert rows[0][6] == 0
+    assert rows[0][7] == "Borç Yok"
+    assert rows[0][4] == -8008.37
+    assert rows[0][10] == "tax:4540007255"
+
+
+def test_build_payment_projection_rows_uses_receivable_side_for_cheque_matching():
+    rows, allocations, cards = google_sheets._build_payment_projection_rows(
+        record=BillRecord(
+            cheque_due_date="2026-08-30",
+            total_amount=4000.0,
+            tax_number="4960863229",
+            company_name="KANSA GRUP GIDA TİCARET VE SANAYİ LİMİTED ŞİRKETİ",
+            sender_name="KANSA GRUP GIDA TİCARET VE SANAYİ LİMİTED ŞİRKETİ",
+            recipient_name="H. KARAKAYA İNŞAAT TİC. VE SAN. LTD. ŞTİ.",
+            cheque_serial_number="581829",
+        ),
+        category=DocumentCategory.CEK,
+        item_id="cek-1",
+        debt_state=[
+            {
+                "row_id": "recv-1",
+                "party_key": "tax:4960863229",
+                "display_name": "KANSA GRUP GIDA TİCARET VE SANAYİ LİMİTED ŞİRKETİ",
+                "tax_number": "4960863229.0",
+                "date": "2026-03-01",
+                "original_amount": -8204.51,
+                "remaining_amount": -8204.51,
+                "aliases": ("KANSA GRUP GIDA",),
+                "sort_index": 0,
+            },
+        ],
+        drive_link=None,
+    )
+
+    assert allocations == []
+    assert cards[0]["party_key"] == "tax:4960863229"
+    assert rows[0][0] == "KANSA GRUP GIDA TİCARET VE SANAYİ LİMİTED ŞİRKETİ"
+    assert rows[0][6] == 4204.51
+    assert rows[0][7] == "Kısmi"
+    assert rows[0][10] == "tax:4960863229"
+
+
+def test_build_payment_projection_rows_allocates_negative_outgoing_payment_by_absolute_amount():
+    rows, allocations, cards = google_sheets._build_payment_projection_rows(
+        record=BillRecord(
+            document_date="2026-02-23",
+            total_amount=-40.0,
+            recipient_name="ABC Market",
+            description="HESAPTAN FAST",
+        ),
+        category=DocumentCategory.ODEME_DEKONTU,
+        item_id="odeme-neg-1",
+        debt_state=[
+            {
+                "row_id": "debt-1",
+                "party_key": "name:abc market",
+                "display_name": "ABC Market",
+                "tax_number": "",
+                "date": "2026-02-01",
+                "original_amount": 100.0,
+                "remaining_amount": 100.0,
+                "aliases": (),
+                "sort_index": 0,
+            },
+        ],
+        drive_link=None,
+    )
+
+    assert cards[0]["party_key"] == "name:abc market"
+    assert allocations[0][7] == 40.0
+    assert rows[0][4] == -40.0
+    assert rows[0][6] == 60.0
+    assert rows[0][7] == "Kısmi"
+
+
 
 def test_remap_legacy_fatura_row_replaces_sparse_bank_columns_with_dense_fields():
     legacy_headers = google_sheets._legacy_header_variants("Faturalar")[0]
