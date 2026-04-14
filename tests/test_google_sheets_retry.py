@@ -457,10 +457,18 @@ def test_append_record_queues_pending_sheet_appends_and_starts_worker(tmp_path, 
         pending_document_bytes=b"fake-image",
         pending_document_filename="media-1.jpg",
         pending_document_mime_type="image/jpeg",
+        feedback_target={
+            "platform": "meta_whatsapp",
+            "chat_id": "120363410789660631@g.us",
+            "recipient_type": "group",
+            "message_id": "wamid-sheet-1",
+        },
     )
 
     items = google_sheets._load_pending_sheet_appends()
     assert len(items) == 3
+    assert sum(1 for item in items if item["is_visible_tab"]) == 2
+    assert {item["feedback_message_id"] for item in items if item["is_visible_tab"]} == {"wamid-sheet-1"}
     assert worker_started["count"] == 1
     assert [item["tab_name"] for item in items] == ["__Raw Belgeler", "Faturalar", "Masraf Kayıtları"]
     assert [item["category"] for item in items] == ["fatura", "fatura", "fatura"]
@@ -468,6 +476,59 @@ def test_append_record_queues_pending_sheet_appends_and_starts_worker(tmp_path, 
     payload_paths = {item["document_payload_path"] for item in items}
     assert len(payload_paths) == 1
     assert all(Path(item["document_payload_path"]).exists() for item in items)
+
+
+def test_process_pending_sheet_appends_sends_success_after_last_visible_tab(tmp_path, monkeypatch):
+    monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
+    monkeypatch.setattr(google_sheets.settings, "google_sheets_spreadsheet_id", "sheet-feedback-1")
+
+    record = google_sheets.BillRecord(
+        company_name="ABC Market",
+        total_amount=100.0,
+        currency="TRY",
+        source_message_id="wamid-sheet-feedback-1",
+        document_date="2026-04-11",
+        confidence=0.91,
+    )
+
+    monkeypatch.setattr(google_sheets, "_get_client", lambda: object())
+    monkeypatch.setattr(google_sheets, "start_pending_sheet_append_worker", lambda: None)
+    google_sheets.append_record(
+        record,
+        google_sheets.DocumentCategory.FATURA,
+        drive_link="https://drive.google.com/file/d/test/view",
+        feedback_target={
+            "platform": "meta_whatsapp",
+            "chat_id": "120363410789660631@g.us",
+            "recipient_type": "group",
+            "message_id": "wamid-sheet-feedback-1",
+        },
+    )
+
+    fake_ws = MagicMock()
+    fake_ws.get.return_value = []
+    fake_ws.col_values.return_value = ["#", "TOPLAM"]
+    fake_sheet = MagicMock()
+    fake_sheet.worksheet.return_value = fake_ws
+    fake_client = MagicMock()
+    fake_client.open_by_key.return_value = fake_sheet
+
+    monkeypatch.setattr(google_sheets, "_get_client", lambda: fake_client)
+    monkeypatch.setattr(google_sheets, "_audit_spreadsheet_layout", lambda sh, repair=False, target_tabs=None: [])
+    monkeypatch.setattr(google_sheets, "_upsert_party_cards", lambda sh, cards: None)
+
+    with patch("app.services.providers.whatsapp.send_reaction_message") as reaction_mock:
+        assert google_sheets.process_pending_sheet_appends(max_items=1) == 1
+        reaction_mock.assert_not_called()
+
+        assert google_sheets.process_pending_sheet_appends(max_items=1) == 1
+        reaction_mock.assert_not_called()
+
+        assert google_sheets.process_pending_sheet_appends(max_items=1) == 1
+        assert reaction_mock.call_args.args == ("120363410789660631@g.us", "wamid-sheet-feedback-1", "✅")
+        assert reaction_mock.call_args.kwargs["recipient_type"] == "group"
+
+    assert google_sheets._load_pending_sheet_appends() == []
 
 
 def test_process_pending_sheet_appends_batches_rows_and_queues_drive_backfill(tmp_path, monkeypatch):

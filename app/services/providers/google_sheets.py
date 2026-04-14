@@ -4528,6 +4528,8 @@ def _queue_pending_sheet_append_item(
     document_payload: bytes | None = None,
     document_filename: str | None = None,
     document_mime_type: str | None = None,
+    feedback_target: dict[str, str] | None = None,
+    is_visible_tab: bool = False,
 ) -> dict:
     payload_path = ""
     if document_payload:
@@ -4539,6 +4541,7 @@ def _queue_pending_sheet_append_item(
         )
 
     month_key = _month_key()
+    feedback = feedback_target or {}
     return {
         "id": uuid4().hex,
         "spreadsheet_id": _registered_spreadsheet_id_for_month(month_key) or "",
@@ -4552,6 +4555,11 @@ def _queue_pending_sheet_append_item(
         "document_filename": document_filename or "",
         "document_mime_type": document_mime_type or "",
         "source_message_id": record.source_message_id or "",
+        "is_visible_tab": bool(is_visible_tab),
+        "feedback_platform": str(feedback.get("platform") or ""),
+        "feedback_chat_id": str(feedback.get("chat_id") or ""),
+        "feedback_recipient_type": str(feedback.get("recipient_type") or ""),
+        "feedback_message_id": str(feedback.get("message_id") or ""),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "attempts": 0,
         "next_attempt_at": time.time(),
@@ -4652,6 +4660,96 @@ def _next_pending_sheet_retry_delay() -> float | None:
 
     next_attempt_at = min(float(item.get("next_attempt_at") or 0.0) for item in items)
     return max(next_attempt_at - time.time(), 0.0)
+
+
+def has_pending_visible_appends(*, message_id: str, chat_id: str | None = None, platform: str | None = None) -> bool:
+    normalized_message_id = (message_id or "").strip()
+    if not normalized_message_id:
+        return False
+
+    with _pending_sheet_appends_lock:
+        items = _load_pending_sheet_appends()
+
+    for item in items:
+        if not bool(item.get("is_visible_tab")):
+            continue
+        if str(item.get("feedback_message_id") or "").strip() != normalized_message_id:
+            continue
+        if chat_id is not None and str(item.get("feedback_chat_id") or "").strip() != chat_id:
+            continue
+        if platform is not None and str(item.get("feedback_platform") or "").strip() != platform:
+            continue
+        return True
+    return False
+
+
+def _pending_sheet_feedback_key(item: dict) -> tuple[str, str, str]:
+    return (
+        str(item.get("feedback_platform") or "").strip(),
+        str(item.get("feedback_chat_id") or "").strip(),
+        str(item.get("feedback_message_id") or "").strip(),
+    )
+
+
+def _send_visible_sheet_success_feedback(item: dict) -> None:
+    platform = str(item.get("feedback_platform") or "").strip()
+    chat_id = str(item.get("feedback_chat_id") or "").strip()
+    message_id = str(item.get("feedback_message_id") or "").strip()
+    recipient_type = str(item.get("feedback_recipient_type") or "").strip() or "individual"
+    if not platform or not message_id:
+        return
+
+    try:
+        if platform == "periskope":
+            from app.services.providers import periskope
+
+            periskope.react_to_message(message_id, "✅")
+            return
+
+        from app.services.providers import whatsapp
+
+        whatsapp.send_reaction_message(
+            chat_id,
+            message_id,
+            "✅",
+            recipient_type=recipient_type,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to send visible-sheet success reaction for platform=%s chat_id=%s message_id=%s: %s",
+            platform,
+            chat_id,
+            message_id,
+            exc,
+            exc_info=True,
+        )
+
+
+def _dispatch_visible_sheet_success_feedback(batch: list[dict]) -> None:
+    feedback_items: dict[tuple[str, str, str], dict] = {}
+    for item in batch:
+        if not bool(item.get("is_visible_tab")):
+            continue
+        key = _pending_sheet_feedback_key(item)
+        if not all(key):
+            continue
+        feedback_items.setdefault(key, item)
+
+    if not feedback_items:
+        return
+
+    with _pending_sheet_appends_lock:
+        remaining_items = _load_pending_sheet_appends()
+
+    remaining_keys = {
+        _pending_sheet_feedback_key(item)
+        for item in remaining_items
+        if bool(item.get("is_visible_tab"))
+    }
+    for key, item in feedback_items.items():
+        if key in remaining_keys:
+            continue
+        _send_visible_sheet_success_feedback(item)
 
 
 def _existing_row_numbers_by_pending_id(ws, tab_name: str, pending_ids: set[str]) -> dict[str, int]:
@@ -4906,6 +5004,7 @@ def process_pending_sheet_appends(*, max_items: int | None = None) -> int:
             _remove_pending_sheet_appends({str(item.get('id') or '') for item in batch})
             for payload_path_raw in payloads_to_cleanup:
                 _cleanup_pending_sheet_payload_if_unused(payload_path_raw)
+            _dispatch_visible_sheet_success_feedback(batch)
             processed += len(batch)
             logger.info(
                 "Processed %d queued sheet append(s) into %s/%s.",
@@ -4968,6 +5067,7 @@ def append_record(
     pending_document_bytes: bytes | None = None,
     pending_document_filename: str | None = None,
     pending_document_mime_type: str | None = None,
+    feedback_target: dict[str, str] | None = None,
 ) -> list[dict[str, str | int]]:
     """
     Queue *record* for append into the correct Google Sheets tab for *category*.
@@ -4991,6 +5091,7 @@ def append_record(
         items: list[dict] = []
 
         def _queue(tab_name: str) -> None:
+            is_visible_tab = not tab_name.startswith("__")
             items.append(
                 _queue_pending_sheet_append_item(
                     record=record,
@@ -5001,6 +5102,8 @@ def append_record(
                     document_payload=payload_bytes,
                     document_filename=payload_filename,
                     document_mime_type=payload_mime_type,
+                    feedback_target=feedback_target if is_visible_tab else None,
+                    is_visible_tab=is_visible_tab,
                 )
             )
 
@@ -5030,7 +5133,7 @@ def append_record(
             record.source_message_id,
         )
         start_pending_sheet_append_worker()
-        return []
+        return items
     except Exception as exc:
         logger.error(
             "Google Sheets append queueing failed for category=%s message_id=%s: %s",

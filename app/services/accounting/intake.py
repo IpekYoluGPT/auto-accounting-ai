@@ -101,9 +101,13 @@ MSG_MEDIA_MULTI_DOCUMENT_RETRY = (
     "Aynı fotoğrafta birden fazla belge var ama hepsini güvenle ayıramadım. "
     "Lütfen daha net bir görsel veya belgeleri ayrı ayrı gönderin."
 )
-MSG_SHEET_BACKLOG_NOTICE = "Belgeler alındı, tabloya yazılıyor; birkaç dakika sürebilir."
+MSG_SHEET_BACKLOG_NOTICE = (
+    "Belge işlendi, tabloya yazılıyor. "
+    "✅ geldiğinde sheet'te görünmüş olur; yoğunlukta birkaç dakika sürebilir."
+)
 
 REACTION_PROCESSING = "⌛"
+REACTION_SHEET_PENDING = "📝"
 REACTION_SUCCESS = "✅"
 REACTION_WARNING = "⚠️"
 
@@ -598,6 +602,12 @@ def process_media_payload(
                 pending_document_bytes=None if drive_link else raw_bytes,
                 pending_document_filename=None if drive_link else filename,
                 pending_document_mime_type=None if drive_link else mime_type,
+                feedback_target={
+                    "platform": route.platform,
+                    "chat_id": route.chat_id,
+                    "recipient_type": route.recipient_type,
+                    "message_id": message_id,
+                },
             )
     except Exception as exc:
         logger.warning("Failed to persist media-derived records for message id=%s: %s", message_id, exc)

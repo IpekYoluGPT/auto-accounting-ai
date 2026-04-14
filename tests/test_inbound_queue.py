@@ -57,7 +57,7 @@ def test_enqueue_media_job_rejects_when_storage_is_hard_reject():
     assert result.message == inbound_queue.MSG_STORAGE_PRESSURE
 
 
-def test_process_pending_inbound_jobs_success_cleans_payload_and_reacts():
+def test_process_pending_inbound_jobs_success_cleans_payload_and_waits_for_visible_sheet_feedback():
     with TemporaryDirectory() as tmpdir, _patch_storage(tmpdir), patch(
         "app.services.accounting.inbound_queue.whatsapp.fetch_media",
         return_value=b"fake-image",
@@ -67,6 +67,11 @@ def test_process_pending_inbound_jobs_success_cleans_payload_and_reacts():
     ), patch(
         "app.services.accounting.inbound_queue.intake.maybe_send_sheet_backlog_notice",
     ) as backlog_mock, patch(
+        "app.services.accounting.inbound_queue.google_sheets.has_pending_visible_appends",
+        return_value=True,
+    ) as pending_mock, patch(
+        "app.services.accounting.inbound_queue.record_store.mark_message_handled",
+    ) as handled_mock, patch(
         "app.services.accounting.inbound_queue.whatsapp.send_reaction_message",
     ) as reaction_mock:
         result = inbound_queue.enqueue_media_job(
@@ -86,7 +91,13 @@ def test_process_pending_inbound_jobs_success_cleans_payload_and_reacts():
         assert inbound_queue.queue_status()["pending_inbound_jobs"] == 0
         assert list((Path(tmpdir) / "state" / "pending_inbound_jobs").glob("*.bin")) == []
         backlog_mock.assert_called_once()
-        assert reaction_mock.call_args.args == ("120363410789660631@g.us", "wamid-1", "✅")
+        pending_mock.assert_called_once_with(
+            message_id="wamid-1",
+            chat_id="120363410789660631@g.us",
+            platform="meta_whatsapp",
+        )
+        handled_mock.assert_called_once_with("wamid-1", outcome="exported")
+        assert reaction_mock.call_args.args == ("120363410789660631@g.us", "wamid-1", "📝")
 
 
 def test_process_pending_inbound_jobs_retryable_failure_sends_delay_once():

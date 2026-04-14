@@ -13,7 +13,7 @@ from uuid import uuid4
 from app.config import settings
 from app.services.accounting import intake, record_store, storage_guard
 from app.services.accounting.pipeline_context import PipelineContext, current_pipeline_context, pipeline_context_scope
-from app.services.providers import periskope, whatsapp
+from app.services.providers import google_sheets, periskope, whatsapp
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -551,13 +551,20 @@ def _process_one_job(job: dict) -> None:
         _schedule_retry_or_fail(job, route=route, error=result.user_message or result.outcome, stage=result.stage)
         return
 
+    visible_sheet_pending = False
     if result.exported_count > 0:
         intake.maybe_send_sheet_backlog_notice(route, send_text=_resolve_send_text)
+        visible_sheet_pending = google_sheets.has_pending_visible_appends(
+            message_id=str(job.get("message_id") or ""),
+            chat_id=route.chat_id,
+            platform=route.platform,
+        )
 
     if result.outcome in {"exported", "already_exported"}:
+        record_store.mark_message_handled(str(job.get("message_id") or ""), outcome=result.outcome)
         intake._safe_send_reaction(
             route,
-            intake.REACTION_SUCCESS,
+            intake.REACTION_SHEET_PENDING if visible_sheet_pending else intake.REACTION_SUCCESS,
             reason="queue success reaction",
             send_reaction=_resolve_send_reaction,
         )
