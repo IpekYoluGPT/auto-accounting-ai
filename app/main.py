@@ -12,11 +12,12 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from app.config import settings
+from app.config import DEFAULT_GEMINI_MODEL, settings
 from app.routes.groups import router as groups_router
 from app.routes.periskope import router as periskope_router
 from app.routes.setup import router as setup_router
 from app.services.accounting.exporter import TURKISH_HEADERS, tabular_rows_to_xlsx_bytes
+from app.services.accounting import inbound_queue
 from app.services.providers import google_sheets
 from app.routes.webhooks import router as webhook_router
 from app.utils.logging import get_logger
@@ -29,6 +30,8 @@ def _run_google_sheets_startup_tasks() -> None:
         ("prepare_current_month_sheet", google_sheets.ensure_current_month_spreadsheet_ready),
         ("process_pending_sheet_appends", google_sheets.process_pending_sheet_appends),
         ("process_pending_document_uploads", google_sheets.process_pending_document_uploads),
+        ("bootstrap_inbound_queue", inbound_queue.bootstrap_inbound_queue),
+        ("process_pending_inbound_jobs", inbound_queue.process_pending_inbound_jobs),
     )
     for step_name, step in startup_steps:
         try:
@@ -73,18 +76,26 @@ async def lifespan(app: FastAPI):
         "extractor": settings.gemini_extractor_model,
         "validation": settings.gemini_validation_model,
     }
-    non_pro_models = {name: model for name, model in configured_models.items() if model != "gemini-2.5-pro"}
-    if non_pro_models:
-        logger.warning("Gemini model override detected; expected gemini-2.5-pro but got %s", non_pro_models)
+    non_default_models = {
+        name: model for name, model in configured_models.items() if model != DEFAULT_GEMINI_MODEL
+    }
+    if non_default_models:
+        logger.warning(
+            "Gemini model override detected; expected %s but got %s",
+            DEFAULT_GEMINI_MODEL,
+            non_default_models,
+        )
     if not settings.periskope_signing_key:
         logger.warning("PERISKOPE_SIGNING_KEY is not configured; webhook signature verification will be skipped.")
     google_sheets.start_pending_sheet_append_worker()
     google_sheets.start_pending_drive_upload_worker()
     google_sheets.start_monthly_rollover_scheduler()
+    inbound_queue.start_pending_inbound_job_worker()
     _start_google_sheets_bootstrap()
     try:
         yield
     finally:
+        inbound_queue.stop_pending_inbound_job_worker()
         google_sheets.stop_monthly_rollover_scheduler()
 
 

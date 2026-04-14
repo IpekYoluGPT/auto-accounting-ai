@@ -18,6 +18,8 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.models.schemas import BillRecord, ClassificationResult, DocumentCategory
+from app.services.accounting import inbound_queue
+from app.services.accounting.intake import process_incoming_message
 from app.services.accounting.doc_classifier import DocumentAnalysis
 from app.services.providers import periskope as periskope_service
 
@@ -138,14 +140,57 @@ def _patch_runtime_settings(
     groups_only: bool = True,
     tool_token: str = "tool-secret",
 ):
+    def _enqueue_media_immediately(**kwargs):
+        message_id = kwargs["message_id"]
+        route = kwargs["route"]
+        media_path = kwargs.get("media_path")
+        mime_type = kwargs["mime_type"]
+        filename = kwargs["filename"]
+        source_type = kwargs["source_type"]
+        attachment_url = kwargs.get("attachment_url")
+
+        process_incoming_message(
+            message_id=message_id,
+            msg_type=kwargs["msg_type"],
+            route=route,
+            send_text=_send_periskope_text_message_placeholder,
+            send_reaction=_send_periskope_reaction_placeholder,
+            fetch_media=lambda: periskope_fetch_media_placeholder(media_path, message_id),
+            mime_type=mime_type,
+            filename=filename,
+            source_type=source_type,
+            attachment_url=attachment_url,
+        )
+        return inbound_queue.EnqueueResult(status="duplicate")
+
     with patch("app.routes.periskope.settings.periskope_signing_key", signing_key), patch(
         "app.routes.periskope.settings.periskope_tool_token", tool_token
     ), patch("app.routes.periskope.settings.storage_dir", tmpdir), patch(
         "app.services.accounting.record_store.settings.storage_dir", tmpdir
+    ), patch(
+        "app.services.accounting.inbound_queue.settings.storage_dir", tmpdir
+    ), patch(
+        "app.services.accounting.storage_guard.settings.storage_dir", tmpdir
     ), patch("app.services.accounting.intake.settings.whatsapp_groups_only", groups_only), patch(
         "app.routes.periskope.settings.periskope_allowed_chat_ids",
         "120363410789660631@g.us,120363423064785066@g.us,120363045948478087@g.us",
-    ):
+    ), patch(
+        "app.routes.periskope.inbound_queue.enqueue_media_job"
+    ) as enqueue_mock:
+        from app.routes import periskope as periskope_route
+
+        def periskope_fetch_media_placeholder(media_path: str | None, message_id: str):
+            if not media_path:
+                raise RuntimeError("missing media path")
+            return periskope_route.periskope.fetch_media(media_path, message_id=message_id)
+
+        def _send_periskope_text_message_placeholder(route, text: str):
+            return periskope_route._send_periskope_text_message(route, text)
+
+        def _send_periskope_reaction_placeholder(route, emoji: str):
+            return periskope_route._send_periskope_reaction(route, emoji)
+
+        enqueue_mock.side_effect = _enqueue_media_immediately
         yield
 
 
@@ -256,6 +301,31 @@ def test_periskope_react_to_message_accepts_204_empty_response(monkeypatch):
     result = periskope_service.react_to_message("peri-msg-1", "⌛")
 
     assert result == {"ok": True}
+
+
+def test_periskope_image_webhook_enqueues_media_without_inline_fetch():
+    payload = _periskope_event(_periskope_image_message())
+    signature = _sign_payload(payload, "periskope-secret")
+    client = TestClient(app)
+    with _patch_runtime_settings("/tmp/peri-queue-test"), patch(
+        "app.routes.periskope.inbound_queue.enqueue_media_job",
+        return_value=inbound_queue.EnqueueResult(status="enqueued"),
+    ) as enqueue_mock, patch(
+        "app.routes.periskope.periskope.fetch_media"
+    ) as fetch_mock, patch(
+        "app.routes.periskope.periskope.react_to_message"
+    ) as react_mock:
+        response = client.post(
+            "/integrations/periskope/webhook",
+            json=payload,
+            headers={"x-periskope-signature": signature},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    fetch_mock.assert_not_called()
+    enqueue_mock.assert_called_once()
+    assert react_mock.call_args.args == ("peri-msg-1", "⌛")
 
 
 def test_periskope_webhook_rejects_invalid_signature():

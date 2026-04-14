@@ -29,7 +29,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.config import settings
 from app.models.schemas import BillRecord, DocumentCategory
-from app.services.accounting import ledger
+from app.services.accounting import ledger, storage_guard
 from app.services.accounting.pipeline_context import PipelineContext, current_pipeline_context, namespace_storage_root, pipeline_context_scope
 from app.utils.logging import get_logger
 
@@ -2422,10 +2422,29 @@ def _audit_spreadsheet_layout(sh, *, repair: bool = False, target_tabs: set[str]
     return findings
 
 def queue_status() -> dict[str, int]:
-    return {
+    status: dict[str, int | str] = {
         "pending_sheet_appends": len(_load_pending_sheet_appends()),
         "pending_drive_uploads": len(_load_pending_drive_uploads()),
     }
+    try:
+        from app.services.accounting import inbound_queue
+
+        status.update(inbound_queue.queue_status())
+    except Exception:
+        status.setdefault("pending_inbound_jobs", 0)
+        status.setdefault("retry_waiting_inbound_jobs", 0)
+        status.setdefault("failed_inbound_jobs", 0)
+        status.setdefault("inbound_payload_storage_bytes", 0)
+
+    try:
+        status.update(storage_guard.storage_snapshot().as_dict())
+    except Exception:
+        status.setdefault("disk_total_bytes", 0)
+        status.setdefault("disk_used_bytes", 0)
+        status.setdefault("disk_free_bytes", 0)
+        status.setdefault("total_managed_storage_bytes", 0)
+        status.setdefault("disk_pressure_state", "unknown")
+    return status  # type: ignore[return-value]
 
 
 def _extract_drive_link_from_cell_value(value: object) -> str | None:
@@ -4165,6 +4184,14 @@ def queue_pending_document_upload(
     if not targets:
         return
 
+    storage_guard.prune_stale_transient_storage()
+    if storage_guard.should_stop_payload_writes():
+        logger.warning(
+            "Skipping pending Drive upload queue for message id=%s because disk pressure forbids transient writes.",
+            source_message_id or "?",
+        )
+        return
+
     normalized_targets = [_normalize_drive_link_target(target) for target in targets]
 
     with _pending_drive_uploads_lock:
@@ -4444,6 +4471,14 @@ def _get_or_create_shared_pending_sheet_payload(
     mime_type: str | None,
     payload_bytes: bytes,
 ) -> str:
+    storage_guard.prune_stale_transient_storage()
+    if storage_guard.should_stop_payload_writes():
+        logger.warning(
+            "Skipping pending sheet payload for message id=%s because disk pressure forbids transient writes.",
+            source_message_id or "?",
+        )
+        return ""
+
     payload_path = _shared_pending_sheet_payload_path(
         source_message_id=source_message_id,
         filename=filename,

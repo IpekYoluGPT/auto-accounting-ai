@@ -5,6 +5,7 @@ Shared Gemini client helpers built on the modern google-genai SDK.
 from __future__ import annotations
 
 from functools import lru_cache
+import threading
 from typing import TypeVar
 
 from google import genai
@@ -16,6 +17,10 @@ from app.config import settings
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+_GEMINI_CALL_SEMAPHORE_LOCK = threading.Lock()
+_GEMINI_CALL_SEMAPHORE: threading.BoundedSemaphore | None = None
+_GEMINI_CALL_SEMAPHORE_SIZE: int | None = None
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
@@ -72,11 +77,12 @@ def _call_model(
     if thinking_level and "preview" in model:
         config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
 
-    response = client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=types.GenerateContentConfig(**config_kwargs),
-    )
+    with _gemini_call_semaphore():
+        response = client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=types.GenerateContentConfig(**config_kwargs),
+        )
 
     if response.parsed is None:
         raise RuntimeError("Gemini returned no structured payload.")
@@ -85,6 +91,17 @@ def _call_model(
         return response.parsed
 
     return response_schema.model_validate(response.parsed)
+
+
+def _gemini_call_semaphore() -> threading.BoundedSemaphore:
+    global _GEMINI_CALL_SEMAPHORE, _GEMINI_CALL_SEMAPHORE_SIZE
+
+    target_size = max(int(settings.gemini_max_concurrency), 1)
+    with _GEMINI_CALL_SEMAPHORE_LOCK:
+        if _GEMINI_CALL_SEMAPHORE is None or _GEMINI_CALL_SEMAPHORE_SIZE != target_size:
+            _GEMINI_CALL_SEMAPHORE = threading.BoundedSemaphore(target_size)
+            _GEMINI_CALL_SEMAPHORE_SIZE = target_size
+        return _GEMINI_CALL_SEMAPHORE
 
 
 @retry(

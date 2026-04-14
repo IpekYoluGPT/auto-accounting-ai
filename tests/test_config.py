@@ -9,9 +9,9 @@ def test_gemini_model_defaults(monkeypatch):
     monkeypatch.delenv("STORAGE_DIR", raising=False)
     monkeypatch.delenv("RAILWAY_VOLUME_MOUNT_PATH", raising=False)
     settings = Settings(_env_file=None)
-    assert settings.gemini_classifier_model == "gemini-2.5-pro"
-    assert settings.gemini_extractor_model == "gemini-2.5-pro"
-    assert settings.gemini_validation_model == "gemini-2.5-pro"
+    assert settings.gemini_classifier_model == "gemini-3.1-pro-preview"
+    assert settings.gemini_extractor_model == "gemini-3.1-pro-preview"
+    assert settings.gemini_validation_model == "gemini-3.1-pro-preview"
     assert settings.whatsapp_groups_only is True
     assert settings.periskope_api_base_url == "https://api.periskope.app/v1"
     assert settings.periskope_media_base_url == "https://api.periskope.app"
@@ -22,6 +22,15 @@ def test_gemini_model_defaults(monkeypatch):
     assert settings.ocr_min_quality_score == 0.45
     assert settings.storage_dir == "./storage"
     assert settings.pending_payload_storage_limit_mb == 192
+    assert settings.inbound_retry_max_attempts == 20
+    assert settings.inbound_retry_max_age_hours == 24
+    assert settings.inbound_worker_poll_seconds == 5
+    assert settings.inbound_max_active_jobs == 2
+    assert settings.gemini_max_concurrency == 1
+    assert settings.storage_soft_pressure_bytes == 3221225472
+    assert settings.storage_hard_reject_bytes == 4026531840
+    assert settings.storage_emergency_stop_bytes == 4563402752
+    assert settings.storage_min_free_bytes == 1342177280
 
 
 def test_environment_overrides_are_applied(monkeypatch):

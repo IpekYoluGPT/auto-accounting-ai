@@ -20,7 +20,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
 from app.config import settings
-from app.services.accounting import intake, record_store
+from app.services.accounting import inbound_queue, intake, record_store
 from app.services.accounting.pipeline_context import sandbox_context, pipeline_context_scope
 from app.services.providers import google_sheets
 from app.utils.logging import get_logger
@@ -427,16 +427,19 @@ async def drain_queues(request: Request, payload: DrainQueuesRequest) -> dict[st
 
     try:
         queue_before = google_sheets.queue_status()
+        processed_inbound = 0
         processed_sheet = 0
         processed_drive = 0
         rounds = max(1, min(int(payload.max_rounds or 10), 20))
 
         for _ in range(rounds):
+            inbound_count = inbound_queue.process_pending_inbound_jobs()
             sheet_count = google_sheets.process_pending_sheet_appends()
             drive_count = google_sheets.process_pending_document_uploads()
+            processed_inbound += inbound_count
             processed_sheet += sheet_count
             processed_drive += drive_count
-            if sheet_count == 0 and drive_count == 0:
+            if inbound_count == 0 and sheet_count == 0 and drive_count == 0:
                 break
 
         queue_after = google_sheets.queue_status()
@@ -444,6 +447,7 @@ async def drain_queues(request: Request, payload: DrainQueuesRequest) -> dict[st
             "status": "ok",
             "queue_before": queue_before,
             "drain": {
+                "pending_inbound_jobs_processed": processed_inbound,
                 "pending_sheet_appends_processed": processed_sheet,
                 "pending_drive_uploads_processed": processed_drive,
             },
@@ -452,6 +456,53 @@ async def drain_queues(request: Request, payload: DrainQueuesRequest) -> dict[st
         }
     except Exception as exc:
         logger.error("Queue drain failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/retry-inbound")
+async def retry_inbound(request: Request) -> dict[str, object]:
+    _verify_admin_token(request)
+
+    try:
+        result = inbound_queue.retry_pending_inbound_jobs()
+        return {
+            "status": "ok",
+            **result,
+            "queue": google_sheets.queue_status(),
+        }
+    except Exception as exc:
+        logger.error("Retry inbound failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/reset-inbound-queue")
+async def reset_inbound_queue(request: Request) -> dict[str, object]:
+    _verify_admin_token(request)
+
+    try:
+        result = inbound_queue.reset_inbound_queue()
+        return {
+            "status": "ok",
+            **result,
+            "queue": google_sheets.queue_status(),
+        }
+    except Exception as exc:
+        logger.error("Reset inbound queue failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/storage-status")
+async def storage_status(request: Request) -> dict[str, object]:
+    _verify_admin_token(request)
+
+    try:
+        return {
+            "status": "ok",
+            **inbound_queue.storage_status(),
+            "queue": google_sheets.queue_status(),
+        }
+    except Exception as exc:
+        logger.error("Storage status failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

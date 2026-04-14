@@ -150,6 +150,15 @@ SendReactionFn = Callable[[MessageRoute, str], None]
 FetchMediaFn = Callable[[], bytes]
 
 
+@dataclass(frozen=True)
+class MediaProcessingResult:
+    outcome: str
+    exported_count: int = 0
+    retryable: bool = False
+    user_message: str | None = None
+    stage: str = "processing"
+
+
 # ─── Manager phone helper ─────────────────────────────────────────────────────
 
 
@@ -390,6 +399,64 @@ def _handle_media(
             outcome="media_fetch_failed",
         )
 
+    try:
+        result = process_media_payload(
+            message_id=message_id,
+            route=route,
+            raw_bytes=raw_bytes,
+            mime_type=mime_type,
+            filename=filename,
+            source_type=source_type,
+            attachment_url=attachment_url,
+        )
+    except Exception as exc:
+        logger.error("Unhandled media processing error for message id=%s: %s", message_id, exc, exc_info=True)
+        return _handle_media_failure(
+            route,
+            send_text,
+            send_reaction,
+            message=_message_for_media_exception(exc, MSG_ERROR),
+            reason="media processing crash",
+            outcome="fatal_processing_error",
+        )
+
+    if result.retryable:
+        return _handle_media_failure(
+            route,
+            send_text,
+            send_reaction,
+            message=result.user_message or MSG_MEDIA_TEMPORARY_UPSTREAM_ERROR,
+            reason="media temporary retry required",
+            outcome=result.outcome,
+        )
+
+    if result.exported_count > 0:
+        maybe_send_sheet_backlog_notice(route, send_text=send_text)
+
+    if result.outcome in {"exported", "already_exported"}:
+        _safe_send_reaction(route, REACTION_SUCCESS, reason="success reaction", send_reaction=send_reaction)
+        return result.outcome
+
+    return _handle_media_failure(
+        route,
+        send_text,
+        send_reaction,
+        message=result.user_message or MSG_ERROR,
+        reason=result.outcome,
+        outcome=result.outcome,
+    )
+
+
+def process_media_payload(
+    *,
+    message_id: str,
+    route: MessageRoute,
+    raw_bytes: bytes,
+    mime_type: str,
+    filename: str,
+    source_type: str,
+    attachment_url: str | None = None,
+) -> MediaProcessingResult:
     media_sha256 = hashlib.sha256(raw_bytes).hexdigest()
 
     prepared = media_prep.prepare_media(raw_bytes, mime_type=mime_type)
@@ -406,14 +473,13 @@ def _handle_media(
         analysis = doc_classifier.analyze_document(working_bytes, mime_type=working_mime_type)
     except Exception as exc:
         logger.warning("Failed to analyze media for message id=%s: %s", message_id, exc)
-        return _handle_media_failure(
-            route,
-            send_text,
-            send_reaction,
-            message=_message_for_media_exception(exc, MSG_MEDIA_CLASSIFICATION_ERROR),
-            reason="media analysis failed",
+        return MediaProcessingResult(
             outcome="classification_failed",
+            retryable=is_temporary_media_exception(exc),
+            user_message=_message_for_media_exception(exc, MSG_MEDIA_CLASSIFICATION_ERROR),
+            stage="classification",
         )
+
     logger.info(
         "Document analysis: financial=%s category=%s is_return=%s count=%d quality=%s retry=%s confidence=%.2f reason=%s",
         analysis.is_financial_document,
@@ -427,23 +493,17 @@ def _handle_media(
     )
 
     if not analysis.is_financial_document:
-        return _handle_media_failure(
-            route,
-            send_text,
-            send_reaction,
-            message=MSG_UNRELATED_IMAGE,
-            reason="unrelated image warning",
+        return MediaProcessingResult(
             outcome="warned_non_bill_media",
+            user_message=MSG_UNRELATED_IMAGE,
+            stage="classification",
         )
 
     if analysis.needs_retry and analysis.quality == "unusable":
-        return _handle_media_failure(
-            route,
-            send_text,
-            send_reaction,
-            message=MSG_MEDIA_RETRY_QUALITY,
-            reason="media quality retry required",
+        return MediaProcessingResult(
             outcome="category_failed",
+            user_message=MSG_MEDIA_RETRY_QUALITY,
+            stage="classification",
         )
 
     category = analysis.category
@@ -473,13 +533,11 @@ def _handle_media(
         valid_records = _extract_valid_records(split_retry=False)
     except Exception as exc:
         logger.warning("Failed to extract bills for message id=%s: %s", message_id, exc)
-        return _handle_media_failure(
-            route,
-            send_text,
-            send_reaction,
-            message=_message_for_media_exception(exc, MSG_MEDIA_EXTRACTION_ERROR),
-            reason="bill extraction failed",
+        return MediaProcessingResult(
             outcome="extraction_failed",
+            retryable=is_temporary_media_exception(exc),
+            user_message=_message_for_media_exception(exc, MSG_MEDIA_EXTRACTION_ERROR),
+            stage="extraction",
         )
 
     if expected_document_count and len(valid_records) != expected_document_count:
@@ -493,13 +551,11 @@ def _handle_media(
             retry_records = _extract_valid_records(split_retry=True)
         except Exception as exc:
             logger.warning("Failed strict multi-document extraction for message id=%s: %s", message_id, exc)
-            return _handle_media_failure(
-                route,
-                send_text,
-                send_reaction,
-                message=_message_for_media_exception(exc, MSG_MEDIA_EXTRACTION_ERROR),
-                reason="strict multi-document extraction failed",
+            return MediaProcessingResult(
                 outcome="extraction_failed",
+                retryable=is_temporary_media_exception(exc),
+                user_message=_message_for_media_exception(exc, MSG_MEDIA_EXTRACTION_ERROR),
+                stage="extraction",
             )
 
         if len(retry_records) != expected_document_count:
@@ -509,54 +565,55 @@ def _handle_media(
                 expected_document_count,
                 len(retry_records),
             )
-            return _handle_media_failure(
-                route,
-                send_text,
-                send_reaction,
-                message=MSG_MEDIA_MULTI_DOCUMENT_RETRY,
-                reason="multi-document retry required",
+            return MediaProcessingResult(
                 outcome="multi_document_retry_required",
+                user_message=MSG_MEDIA_MULTI_DOCUMENT_RETRY,
+                stage="extraction",
             )
         valid_records = retry_records
 
     if not valid_records:
         logger.warning("Gemini returned no usable documents for message id=%s", message_id)
-        return _handle_media_failure(
-            route,
-            send_text,
-            send_reaction,
-            message=MSG_MEDIA_RETRY_QUALITY if analysis.needs_retry else MSG_MEDIA_EMPTY_EXTRACTION,
-            reason="empty extraction",
+        return MediaProcessingResult(
             outcome="empty_extraction",
+            user_message=MSG_MEDIA_RETRY_QUALITY if analysis.needs_retry else MSG_MEDIA_EMPTY_EXTRACTION,
+            stage="extraction",
         )
 
-    drive_link = google_sheets.upload_document(raw_bytes, filename=filename, mime_type=mime_type)
+    try:
+        drive_link = google_sheets.upload_document(raw_bytes, filename=filename, mime_type=mime_type)
 
-    persisted_count = 0
-    for record in valid_records:
-        record.source_media_sha256 = media_sha256
-        persisted = record_store.persist_record_once(record)
-        if not persisted:
-            continue
-        persisted_count += 1
-        google_sheets.append_record(
-            record,
-            category,
-            is_return=is_return,
-            drive_link=drive_link,
-            pending_document_bytes=None if drive_link else raw_bytes,
-            pending_document_filename=None if drive_link else filename,
-            pending_document_mime_type=None if drive_link else mime_type,
-        )
+        persisted_count = 0
+        for record in valid_records:
+            record.source_media_sha256 = media_sha256
+            persisted = record_store.persist_record_once(record)
+            if not persisted:
+                continue
+            persisted_count += 1
+            google_sheets.append_record(
+                record,
+                category,
+                is_return=is_return,
+                drive_link=drive_link,
+                pending_document_bytes=None if drive_link else raw_bytes,
+                pending_document_filename=None if drive_link else filename,
+                pending_document_mime_type=None if drive_link else mime_type,
+            )
+    except Exception as exc:
+        logger.warning("Failed to persist media-derived records for message id=%s: %s", message_id, exc)
+        if is_temporary_media_exception(exc):
+            return MediaProcessingResult(
+                outcome="persistence_failed",
+                retryable=True,
+                user_message=MSG_MEDIA_TEMPORARY_UPSTREAM_ERROR,
+                stage="persistence",
+            )
+        raise
 
-    if persisted_count > 0:
-        _maybe_send_sheet_backlog_notice(route, send_text=send_text)
     if persisted_count == 0:
-        _safe_send_reaction(route, REACTION_SUCCESS, reason="already exported reaction", send_reaction=send_reaction)
-        return "already_exported"
+        return MediaProcessingResult(outcome="already_exported", stage="persistence")
 
-    _safe_send_reaction(route, REACTION_SUCCESS, reason="success reaction", send_reaction=send_reaction)
-    return "exported"
+    return MediaProcessingResult(outcome="exported", exported_count=persisted_count, stage="persistence")
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -646,7 +703,7 @@ def _send_throttled_warning(
     return True
 
 
-def _maybe_send_sheet_backlog_notice(route: MessageRoute, *, send_text: SendTextFn) -> None:
+def maybe_send_sheet_backlog_notice(route: MessageRoute, *, send_text: SendTextFn) -> None:
     try:
         backlog = google_sheets.queue_status().get("pending_sheet_appends", 0)
     except Exception as exc:
@@ -684,8 +741,14 @@ def _record_meets_minimum_fields(record: BillRecord, category: DocumentCategory)
 
 
 def _message_for_media_exception(exc: Exception, default_message: str) -> str:
+    if is_temporary_media_exception(exc):
+        return MSG_MEDIA_TEMPORARY_UPSTREAM_ERROR
+    return default_message
+
+
+def is_temporary_media_exception(exc: Exception) -> bool:
     error = str(exc).lower()
-    if any(
+    return any(
         token in error
         for token in (
             "503",
@@ -695,7 +758,9 @@ def _message_for_media_exception(exc: Exception, default_message: str) -> str:
             "overload",
             "timed out",
             "timeout",
+            "connection reset",
+            "temporarily unavailable",
+            "ssl",
+            "quota",
         )
-    ):
-        return MSG_MEDIA_TEMPORARY_UPSTREAM_ERROR
-    return default_message
+    )

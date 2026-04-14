@@ -12,6 +12,10 @@ def _lifespan_patches():
     stack.enter_context(patch("app.main.google_sheets.ensure_current_month_spreadsheet_ready"))
     stack.enter_context(patch("app.main.google_sheets.process_pending_sheet_appends"))
     stack.enter_context(patch("app.main.google_sheets.process_pending_document_uploads"))
+    stack.enter_context(patch("app.main.inbound_queue.bootstrap_inbound_queue"))
+    stack.enter_context(patch("app.main.inbound_queue.process_pending_inbound_jobs"))
+    stack.enter_context(patch("app.main.inbound_queue.start_pending_inbound_job_worker"))
+    stack.enter_context(patch("app.main.inbound_queue.stop_pending_inbound_job_worker"))
     stack.enter_context(patch("app.main.google_sheets.start_pending_sheet_append_worker"))
     stack.enter_context(patch("app.main.google_sheets.start_monthly_rollover_scheduler"))
     stack.enter_context(patch("app.main.google_sheets.stop_monthly_rollover_scheduler"))
@@ -334,6 +338,7 @@ def test_drain_queues_returns_processed_counts_and_remaining_queue():
         "status": "ok",
         "queue_before": {"pending_sheet_appends": 4, "pending_drive_uploads": 2},
         "drain": {
+            "pending_inbound_jobs_processed": 0,
             "pending_sheet_appends_processed": 3,
             "pending_drive_uploads_processed": 2,
         },

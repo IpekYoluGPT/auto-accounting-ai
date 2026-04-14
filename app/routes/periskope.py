@@ -20,8 +20,8 @@ from app.models.schemas import (
     PeriskopeSubmissionStatusRequest,
 )
 from app.services.providers import periskope
-from app.services.accounting import record_store
-from app.services.accounting.intake import MessageRoute, process_incoming_message
+from app.services.accounting import inbound_queue, record_store
+from app.services.accounting.intake import MessageRoute, REACTION_PROCESSING, REACTION_WARNING, process_incoming_message
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -62,7 +62,10 @@ async def receive_periskope_webhook(
         logger.info("Ignoring self-authored/private Periskope message id=%s", message.message_id)
         return {"status": "ignored"}
 
-    background_tasks.add_task(_process_periskope_message, message)
+    if message.message_type in {"image", "document"}:
+        _process_periskope_message(message)
+    else:
+        background_tasks.add_task(_process_periskope_message, message)
     return {"status": "ok"}
 
 
@@ -175,22 +178,21 @@ def _process_periskope_message(message: PeriskopeMessage) -> None:
 
     if message.message_type in {"image", "document"}:
         media = message.media
-        process_incoming_message(
+        result = inbound_queue.enqueue_media_job(
             message_id=message.message_id,
             msg_type=message.message_type,
             route=route,
-            send_text=_send_periskope_text_message,
-            send_reaction=_send_periskope_reaction,
-            fetch_media=(
-                lambda: periskope.fetch_media(media.path, message_id=message.message_id)
-            )
-            if media and media.path
-            else None,
             mime_type=(media.mimetype if media and media.mimetype else _default_mime_type(message.message_type)),
             filename=(media.filename if media and media.filename else f"{message.message_id}.{_default_extension(message.message_type)}"),
             source_type=message.message_type,
+            media_path=(media.path if media and media.path else None),
             attachment_url=(media.path if media and media.path and media.path.startswith("http") else None),
         )
+        if result.status == "enqueued":
+            _safe_periskope_reaction(route, REACTION_PROCESSING)
+        elif result.status == "rejected_due_to_storage":
+            _safe_periskope_reaction(route, REACTION_WARNING)
+            _safe_periskope_text_message(route, result.message or inbound_queue.MSG_STORAGE_PRESSURE)
         return
 
     process_incoming_message(
@@ -235,6 +237,20 @@ def _send_periskope_reaction(route: MessageRoute, emoji: str) -> None:
     if not route.reply_to_message_id:
         return
     periskope.react_to_message(route.reply_to_message_id, emoji)
+
+
+def _safe_periskope_text_message(route: MessageRoute, text: str) -> None:
+    try:
+        _send_periskope_text_message(route, text)
+    except Exception as exc:
+        logger.error("Failed to send queued Periskope text to %s: %s", route.chat_id, exc, exc_info=True)
+
+
+def _safe_periskope_reaction(route: MessageRoute, emoji: str) -> None:
+    try:
+        _send_periskope_reaction(route, emoji)
+    except Exception as exc:
+        logger.error("Failed to send queued Periskope reaction to %s: %s", route.chat_id, exc, exc_info=True)
 
 
 def _is_allowed_periskope_chat(chat_id: str) -> bool:

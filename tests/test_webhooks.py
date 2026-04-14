@@ -14,6 +14,8 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.models.schemas import BillRecord, ClassificationResult, DocumentCategory
+from app.services.accounting import inbound_queue
+from app.services.accounting.intake import process_incoming_message
 from app.services.accounting.doc_classifier import DocumentAnalysis
 
 
@@ -164,9 +166,52 @@ def _analysis(
 
 @contextmanager
 def _patch_runtime_settings(tmpdir: str, *, groups_only: bool = False):
+    def _enqueue_media_immediately(**kwargs):
+        message_id = kwargs["message_id"]
+        route = kwargs["route"]
+        media_id = kwargs.get("media_id")
+        mime_type = kwargs["mime_type"]
+        filename = kwargs["filename"]
+        source_type = kwargs["source_type"]
+        attachment_url = kwargs.get("attachment_url")
+
+        process_incoming_message(
+            message_id=message_id,
+            msg_type=kwargs["msg_type"],
+            route=route,
+            send_text=_send_meta_text_message_placeholder,
+            send_reaction=_send_meta_reaction_placeholder,
+            fetch_media=lambda: whatsapp_fetch_media_placeholder(media_id),
+            mime_type=mime_type,
+            filename=filename,
+            source_type=source_type,
+            attachment_url=attachment_url,
+        )
+        return inbound_queue.EnqueueResult(status="duplicate")
+
     with patch("app.routes.webhooks.settings.storage_dir", tmpdir), patch(
         "app.routes.webhooks.settings.whatsapp_groups_only", groups_only
-    ), patch("app.services.accounting.record_store.settings.storage_dir", tmpdir):
+    ), patch("app.services.accounting.record_store.settings.storage_dir", tmpdir), patch(
+        "app.services.accounting.inbound_queue.settings.storage_dir", tmpdir
+    ), patch(
+        "app.services.accounting.storage_guard.settings.storage_dir", tmpdir
+    ), patch(
+        "app.routes.webhooks.inbound_queue.enqueue_media_job"
+    ) as enqueue_mock:
+        from app.routes import webhooks as webhooks_route
+
+        def whatsapp_fetch_media_placeholder(media_id: str | None):
+            if not media_id:
+                raise RuntimeError("missing media id")
+            return webhooks_route.whatsapp.fetch_media(media_id)
+
+        def _send_meta_text_message_placeholder(route, text: str):
+            return webhooks_route._send_meta_text_message(route, text)
+
+        def _send_meta_reaction_placeholder(route, emoji: str):
+            return webhooks_route._send_meta_reaction(route, emoji)
+
+        enqueue_mock.side_effect = _enqueue_media_immediately
         yield
 
 
@@ -200,6 +245,25 @@ def test_verify_webhook_invalid_token_returns_403():
         )
 
     assert response.status_code == 403
+
+
+def test_image_webhook_enqueues_media_without_inline_fetch():
+    client = TestClient(app)
+    with patch(
+        "app.routes.webhooks.inbound_queue.enqueue_media_job",
+        return_value=inbound_queue.EnqueueResult(status="enqueued"),
+    ) as enqueue_mock, patch(
+        "app.routes.webhooks.whatsapp.fetch_media"
+    ) as fetch_mock, patch(
+        "app.routes.webhooks.whatsapp.send_reaction_message"
+    ) as reaction_mock:
+        response = client.post("/webhook", json=_image_payload())
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    fetch_mock.assert_not_called()
+    enqueue_mock.assert_called_once()
+    assert reaction_mock.call_args.args == ("905551112233", "wamid-1", "⌛")
 
 
 def test_happy_path_image_webhook_writes_csv_and_reacts():

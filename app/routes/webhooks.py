@@ -14,8 +14,9 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, R
 
 from app.config import settings
 from app.models.schemas import WhatsAppWebhookPayload
+from app.services.accounting import inbound_queue
 from app.services.providers import whatsapp
-from app.services.accounting.intake import MessageRoute, process_incoming_message
+from app.services.accounting.intake import MessageRoute, REACTION_PROCESSING, REACTION_WARNING, process_incoming_message
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -59,7 +60,10 @@ async def receive_webhook(
             }
             messages = change.value.messages or []
             for message in messages:
-                background_tasks.add_task(_process_message, message, contact_names.get(message.from_))
+                if message.type in {"image", "document"}:
+                    _process_message(message, contact_names.get(message.from_))
+                else:
+                    background_tasks.add_task(_process_message, message, contact_names.get(message.from_))
 
     return {"status": "ok"}
 
@@ -78,31 +82,37 @@ def _process_message(message, sender_name: str | None = None) -> None:
         return
 
     if message.type == "image" and message.image:
-        process_incoming_message(
+        result = inbound_queue.enqueue_media_job(
             message_id=message.id,
             msg_type="image",
             route=route,
-            send_text=_send_meta_text_message,
-            send_reaction=_send_meta_reaction,
-            fetch_media=lambda: whatsapp.fetch_media(message.image.id),
             mime_type=message.image.mime_type or "image/jpeg",
             filename=f"{message.image.id}.jpg",
             source_type="image",
+            media_id=message.image.id,
         )
+        if result.status == "enqueued":
+            _safe_meta_reaction(route, REACTION_PROCESSING)
+        elif result.status == "rejected_due_to_storage":
+            _safe_meta_reaction(route, REACTION_WARNING)
+            _safe_meta_text_message(route, result.message or inbound_queue.MSG_STORAGE_PRESSURE)
         return
 
     if message.type == "document" and message.document:
-        process_incoming_message(
+        result = inbound_queue.enqueue_media_job(
             message_id=message.id,
             msg_type="document",
             route=route,
-            send_text=_send_meta_text_message,
-            send_reaction=_send_meta_reaction,
-            fetch_media=lambda: whatsapp.fetch_media(message.document.id),
             mime_type=message.document.mime_type or "application/pdf",
             filename=message.document.filename or f"{message.document.id}.pdf",
             source_type="document",
+            media_id=message.document.id,
         )
+        if result.status == "enqueued":
+            _safe_meta_reaction(route, REACTION_PROCESSING)
+        elif result.status == "rejected_due_to_storage":
+            _safe_meta_reaction(route, REACTION_WARNING)
+            _safe_meta_text_message(route, result.message or inbound_queue.MSG_STORAGE_PRESSURE)
         return
 
     process_incoming_message(
@@ -156,3 +166,17 @@ def _send_meta_reaction(route: MessageRoute, emoji: str) -> None:
         emoji,
         recipient_type=route.recipient_type,
     )
+
+
+def _safe_meta_text_message(route: MessageRoute, text: str) -> None:
+    try:
+        _send_meta_text_message(route, text)
+    except Exception as exc:
+        logger.error("Failed to send queued Meta text to %s: %s", route.chat_id, exc, exc_info=True)
+
+
+def _safe_meta_reaction(route: MessageRoute, emoji: str) -> None:
+    try:
+        _send_meta_reaction(route, emoji)
+    except Exception as exc:
+        logger.error("Failed to send queued Meta reaction to %s: %s", route.chat_id, exc, exc_info=True)
