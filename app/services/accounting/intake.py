@@ -102,8 +102,8 @@ MSG_MEDIA_MULTI_DOCUMENT_RETRY = (
     "Lütfen daha net bir görsel veya belgeleri ayrı ayrı gönderin."
 )
 MSG_SHEET_BACKLOG_NOTICE = (
-    "Belge işlendi, tabloya yazılıyor. "
-    "✅ geldiğinde sheet'te görünmüş olur; yoğunlukta birkaç dakika sürebilir."
+    "Belge işlendi. Görünür satırlar önce, detaylar sonra yazılıyor. "
+    "✅ geldiğinde ana tabloda görünmüş olur; yoğunlukta birkaç dakika sürebilir."
 )
 
 REACTION_PROCESSING = "⌛"
@@ -585,23 +585,23 @@ def process_media_payload(
         )
 
     try:
-        drive_link = google_sheets.upload_document(raw_bytes, filename=filename, mime_type=mime_type)
-
-        persisted_count = 0
+        persisted_records: list[BillRecord] = []
         for record in valid_records:
             record.source_media_sha256 = media_sha256
             persisted = record_store.persist_record_once(record)
             if not persisted:
                 continue
-            persisted_count += 1
+            persisted_records.append(record)
+
+        for record in persisted_records:
             google_sheets.append_record(
                 record,
                 category,
                 is_return=is_return,
-                drive_link=drive_link,
-                pending_document_bytes=None if drive_link else raw_bytes,
-                pending_document_filename=None if drive_link else filename,
-                pending_document_mime_type=None if drive_link else mime_type,
+                drive_link=None,
+                pending_document_bytes=raw_bytes,
+                pending_document_filename=filename,
+                pending_document_mime_type=mime_type,
                 feedback_target={
                     "platform": route.platform,
                     "chat_id": route.chat_id,
@@ -620,6 +620,7 @@ def process_media_payload(
             )
         raise
 
+    persisted_count = len(persisted_records)
     if persisted_count == 0:
         return MediaProcessingResult(outcome="already_exported", stage="persistence")
 

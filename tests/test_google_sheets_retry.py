@@ -428,6 +428,84 @@ def test_queue_pending_document_upload_merges_targets_for_same_message(tmp_path,
     ]
 
 
+def test_queue_pending_document_upload_merges_targets_for_split_documents(tmp_path, monkeypatch):
+    monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
+    monkeypatch.setattr(google_sheets, "start_pending_drive_upload_worker", lambda: None)
+
+    google_sheets.queue_pending_document_upload(
+        file_bytes=b"doc-bytes",
+        filename="Checks.jpg",
+        mime_type="image/jpeg",
+        targets=[
+            {"spreadsheet_id": "sheet-1", "tab_name": "📝 Çekler", "row_number": 3, "row_id": "row-check-1"}
+        ],
+        source_message_id="wamid-merge-split__doc1",
+    )
+    google_sheets.queue_pending_document_upload(
+        file_bytes=b"doc-bytes",
+        filename="Checks.jpg",
+        mime_type="image/jpeg",
+        targets=[
+            {"spreadsheet_id": "sheet-1", "tab_name": "📝 Çekler", "row_number": 4, "row_id": "row-check-2"}
+        ],
+        source_message_id="wamid-merge-split__doc2",
+    )
+
+    items = google_sheets._load_pending_drive_uploads()
+    assert len(items) == 1
+    assert items[0]["source_message_id"] == "wamid-merge-split"
+    assert items[0]["targets"] == [
+        {"spreadsheet_id": "sheet-1", "tab_name": "Banka Ödemeleri", "row_number": 3, "row_id": "row-check-1"},
+        {"spreadsheet_id": "sheet-1", "tab_name": "Banka Ödemeleri", "row_number": 4, "row_id": "row-check-2"},
+    ]
+
+
+def test_append_record_reuses_pending_payload_for_split_documents(tmp_path, monkeypatch):
+    monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
+    monkeypatch.setattr(google_sheets.settings, "google_sheets_spreadsheet_id", "sheet-split-1")
+    monkeypatch.setattr(google_sheets, "_get_client", lambda: object())
+    monkeypatch.setattr(google_sheets, "start_pending_sheet_append_worker", lambda: None)
+
+    first = google_sheets.BillRecord(
+        company_name="Yapı Kredi",
+        total_amount=444000.0,
+        currency="TRY",
+        source_message_id="wamid-split__doc1",
+        document_date="2026-04-11",
+        confidence=0.91,
+    )
+    second = google_sheets.BillRecord(
+        company_name="Yapı Kredi",
+        total_amount=444000.0,
+        currency="TRY",
+        source_message_id="wamid-split__doc2",
+        document_date="2026-04-11",
+        confidence=0.91,
+    )
+
+    google_sheets.append_record(
+        first,
+        google_sheets.DocumentCategory.CEK,
+        drive_link=None,
+        pending_document_bytes=b"shared-image",
+        pending_document_filename="checks.jpg",
+        pending_document_mime_type="image/jpeg",
+    )
+    google_sheets.append_record(
+        second,
+        google_sheets.DocumentCategory.CEK,
+        drive_link=None,
+        pending_document_bytes=b"shared-image",
+        pending_document_filename="checks.jpg",
+        pending_document_mime_type="image/jpeg",
+    )
+
+    items = google_sheets._load_pending_sheet_appends()
+    payload_paths = {item["document_payload_path"] for item in items if item["document_payload_path"]}
+    assert len(payload_paths) == 1
+    assert Path(next(iter(payload_paths))).exists()
+
+
 def test_append_record_queues_pending_sheet_appends_and_starts_worker(tmp_path, monkeypatch):
     monkeypatch.setattr(google_sheets.settings, "storage_dir", str(tmp_path))
     monkeypatch.setattr(google_sheets.settings, "google_sheets_spreadsheet_id", "sheet-queue-1")
@@ -522,11 +600,11 @@ def test_process_pending_sheet_appends_sends_success_after_last_visible_tab(tmp_
         reaction_mock.assert_not_called()
 
         assert google_sheets.process_pending_sheet_appends(max_items=1) == 1
-        reaction_mock.assert_not_called()
-
-        assert google_sheets.process_pending_sheet_appends(max_items=1) == 1
         assert reaction_mock.call_args.args == ("120363410789660631@g.us", "wamid-sheet-feedback-1", "✅")
         assert reaction_mock.call_args.kwargs["recipient_type"] == "group"
+
+        assert google_sheets.process_pending_sheet_appends(max_items=1) == 1
+        assert reaction_mock.call_count == 1
 
     assert google_sheets._load_pending_sheet_appends() == []
 
@@ -629,11 +707,11 @@ def test_process_pending_sheet_appends_retries_rate_limited_batch(tmp_path, monk
     items = google_sheets._load_pending_sheet_appends()
     assert len(items) == 3
     items_by_tab = {item["tab_name"]: item for item in items}
-    assert items_by_tab["__Raw Belgeler"]["attempts"] == 1
-    assert "429" in items_by_tab["__Raw Belgeler"]["last_error"]
-    assert float(items_by_tab["__Raw Belgeler"]["next_attempt_at"]) > 0
-    assert items_by_tab["Faturalar"]["attempts"] == 0
+    assert items_by_tab["Faturalar"]["attempts"] == 1
+    assert "429" in items_by_tab["Faturalar"]["last_error"]
+    assert float(items_by_tab["Faturalar"]["next_attempt_at"]) > 0
     assert items_by_tab["Masraf Kayıtları"]["attempts"] == 0
+    assert items_by_tab["__Raw Belgeler"]["attempts"] == 0
 
 
 
@@ -846,9 +924,9 @@ def test_process_pending_sheet_appends_repairs_target_tabs_before_append(tmp_pat
 
     assert processed == 3
     assert audit_calls == [
-        (fake_sheet, True, {"__Raw Belgeler", "📊 Özet"}),
         (fake_sheet, True, {"Faturalar", "📊 Özet"}),
         (fake_sheet, True, {"Masraf Kayıtları", "📊 Özet"}),
+        (fake_sheet, True, {"__Raw Belgeler", "📊 Özet"}),
     ]
 
 

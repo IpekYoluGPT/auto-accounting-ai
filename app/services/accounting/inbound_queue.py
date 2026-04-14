@@ -27,7 +27,7 @@ _JOB_LOCK = threading.Lock()
 _WORKER_LOCK = threading.Lock()
 _WORKER_WAKE_EVENT = threading.Event()
 _WORKER_STOP_EVENT = threading.Event()
-_WORKER_THREAD: threading.Thread | None = None
+_WORKER_THREADS: list[threading.Thread] = []
 
 
 @dataclass(frozen=True)
@@ -644,7 +644,7 @@ def reset_inbound_queue(*, context: PipelineContext | None = None) -> dict[str, 
 def _pending_inbound_worker() -> None:
     while not _WORKER_STOP_EVENT.is_set():
         try:
-            processed = process_pending_inbound_jobs()
+            processed = process_pending_inbound_jobs(max_jobs=1)
         except Exception as exc:
             logger.warning("Pending inbound queue worker error: %s", exc, exc_info=True)
             processed = 0
@@ -666,32 +666,37 @@ def start_pending_inbound_job_worker() -> None:
     if not current_pipeline_context().is_production:
         return
 
-    global _WORKER_THREAD
     with _WORKER_LOCK:
-        if _WORKER_THREAD is not None and _WORKER_THREAD.is_alive():
+        desired_workers = max(int(settings.inbound_max_active_jobs), 1)
+        alive_threads = [thread for thread in _WORKER_THREADS if thread.is_alive()]
+        _WORKER_THREADS[:] = alive_threads
+        if len(alive_threads) >= desired_workers:
             return
+
         _WORKER_STOP_EVENT.clear()
-        _WORKER_THREAD = threading.Thread(
-            target=_pending_inbound_worker,
-            name="inbound-media-queue",
-            daemon=True,
-        )
-        _WORKER_THREAD.start()
+        for worker_index in range(len(alive_threads), desired_workers):
+            thread = threading.Thread(
+                target=_pending_inbound_worker,
+                name=f"inbound-media-queue-{worker_index + 1}",
+                daemon=True,
+            )
+            _WORKER_THREADS.append(thread)
+            thread.start()
 
 
 def stop_pending_inbound_job_worker(*, timeout_seconds: float = 1.0) -> None:
-    global _WORKER_THREAD
-
     with _WORKER_LOCK:
-        thread = _WORKER_THREAD
-        if thread is None:
+        threads = list(_WORKER_THREADS)
+        if not threads:
             return
         _WORKER_STOP_EVENT.set()
         _WORKER_WAKE_EVENT.set()
 
-    if thread.is_alive():
-        thread.join(timeout=timeout_seconds)
+    for thread in threads:
+        if thread.is_alive():
+            thread.join(timeout=timeout_seconds)
 
     with _WORKER_LOCK:
-        if _WORKER_THREAD is thread:
-            _WORKER_THREAD = None
+        _WORKER_THREADS[:] = [thread for thread in _WORKER_THREADS if thread.is_alive()]
+        if not _WORKER_THREADS:
+            _WORKER_STOP_EVENT.clear()

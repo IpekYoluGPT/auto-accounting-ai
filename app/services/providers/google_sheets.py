@@ -4184,11 +4184,13 @@ def queue_pending_document_upload(
     if not targets:
         return
 
+    normalized_source_message_id = _root_source_message_id(source_message_id)
+
     storage_guard.prune_stale_transient_storage()
     if storage_guard.should_stop_payload_writes():
         logger.warning(
             "Skipping pending Drive upload queue for message id=%s because disk pressure forbids transient writes.",
-            source_message_id or "?",
+            normalized_source_message_id or "?",
         )
         return
 
@@ -4199,7 +4201,7 @@ def queue_pending_document_upload(
         if source_message_id:
             for existing in items:
                 if (
-                    str(existing.get("source_message_id") or "") == source_message_id
+                    str(existing.get("source_message_id") or "") == normalized_source_message_id
                     and str(existing.get("filename") or "") == filename
                     and str(existing.get("mime_type") or "") == mime_type
                 ):
@@ -4215,7 +4217,7 @@ def queue_pending_document_upload(
                     _save_pending_drive_uploads(items)
                     logger.warning(
                         "Merged pending Drive upload for message id=%s; target count is now %d.",
-                        source_message_id,
+                        normalized_source_message_id,
                         len(existing.get("targets", [])),
                     )
                     start_pending_drive_upload_worker()
@@ -4231,7 +4233,7 @@ def queue_pending_document_upload(
         "mime_type": mime_type,
         "payload_path": str(payload_path),
         "targets": normalized_targets,
-        "source_message_id": source_message_id or "",
+        "source_message_id": normalized_source_message_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "attempts": 0,
     }
@@ -4243,7 +4245,7 @@ def queue_pending_document_upload(
 
     logger.warning(
         "Queued pending Drive upload for message id=%s with %d target cell(s).",
-        source_message_id,
+        normalized_source_message_id,
         len(normalized_targets),
     )
     start_pending_drive_upload_worker()
@@ -4449,6 +4451,14 @@ def _pending_payload_storage_usage_bytes() -> int:
     return total
 
 
+def _root_source_message_id(source_message_id: str | None) -> str:
+    raw = (source_message_id or "").strip()
+    prefix, separator, suffix = raw.rpartition("__doc")
+    if prefix and separator and suffix.isdigit():
+        return prefix
+    return raw
+
+
 def _shared_pending_sheet_payload_path(
     *,
     source_message_id: str | None,
@@ -4456,7 +4466,7 @@ def _shared_pending_sheet_payload_path(
     mime_type: str | None,
 ) -> Path:
     key = "|".join([
-        (source_message_id or "").strip(),
+        _root_source_message_id(source_message_id),
         (filename or "").strip(),
         (mime_type or "").strip(),
     ])
@@ -4577,9 +4587,14 @@ def _pending_sheet_item_is_ready(item: dict) -> bool:
 
 def _pending_sheet_batch_priority(item: dict) -> tuple[int, int]:
     tab_name = str(item.get("tab_name") or "")
-    # Payments depend on debt tabs already being present; let debt-producing tabs win first.
+    if tab_name in {"Masraf Kayıtları", "Faturalar", "Sevk Fişleri"}:
+        return (0, 0)
     if tab_name == "Banka Ödemeleri":
         return (1, 0)
+    if tab_name.startswith("__") and tab_name != "__Raw Belgeler":
+        return (2, 0)
+    if tab_name == "__Raw Belgeler":
+        return (3, 0)
     return (0, 0)
 
 

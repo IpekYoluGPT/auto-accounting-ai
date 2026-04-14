@@ -713,7 +713,7 @@ def test_sheet_backlog_notice_is_throttled_per_chat():
         assert response_one.status_code == 200
         assert response_two.status_code == 200
         assert send_mock.call_count == 1
-        assert "tabloya yazılıyor" in send_mock.call_args.args[1].lower()
+        assert "görünür satırlar önce" in send_mock.call_args.args[1].lower()
         assert [call.args[2] for call in reaction_mock.call_args_list] == ["⌛", "✅", "⌛", "✅"]
 
 
@@ -746,8 +746,10 @@ def test_duplicate_content_with_new_message_id_writes_only_one_export_row():
             side_effect=[[_record_for("wamid-1")], [_record_for("wamid-2")]],
         ), patch(
             "app.services.accounting.intake.google_sheets.upload_document",
-            return_value="https://drive.google.com/file/d/test/view",
-        ), patch(
+        ) as upload_mock, patch(
+            "app.services.accounting.intake.google_sheets.append_record",
+            return_value=[],
+        ) as append_mock, patch(
             "app.routes.webhooks.whatsapp.send_text_message"
         ), patch(
             "app.routes.webhooks.whatsapp.send_reaction_message"
@@ -759,6 +761,8 @@ def test_duplicate_content_with_new_message_id_writes_only_one_export_row():
         assert response_two.status_code == 200
         rows = _read_export_rows(tmpdir)
         assert len(rows) == 1
+        upload_mock.assert_not_called()
+        append_mock.assert_called_once()
 
 
 def test_duplicate_delivery_writes_only_one_export_row():
