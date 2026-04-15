@@ -29,7 +29,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.config import settings
 from app.models.schemas import BillRecord, DocumentCategory
-from app.services.accounting import ledger, storage_guard
+from app.services.accounting import ledger, storage_guard, unit_dictionary
 from app.services.accounting.pipeline_context import PipelineContext, current_pipeline_context, namespace_storage_root, pipeline_context_scope
 from app.utils.logging import get_logger
 
@@ -3145,27 +3145,18 @@ def _join_labeled_parts(parts: list[tuple[str, object]]) -> str:
     return " | ".join(rendered)
 
 
-def _normalized_display_unit(value: object) -> str:
-    raw_unit_text = _text_value(value)
-    folded = raw_unit_text.casefold()
-    unit_map = {
-        "ad": "adet",
-        "adet": "adet",
-        "m²": "m2",
-        "m2": "m2",
-        "l": "lt",
-    }
-    return unit_map.get(folded, raw_unit_text)
+def _normalized_display_unit(value: object, *, compact: bool = False) -> str:
+    return unit_dictionary.display_unit(value, compact=compact) or ""
 
 
 def _display_quantity(value: object, unit: object | None = None, *, compact: bool = True) -> str:
     quantity_text = _text_value(value)
     if not quantity_text:
         return ""
-    unit_text = _normalized_display_unit(unit)
+    unit_text = _normalized_display_unit(unit, compact=compact)
     if not unit_text:
         return quantity_text
-    if compact and unit_text in {"m3", "m2", "m", "mt", "kg", "gr", "g", "lt", "ton"}:
+    if compact and unit_dictionary.canonical_unit(unit_text) in {"m3", "m2", "m", "mt", "kg", "gr", "lt", "ton"}:
         return f"{quantity_text}{unit_text}"
     return f"{quantity_text} {unit_text}"
 

@@ -7,6 +7,7 @@ from unittest.mock import ANY, patch
 import pytest
 
 from app.models.schemas import AIExtractionResult, AIMultiExtractionResult, BillRecord, DocumentCategory, InvoiceLineItem
+from app.services.accounting import unit_dictionary
 from app.services.accounting.gemini_extractor import _normalize_record, _parse_tr_number, extract_bill, extract_bills
 
 
@@ -197,6 +198,7 @@ class TestNormalizeRecord:
                     {"description": "3AD 2m MASTAR", "quantity": None, "unit": None},
                     {"description": "1 adet 25cm Rulo", "quantity": None, "unit": None},
                     {"description": "Sap 1.50m", "quantity": "1AD", "unit": None},
+                    {"description": "Çimento", "quantity": "5TRB", "unit": None},
                 ],
             )
         )
@@ -204,9 +206,10 @@ class TestNormalizeRecord:
         assert record.product_quantity == pytest.approx(18.0)
         assert record.line_unit == "m3"
         assert record.line_items is not None
-        assert [item.quantity for item in record.line_items] == [pytest.approx(3.0), pytest.approx(1.0), pytest.approx(1.0)]
-        assert [item.unit for item in record.line_items] == ["adet", "adet", "adet"]
-        assert [item.description for item in record.line_items] == ["2m MASTAR", "25cm Rulo", "Sap 1.50m"]
+        assert [item.quantity for item in record.line_items] == [pytest.approx(3.0), pytest.approx(1.0), pytest.approx(1.0), pytest.approx(5.0)]
+        assert [item.unit for item in record.line_items] == ["AD", "adet", "AD", "TRB"]
+        assert [item.description for item in record.line_items] == ["2m MASTAR", "25cm Rulo", "Sap 1.50m", "Çimento"]
+        assert [unit_dictionary.canonical_unit(item.unit) for item in record.line_items] == ["adet", "adet", "adet", "torba"]
 
 
 class TestExtractBill:
@@ -440,6 +443,7 @@ class TestExtractBill:
         assert "pallet_count, items_per_pallet ve product_quantity" in prompt
         assert "18m3" in prompt
         assert "3AD" in prompt
+        assert "5 TRB" in prompt
 
     def test_multi_document_extraction(self, monkeypatch):
         monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")

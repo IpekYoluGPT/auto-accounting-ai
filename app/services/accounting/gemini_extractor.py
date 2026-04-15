@@ -4,13 +4,12 @@ Gemini-backed extraction with category-aware prompts.
 
 from __future__ import annotations
 
-import re
 from typing import Optional
 
 from app.config import settings
 from app.models.schemas import AIMultiExtractionResult, BillRecord, DocumentCategory, InvoiceLineItem
 from app.services import gemini_client
-from app.services.accounting import ocr
+from app.services.accounting import ocr, unit_dictionary
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -76,7 +75,7 @@ _CATEGORY_SPECIFIC_INSTRUCTIONS: dict[DocumentCategory, str] = {
 - recipient_name teslim alan / alici / sevk edilen taraf gorunuyorsa onu yaz.
 - document_number irsaliye / belge / form numarasidir.
 - shipment_origin, shipment_destination, vehicle_plate, pallet_count, items_per_pallet ve product_quantity gorunuyorsa doldur.
-- `18m3`, `18 m3`, `3AD`, `1 adet`, `25kg`, `2 ton` gibi miktar+birim yazimlari varsa sayi ve birimi ayri alanlara dagit.
+- `18m3`, `18 m3`, `3AD`, `1 adet`, `25kg`, `2 ton`, `5 TRB` gibi miktar+birim yazimlari varsa sayi ve birimi ayri alanlara dagit.
 - line_items varsa her satiri ayri ayri cikar; yalnizca description degil, gorunen satir miktari ve birimini de doldur.
 - product_quantity yalniz belge genelinde tek baskin toplam miktar varsa doldur; cok kalemli belgelerde satir detaylarini line_items icinde tut.
 - description alanina malzeme cinsi veya malzeme listesinin kisa ozeti yaz.
@@ -102,8 +101,8 @@ _EXTRACTION_EXAMPLES = """Kisa ornekler:
 2. Ayni fotografta 3 cek varsa 3 ayri document dondur ve siralamayi soldan saga yap.
 3. Iade faturasinda iade oldugu acikca gorunuyorsa tutarlari goruldugu gibi cikar; normal faturaya cevirme."""
 
-_QUANTITY_WITH_UNIT_TOKEN_RE = re.compile(r"^\s*(?P<quantity>\d+(?:[.,]\d+)?)\s*(?P<unit>m3|m²|m2|kg|gr|g|lt|l|ton|adet|ad|paket|çuval|koli|mt|m)\s*$", re.IGNORECASE)
-_LINE_ITEM_LEADING_QUANTITY_RE = re.compile(r"^\s*(?P<quantity>\d+(?:[.,]\d+)?)\s*(?P<unit>adet|ad|kg|gr|g|lt|l|ton|m3|m²|m2|paket|çuval|koli|mt|m)\b[\s:;,.\-]*(?P<rest>.+?)\s*$", re.IGNORECASE)
+_QUANTITY_WITH_UNIT_TOKEN_RE = unit_dictionary.QUANTITY_WITH_UNIT_TOKEN_RE
+_LINE_ITEM_LEADING_QUANTITY_RE = unit_dictionary.LINE_ITEM_LEADING_QUANTITY_RE
 
 _MULTI_DOCUMENT_RETRY_INSTRUCTIONS = """Bu goruntude birden fazla belge var ve onceki denemede belge ayrimi eksik kaldi.
 - Bu turda gorunur her ayri belgeyi ayri object olarak dondur.
@@ -122,32 +121,7 @@ def _parse_tr_number(value: str) -> Optional[float]:
 
 
 def _normalize_unit_text(value: object) -> Optional[str]:
-    if value is None:
-        return None
-    normalized = str(value).strip()
-    if not normalized:
-        return None
-    folded = normalized.casefold()
-    unit_map = {
-        "ad": "adet",
-        "adet": "adet",
-        "m3": "m3",
-        "m²": "m2",
-        "m2": "m2",
-        "kg": "kg",
-        "gr": "gr",
-        "g": "g",
-        "lt": "lt",
-        "l": "lt",
-        "ton": "ton",
-        "paket": "paket",
-        "çuval": "çuval",
-        "cuval": "çuval",
-        "koli": "koli",
-        "mt": "mt",
-        "m": "m",
-    }
-    return unit_map.get(folded, normalized)
+    return unit_dictionary.display_unit(value, compact=False)
 
 
 def _extract_quantity_and_unit(raw_value: object, raw_unit: object = None) -> tuple[Optional[float], Optional[str]]:
