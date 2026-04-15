@@ -4,6 +4,7 @@ Gemini-backed extraction with category-aware prompts.
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from app.config import settings
@@ -75,7 +76,9 @@ _CATEGORY_SPECIFIC_INSTRUCTIONS: dict[DocumentCategory, str] = {
 - recipient_name teslim alan / alici / sevk edilen taraf gorunuyorsa onu yaz.
 - document_number irsaliye / belge / form numarasidir.
 - shipment_origin, shipment_destination, vehicle_plate, pallet_count, items_per_pallet ve product_quantity gorunuyorsa doldur.
-- line_items varsa urun listesi gibi satirlari ayri ayri cikar.
+- `18m3`, `18 m3`, `3AD`, `1 adet`, `25kg`, `2 ton` gibi miktar+birim yazimlari varsa sayi ve birimi ayri alanlara dagit.
+- line_items varsa her satiri ayri ayri cikar; yalnizca description degil, gorunen satir miktari ve birimini de doldur.
+- product_quantity yalniz belge genelinde tek baskin toplam miktar varsa doldur; cok kalemli belgelerde satir detaylarini line_items icinde tut.
 - description alanina malzeme cinsi veya malzeme listesinin kisa ozeti yaz.
 - notes alanina teslim yeri / santiye / aciklama gibi sahaya ait bilgileri yaz.
 - total_amount gorunmuyorsa null birak; sirf tahmin etmek icin hesap yapma.
@@ -99,6 +102,9 @@ _EXTRACTION_EXAMPLES = """Kisa ornekler:
 2. Ayni fotografta 3 cek varsa 3 ayri document dondur ve siralamayi soldan saga yap.
 3. Iade faturasinda iade oldugu acikca gorunuyorsa tutarlari goruldugu gibi cikar; normal faturaya cevirme."""
 
+_QUANTITY_WITH_UNIT_TOKEN_RE = re.compile(r"^\s*(?P<quantity>\d+(?:[.,]\d+)?)\s*(?P<unit>m3|m²|m2|kg|gr|g|lt|l|ton|adet|ad|paket|çuval|koli|mt|m)\s*$", re.IGNORECASE)
+_LINE_ITEM_LEADING_QUANTITY_RE = re.compile(r"^\s*(?P<quantity>\d+(?:[.,]\d+)?)\s*(?P<unit>adet|ad|kg|gr|g|lt|l|ton|m3|m²|m2|paket|çuval|koli|mt|m)\b[\s:;,.\-]*(?P<rest>.+?)\s*$", re.IGNORECASE)
+
 _MULTI_DOCUMENT_RETRY_INSTRUCTIONS = """Bu goruntude birden fazla belge var ve onceki denemede belge ayrimi eksik kaldi.
 - Bu turda gorunur her ayri belgeyi ayri object olarak dondur.
 - Ayrik belgeleri ASLA birlestirme.
@@ -113,6 +119,89 @@ def _parse_tr_number(value: str) -> Optional[float]:
     """Backward-compatible wrapper for tests."""
     return ocr.parse_tr_number(value)
 
+
+
+def _normalize_unit_text(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    folded = normalized.casefold()
+    unit_map = {
+        "ad": "adet",
+        "adet": "adet",
+        "m3": "m3",
+        "m²": "m2",
+        "m2": "m2",
+        "kg": "kg",
+        "gr": "gr",
+        "g": "g",
+        "lt": "lt",
+        "l": "lt",
+        "ton": "ton",
+        "paket": "paket",
+        "çuval": "çuval",
+        "cuval": "çuval",
+        "koli": "koli",
+        "mt": "mt",
+        "m": "m",
+    }
+    return unit_map.get(folded, normalized)
+
+
+def _extract_quantity_and_unit(raw_value: object, raw_unit: object = None) -> tuple[Optional[float], Optional[str]]:
+    quantity = ocr.parse_tr_number(raw_value)
+    unit = _normalize_unit_text(raw_unit)
+    if quantity is not None and unit:
+        return quantity, unit
+
+    value_text = str(raw_value or '').strip()
+    if not value_text:
+        return quantity, unit
+
+    match = _QUANTITY_WITH_UNIT_TOKEN_RE.match(value_text)
+    if match is None:
+        return quantity, unit
+
+    parsed_quantity = ocr.parse_tr_number(match.group('quantity'))
+    parsed_unit = _normalize_unit_text(match.group('unit'))
+    return parsed_quantity if parsed_quantity is not None else quantity, parsed_unit or unit
+
+
+def _strip_line_item_quantity_prefix(description: object) -> tuple[Optional[float], Optional[str], Optional[str]]:
+    description_text = str(description or '').strip()
+    if not description_text:
+        return None, None, None
+
+    match = _LINE_ITEM_LEADING_QUANTITY_RE.match(description_text)
+    if match is None:
+        return None, None, description_text
+
+    parsed_quantity = ocr.parse_tr_number(match.group('quantity'))
+    parsed_unit = _normalize_unit_text(match.group('unit'))
+    remainder = str(match.group('rest') or '').strip() or description_text
+    return parsed_quantity, parsed_unit, remainder
+
+
+def _normalize_line_item(item: dict, *, safe_str, safe_float) -> InvoiceLineItem:
+    description = safe_str(item.get('description'))
+    quantity, unit = _extract_quantity_and_unit(item.get('quantity'), item.get('unit'))
+    if (quantity is None or unit is None) and description:
+        parsed_quantity, parsed_unit, stripped_description = _strip_line_item_quantity_prefix(description)
+        if quantity is None and parsed_quantity is not None:
+            quantity = parsed_quantity
+        if unit is None and parsed_unit is not None:
+            unit = parsed_unit
+        description = safe_str(stripped_description)
+
+    return InvoiceLineItem(
+        description=description,
+        quantity=quantity if quantity is not None else safe_float(item.get('quantity')),
+        unit=unit,
+        unit_price=safe_float(item.get('unit_price')),
+        line_amount=safe_float(item.get('line_amount')),
+    )
 
 
 def _safe_bool(value) -> Optional[bool]:
@@ -149,15 +238,12 @@ def _normalize_record(raw: dict) -> BillRecord:
         for item in line_items_raw:
             if not isinstance(item, dict):
                 continue
-            normalized_line_items.append(
-                InvoiceLineItem(
-                    description=_safe_str(item.get("description")),
-                    quantity=_safe_float(item.get("quantity")),
-                    unit=_safe_str(item.get("unit")),
-                    unit_price=_safe_float(item.get("unit_price")),
-                    line_amount=_safe_float(item.get("line_amount")),
-                )
-            )
+            normalized_line_items.append(_normalize_line_item(item, safe_str=_safe_str, safe_float=_safe_float))
+
+    line_quantity, line_unit = _extract_quantity_and_unit(raw.get("line_quantity"), raw.get("line_unit"))
+    product_quantity, product_unit = _extract_quantity_and_unit(raw.get("product_quantity"), raw.get("line_unit"))
+    if line_unit is None and product_unit is not None:
+        line_unit = product_unit
 
     currency_raw = _safe_str(raw.get("currency"))
     if currency_raw:
@@ -185,8 +271,8 @@ def _normalize_record(raw: dict) -> BillRecord:
         recipient_name=_safe_str(raw.get("recipient_name")),
         buyer_name=_safe_str(raw.get("buyer_name")),
         invoice_type=_safe_str(raw.get("invoice_type")),
-        line_quantity=_safe_float(raw.get("line_quantity")),
-        line_unit=_safe_str(raw.get("line_unit")),
+        line_quantity=line_quantity,
+        line_unit=line_unit,
         unit_price=_safe_float(raw.get("unit_price")),
         line_amount=_safe_float(raw.get("line_amount")),
         withholding_present=_safe_bool(raw.get("withholding_present")),
@@ -199,7 +285,7 @@ def _normalize_record(raw: dict) -> BillRecord:
         shipment_destination=_safe_str(raw.get("shipment_destination")),
         pallet_count=_safe_float(raw.get("pallet_count")),
         items_per_pallet=_safe_float(raw.get("items_per_pallet")),
-        product_quantity=_safe_float(raw.get("product_quantity")),
+        product_quantity=product_quantity,
         vehicle_plate=_safe_str(raw.get("vehicle_plate")),
         cheque_issue_place=_safe_str(raw.get("cheque_issue_place")),
         cheque_issue_date=ocr.normalize_date(_safe_str(raw.get("cheque_issue_date"))) or _safe_str(raw.get("cheque_issue_date")),

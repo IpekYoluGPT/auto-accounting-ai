@@ -272,6 +272,7 @@ def test_sevk_row_uses_dense_visible_columns_and_summary_detail():
             recipient_name="H. Karakaya İnş.",
             description="SİYAH KUM",
             product_quantity=18.0,
+            line_unit="m3",
             shipment_destination="KARAKAYA İNŞ Kuzey Organize",
             shipment_origin="ELAZIĞ",
             vehicle_plate="23ABC123",
@@ -293,7 +294,7 @@ def test_sevk_row_uses_dense_visible_columns_and_summary_detail():
         "KUM - ÇAKIL - HAFRİYAT",
         "H. Karakaya İnş.",
         "SİYAH KUM",
-        "18",
+        "18m3",
         "KARAKAYA İNŞ Kuzey Organize",
         "Çıkış: ELAZIĞ | Plaka: 23ABC123 | Palet: 3 | Adet/Palet: 6 | Not: Saha teslim",
     ]

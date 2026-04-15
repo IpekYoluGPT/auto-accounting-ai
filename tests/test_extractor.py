@@ -187,6 +187,27 @@ class TestNormalizeRecord:
         assert record.line_items[0].unit_price == pytest.approx(25.5)
         assert record.line_items[0].line_amount == pytest.approx(76.5)
 
+    def test_parses_compact_material_quantity_tokens_without_hardcoding(self):
+        record = _normalize_record(
+            self._raw(
+                line_quantity=None,
+                line_unit=None,
+                product_quantity="18m3",
+                line_items=[
+                    {"description": "3AD 2m MASTAR", "quantity": None, "unit": None},
+                    {"description": "1 adet 25cm Rulo", "quantity": None, "unit": None},
+                    {"description": "Sap 1.50m", "quantity": "1AD", "unit": None},
+                ],
+            )
+        )
+
+        assert record.product_quantity == pytest.approx(18.0)
+        assert record.line_unit == "m3"
+        assert record.line_items is not None
+        assert [item.quantity for item in record.line_items] == [pytest.approx(3.0), pytest.approx(1.0), pytest.approx(1.0)]
+        assert [item.unit for item in record.line_items] == ["adet", "adet", "adet"]
+        assert [item.description for item in record.line_items] == ["2m MASTAR", "25cm Rulo", "Sap 1.50m"]
+
 
 class TestExtractBill:
     def test_no_api_key_raises(self, monkeypatch):
@@ -417,6 +438,8 @@ class TestExtractBill:
         assert "shipment_destination" in prompt
         assert "vehicle_plate" in prompt
         assert "pallet_count, items_per_pallet ve product_quantity" in prompt
+        assert "18m3" in prompt
+        assert "3AD" in prompt
 
     def test_multi_document_extraction(self, monkeypatch):
         monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")

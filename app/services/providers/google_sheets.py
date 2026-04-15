@@ -3145,14 +3145,29 @@ def _join_labeled_parts(parts: list[tuple[str, object]]) -> str:
     return " | ".join(rendered)
 
 
-def _display_quantity(value: object, unit: object | None = None) -> str:
+def _normalized_display_unit(value: object) -> str:
+    raw_unit_text = _text_value(value)
+    folded = raw_unit_text.casefold()
+    unit_map = {
+        "ad": "adet",
+        "adet": "adet",
+        "m²": "m2",
+        "m2": "m2",
+        "l": "lt",
+    }
+    return unit_map.get(folded, raw_unit_text)
+
+
+def _display_quantity(value: object, unit: object | None = None, *, compact: bool = True) -> str:
     quantity_text = _text_value(value)
     if not quantity_text:
         return ""
-    unit_text = _text_value(unit)
-    if unit_text:
-        return f"{quantity_text} {unit_text}"
-    return quantity_text
+    unit_text = _normalized_display_unit(unit)
+    if not unit_text:
+        return quantity_text
+    if compact and unit_text in {"m3", "m2", "m", "mt", "kg", "gr", "g", "lt", "ton"}:
+        return f"{quantity_text}{unit_text}"
+    return f"{quantity_text} {unit_text}"
 
 
 def _display_sender_or_company(record: BillRecord) -> str:
@@ -3331,8 +3346,28 @@ def _invoice_unit_price_display(record: BillRecord, primary_line_item: dict[str,
     return record.unit_price if record.unit_price is not None else ""
 
 
+def _shipment_line_item_summary(record: BillRecord, *, preview_limit: int = 3) -> str:
+    rendered: list[str] = []
+    for item in _line_item_rows(record):
+        description = _text_value(item.get("description"))
+        quantity_prefix = _display_quantity(item.get("quantity"), item.get("unit"), compact=False)
+        if quantity_prefix and description:
+            rendered.append(f"{quantity_prefix} {description}")
+        elif description:
+            rendered.append(description)
+        elif quantity_prefix:
+            rendered.append(quantity_prefix)
+
+    if not rendered:
+        return ""
+    summary = ", ".join(rendered[:preview_limit])
+    if len(rendered) > preview_limit:
+        summary += f" +{len(rendered) - preview_limit} kalem"
+    return summary
+
+
 def _shipment_product_summary(record: BillRecord) -> str:
-    return _line_item_description_summary(record, preview_limit=3) or _coalesce_text(record.description, record.notes)
+    return _shipment_line_item_summary(record, preview_limit=3) or _coalesce_text(record.description, record.notes)
 
 
 def _shipment_visible_description(record: BillRecord) -> str:
@@ -3341,9 +3376,6 @@ def _shipment_visible_description(record: BillRecord) -> str:
     product_summary = _shipment_product_summary(record)
     if raw_description and product_summary and raw_description != product_summary:
         parts.append(raw_description)
-    line_item_count = _line_item_count(record)
-    if line_item_count > 1:
-        parts.append(f"{line_item_count} kalem")
     extra_detail = _shipment_extra_detail(record)
     if extra_detail:
         parts.append(extra_detail)
@@ -3351,8 +3383,19 @@ def _shipment_visible_description(record: BillRecord) -> str:
 
 
 def _shipment_quantity_display(record: BillRecord) -> str:
+    line_item_rows = _line_item_rows(record)
+    if len(line_item_rows) > 1:
+        return f"{len(line_item_rows)} kalem"
+
+    primary_line_item = line_item_rows[0] if len(line_item_rows) == 1 else None
     quantity = record.product_quantity if record.product_quantity is not None else record.line_quantity
-    return _display_quantity(quantity, record.line_unit)
+    unit = record.line_unit
+    if primary_line_item is not None:
+        if quantity is None:
+            quantity = primary_line_item.get("quantity")
+        if not unit:
+            unit = primary_line_item.get("unit")
+    return _display_quantity(quantity, unit, compact=True)
 
 
 def _is_generic_invoice_description(record: BillRecord, description: str | None) -> bool:

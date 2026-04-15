@@ -927,14 +927,12 @@ def test_build_row_for_sevk_formats_quantity_with_unit_and_uses_line_item_summar
         document_number='8979',
         document_date='2026-03-07',
         description='Veresiye satış senedi',
-        line_unit='m3',
-        product_quantity=18,
         shipment_destination='KARAKAYA İNŞ Kuzey Organize',
         notes='Kuzey Organize',
         line_items=[
-            {'description': '2m Mastar'},
-            {'description': '25cm Rulo'},
-            {'description': 'Saç 1.5mm'},
+            {'description': '2m MASTAR', 'quantity': 3, 'unit': 'ADET'},
+            {'description': '25cm Rulo', 'quantity': 1, 'unit': 'ad'},
+            {'description': 'Sap 1.50m', 'quantity': 1, 'unit': 'adet'},
         ],
     )
 
@@ -946,10 +944,10 @@ def test_build_row_for_sevk_formats_quantity_with_unit_and_uses_line_item_summar
         row_number=3,
     )
 
-    assert row[4] == '2m Mastar, 25cm Rulo, Saç 1.5mm'
-    assert row[5] == '18 m3'
+    assert row[4] == '3 adet 2m MASTAR, 1 adet 25cm Rulo, 1 adet Sap 1.50m'
+    assert row[5] == '3 kalem'
     assert row[6] == 'KARAKAYA İNŞ Kuzey Organize'
-    assert row[7] == 'Veresiye satış senedi | 3 kalem | Not: Kuzey Organize'
+    assert row[7] == 'Veresiye satış senedi | Not: Kuzey Organize'
 
 
 
