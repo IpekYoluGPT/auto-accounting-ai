@@ -705,11 +705,11 @@ def test_select_pending_sheet_batch_defers_banka_odemeleri_until_other_ready_tab
     assert [item["id"] for item in batch] == ["masraf-1"]
 
 
-def test_reset_current_month_spreadsheet_data_clears_only_visible_projection_rows(monkeypatch):
+def test_reset_current_month_spreadsheet_data_clears_visible_and_allocation_projection_rows(monkeypatch):
     fake_summary_ws = MagicMock()
     fake_summary_ws.row_count = 1000
     fake_tab_wss = {}
-    for tab_name in google_sheets._ACTIVE_WORKBOOK_TABS:
+    for tab_name in google_sheets._RESETTABLE_WORKBOOK_TABS:
         if tab_name == "📊 Özet":
             continue
         ws = MagicMock()
@@ -734,7 +734,7 @@ def test_reset_current_month_spreadsheet_data_clears_only_visible_projection_row
 
     touched_tabs = google_sheets.reset_current_month_spreadsheet_data(spreadsheet_id="sheet-reset-1")
 
-    assert touched_tabs == len(google_sheets._ACTIVE_WORKBOOK_TABS)
+    assert touched_tabs == len(google_sheets._RESETTABLE_WORKBOOK_TABS)
     fake_client.open_by_key.assert_called_once_with("sheet-reset-1")
     fake_summary_ws.batch_clear.assert_not_called()
     for tab_name, ws in fake_tab_wss.items():

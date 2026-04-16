@@ -3989,10 +3989,10 @@ def _build_payment_projection_rows(
 
     remaining_payment = payment_magnitude
     allocation_index = 0
+    party_remaining_balance = 0.0
 
     if selected_mode == 'payable' and selected_match and selected_match.party_key:
-        party_debts = payable_rows
-        for debt in party_debts:
+        for debt in payable_rows:
             if remaining_payment <= 0:
                 break
             open_amount = float(debt['remaining_amount'])
@@ -4005,26 +4005,7 @@ def _build_payment_projection_rows(
             debt['remaining_amount'] = round(open_amount - applied, 2)
             remaining_payment = round(remaining_payment - applied, 2)
             allocation_id = f"{item_id}__alloc{allocation_index}"
-            visible_row_id = f"{item_id}__row{allocation_index}"
             status = _allocation_status(float(debt['remaining_amount']), applied)
-            visible_rows.append(_build_payment_allocation_row(
-                party_name=matched_display_name,
-                description=description,
-                reference_number=payment_reference,
-                sender_name=payment_sender_name,
-                payment_amount=_signed_payment_value(amount, applied),
-                payment_date=payment_date,
-                remaining_balance=debt.get('remaining_amount'),
-                status=status,
-                drive_link=drive_link,
-                row_id=visible_row_id,
-                party_key=selected_match.party_key,
-                source_doc_id=source_doc_id,
-                debt_row_id=str(debt.get('row_id') or ''),
-                tax_number=str(debt.get('tax_number') or payment_tax_number or ''),
-                allocation_id=allocation_id,
-                spreadsheet=spreadsheet,
-            ))
             allocation_rows.append(_build_allocation_detail_row(
                 allocation_id=allocation_id,
                 party_key=selected_match.party_key,
@@ -4037,6 +4018,7 @@ def _build_payment_projection_rows(
                 remaining_amount=debt.get('remaining_amount'),
                 status=status,
             ))
+        party_remaining_balance = round(sum(max(float(debt.get('remaining_amount') or 0), 0.0) for debt in payable_rows), 2)
 
     if selected_mode == 'receivable' and selected_match and selected_match.party_key:
         for debt in receivable_rows:
@@ -4052,84 +4034,64 @@ def _build_payment_projection_rows(
             debt['remaining_amount'] = round(float(debt['remaining_amount']) + applied, 2)
             remaining_payment = round(remaining_payment - applied, 2)
             remaining_receivable = abs(float(debt['remaining_amount']))
-            visible_row_id = f"{item_id}__row{allocation_index}"
             status = _allocation_status(remaining_receivable, applied)
-            visible_rows.append(_build_payment_allocation_row(
-                party_name=matched_display_name,
-                description=description,
-                reference_number=payment_reference,
-                sender_name=payment_sender_name,
-                payment_amount=applied,
-                payment_date=payment_date,
-                remaining_balance=remaining_receivable,
-                status=status,
-                drive_link=drive_link,
-                row_id=visible_row_id,
-                party_key=selected_match.party_key,
-                source_doc_id=source_doc_id,
-                debt_row_id='receivable:' + str(debt.get('row_id') or ''),
-                tax_number=str(debt.get('tax_number') or payment_tax_number or ''),
+            allocation_rows.append(_build_allocation_detail_row(
                 allocation_id=f'{item_id}__alloc{allocation_index}',
-                spreadsheet=spreadsheet,
+                party_key=selected_match.party_key,
+                debt_row_id='receivable:' + str(debt.get('row_id') or ''),
+                payment_doc_id=source_doc_id,
+                payment_date=payment_date,
+                debt_date=str(debt.get('date') or ''),
+                debt_amount=abs(float(debt.get('original_amount') or 0.0)),
+                allocated_amount=applied,
+                remaining_amount=remaining_receivable,
+                status=status,
             ))
+        party_remaining_balance = round(sum(abs(min(float(debt.get('remaining_amount') or 0), 0.0)) for debt in receivable_rows), 2)
+
+    row_status = ledger.STATUS_ESLESMEDI
+    row_remaining_balance: float | int = amount
+    row_description = description
+    row_party_key = selected_match.party_key if selected_match else ''
+    row_tax_number = (selected_match.tax_number if selected_match else '') or payment_tax_number
 
     if selected_mode == 'unmatched':
-        visible_rows.append(_build_payment_allocation_row(
-            party_name=matched_display_name,
-            description=description,
-            reference_number=payment_reference,
-            sender_name=payment_sender_name,
-            payment_amount=amount,
-            payment_date=payment_date,
-            remaining_balance=amount,
-            status=ledger.STATUS_ESLESMEDI,
-            drive_link=drive_link,
-            row_id=f'{item_id}__row1',
-            party_key='',
-            source_doc_id=source_doc_id,
-            debt_row_id='',
-            tax_number=payment_tax_number,
-            allocation_id=f'{item_id}__alloc0',
-            spreadsheet=spreadsheet,
-        ))
+        row_status = ledger.STATUS_ESLESMEDI
+        row_remaining_balance = amount
+        row_party_key = ''
+        row_tax_number = payment_tax_number
     elif allocation_index == 0:
-        visible_rows.append(_build_payment_allocation_row(
-            party_name=matched_display_name,
-            description=description,
-            reference_number=payment_reference,
-            sender_name=payment_sender_name,
-            payment_amount=amount,
-            payment_date=payment_date,
-            remaining_balance=0,
-            status=ledger.STATUS_BORC_YOK,
-            drive_link=drive_link,
-            row_id=f'{item_id}__row1',
-            party_key=selected_match.party_key if selected_match else '',
-            source_doc_id=source_doc_id,
-            debt_row_id='',
-            tax_number=(selected_match.tax_number if selected_match else '') or payment_tax_number,
-            allocation_id=f'{item_id}__alloc0',
-            spreadsheet=spreadsheet,
-        ))
-    elif remaining_payment > 0:
-        visible_rows.append(_build_payment_allocation_row(
-            party_name=matched_display_name,
-            description=description,
-            reference_number=payment_reference,
-            sender_name=payment_sender_name,
-            payment_amount=_signed_payment_value(amount, remaining_payment),
-            payment_date=payment_date,
-            remaining_balance=remaining_payment,
-            status=ledger.STATUS_FAZLA_ODEME,
-            drive_link=drive_link,
-            row_id=f'{item_id}__row{allocation_index + 1}',
-            party_key=selected_match.party_key if selected_match else '',
-            source_doc_id=source_doc_id,
-            debt_row_id='',
-            tax_number=(selected_match.tax_number if selected_match else '') or payment_tax_number,
-            allocation_id=f'{item_id}__alloc{allocation_index + 1}',
-            spreadsheet=spreadsheet,
-        ))
+        row_status = ledger.STATUS_BORC_YOK
+        row_remaining_balance = 0
+    else:
+        row_remaining_balance = party_remaining_balance
+        if allocation_index > 1:
+            row_description = f"{description} | {allocation_index} borca dağıtıldı" if description else f"{allocation_index} borca dağıtıldı"
+        if remaining_payment > 0:
+            row_status = ledger.STATUS_FAZLA_ODEME
+        elif party_remaining_balance <= 0:
+            row_status = ledger.STATUS_KAPANDI
+        else:
+            row_status = ledger.STATUS_KISMI
+
+    visible_rows.append(_build_payment_allocation_row(
+        party_name=matched_display_name,
+        description=row_description,
+        reference_number=payment_reference,
+        sender_name=payment_sender_name,
+        payment_amount=amount,
+        payment_date=payment_date,
+        remaining_balance=row_remaining_balance,
+        status=row_status,
+        drive_link=drive_link,
+        row_id=f'{item_id}__row1',
+        party_key=row_party_key,
+        source_doc_id=source_doc_id,
+        debt_row_id='',
+        tax_number=row_tax_number,
+        allocation_id='',
+        spreadsheet=spreadsheet,
+    ))
 
     return visible_rows, allocation_rows, party_cards
 
@@ -5370,6 +5332,7 @@ def ensure_summary_tab_exists(spreadsheet_id: Optional[str] = None) -> None:
 from app.services.accounting import canonical_store as _canonical_store
 
 _ACTIVE_WORKBOOK_TABS = ["📊 Özet", *_VISIBLE_TABS]
+_RESETTABLE_WORKBOOK_TABS = ["📊 Özet", *_VISIBLE_TABS, "__Ödeme_Dağıtımları"]
 _AUTHORITATIVE_FIELDS: dict[str, tuple[str, ...]] = {
     "Masraf Kayıtları": ("Kategori", "Alıcı / Tedarikçi", "Açıklama", "Belge No / Referans"),
     "Banka Ödemeleri": ("Alıcı / Tedarikçi", "Açıklama", "Referans No", "Gönderen"),
@@ -5579,17 +5542,18 @@ def _build_shipment_projection_rows(documents: list[_canonical_store.StoredDocum
 def _build_payment_projection_rows_from_documents(
     documents: list[_canonical_store.StoredDocument],
     debt_state: list[dict[str, object]],
-) -> tuple[list[list[object]], dict[str, str]]:
+) -> tuple[list[list[object]], dict[str, str], list[list[object]]]:
     overrides_by_doc_id = _canonical_store.override_map_for_tab("Banka Ödemeleri")
-    rows: list[list[object]] = []
+    rows: list[list] = []
     hashes: dict[str, str] = {}
+    allocation_rows: list[list[object]] = []
 
     for document in documents:
         if document.category not in {DocumentCategory.ODEME_DEKONTU, DocumentCategory.CEK}:
             continue
         overrides = overrides_by_doc_id.get(document.source_doc_id, {})
         record = _payment_record_with_overrides(document.record, overrides)
-        visible_rows, _, _ = _build_payment_projection_rows(
+        visible_rows, built_allocation_rows, _ = _build_payment_projection_rows(
             record=record,
             category=document.category,
             item_id=document.source_doc_id,
@@ -5598,16 +5562,14 @@ def _build_payment_projection_rows_from_documents(
         )
         if not visible_rows:
             continue
-        visible_rows = [
-            _apply_authoritative_overrides("Banka Ödemeleri", row, overrides_by_doc_id, document.source_doc_id)
-            for row in visible_rows
-        ]
-        rows.extend(visible_rows)
+        row = _apply_authoritative_overrides("Banka Ödemeleri", visible_rows[0], overrides_by_doc_id, document.source_doc_id)
+        rows.append(row)
+        allocation_rows.extend(built_allocation_rows)
         hashes[document.source_doc_id] = _authoritative_hash(
-            _authoritative_values_from_row("Banka Ödemeleri", visible_rows[0])
+            _authoritative_values_from_row("Banka Ödemeleri", row)
         )
 
-    return rows, hashes
+    return rows, hashes, allocation_rows
 
 
 def _build_expense_projection_rows(
@@ -5658,7 +5620,7 @@ def _build_expense_projection_rows(
 def _build_visible_projection_snapshot() -> tuple[dict[str, list[list[object]]], dict[str, dict[str, str]]]:
     documents = _canonical_store.list_documents()
     debt_state = _build_projection_debt_state(documents)
-    payment_rows, payment_hashes = _build_payment_projection_rows_from_documents(documents, debt_state)
+    payment_rows, payment_hashes, allocation_rows = _build_payment_projection_rows_from_documents(documents, debt_state)
     expense_rows, expense_hashes = _build_expense_projection_rows(debt_state)
     invoice_rows, invoice_hashes = _build_invoice_projection_rows(documents)
     shipment_rows, shipment_hashes = _build_shipment_projection_rows(documents)
@@ -5668,6 +5630,7 @@ def _build_visible_projection_snapshot() -> tuple[dict[str, list[list[object]]],
         "Banka Ödemeleri": payment_rows,
         "Faturalar": invoice_rows,
         "Sevk Fişleri": shipment_rows,
+        "__Ödeme_Dağıtımları": allocation_rows,
     }
     hashes_by_tab = {
         "Masraf Kayıtları": expense_hashes,
@@ -5694,15 +5657,16 @@ def _ensure_tab_exists_for_projection(sh, tab_name: str):
 
 def _write_visible_projection_rows(sh, rows_by_tab: dict[str, list[list[object]]]) -> int:
     request_count = 0
-    for tab_name in _projection_target_tabs():
+    for tab_name, rows in rows_by_tab.items():
         ws = _ensure_tab_exists_for_projection(sh, tab_name)
         if _trimmed_row(_row_values(ws, 1)) != _headers(tab_name):
             _setup_worksheet(ws, tab_name, lightweight=True)
         else:
             _ensure_tab_total_row(ws, tab_name)
             _apply_lightweight_layout(ws, tab_name)
+        if tab_name in _HIDDEN_TABS:
+            _set_worksheet_hidden(ws, hidden=True)
 
-        rows = rows_by_tab.get(tab_name, [])
         _clear_projection_tab_rows(ws, tab_name, len(rows))
         request_count += 1
         if rows:
@@ -6203,7 +6167,7 @@ def reset_current_month_spreadsheet_data(*, spreadsheet_id: Optional[str] = None
     with _lock:
         sh = _open_spreadsheet_by_key(client, spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
         touched_tabs = 0
-        for tab_name in _ACTIVE_WORKBOOK_TABS:
+        for tab_name in _RESETTABLE_WORKBOOK_TABS:
             ws = _ensure_tab_exists_for_projection(sh, tab_name)
             touched_tabs += 1
             if tab_name == "📊 Özet":

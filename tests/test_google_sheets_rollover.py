@@ -350,6 +350,7 @@ def test_build_payment_projection_rows_marks_borc_yok_when_party_matches_but_ope
     )
 
     assert allocations == []
+    assert len(rows) == 1
     assert cards[0]["party_key"] == "tax:4540007255"
     assert rows[0][6] == 0
     assert rows[0][7] == "Borç Yok"
@@ -386,12 +387,16 @@ def test_build_payment_projection_rows_uses_receivable_side_for_cheque_matching(
         drive_link=None,
     )
 
-    assert allocations == []
+    assert len(rows) == 1
+    assert len(allocations) == 1
     assert cards[0]["party_key"] == "tax:4960863229"
     assert rows[0][0] == "KANSA GRUP GIDA TİCARET VE SANAYİ LİMİTED ŞİRKETİ"
+    assert rows[0][4] == 4000.0
     assert rows[0][6] == 4204.51
     assert rows[0][7] == "Kısmi"
     assert rows[0][10] == "tax:4960863229"
+    assert allocations[0][2] == "receivable:recv-1"
+    assert allocations[0][7] == 4000.0
 
 
 def test_build_payment_projection_rows_allocates_negative_outgoing_payment_by_absolute_amount():
@@ -420,12 +425,86 @@ def test_build_payment_projection_rows_allocates_negative_outgoing_payment_by_ab
         drive_link=None,
     )
 
+    assert len(rows) == 1
     assert cards[0]["party_key"] == "name:abc market"
     assert allocations[0][7] == 40.0
     assert rows[0][4] == -40.0
     assert rows[0][6] == 60.0
     assert rows[0][7] == "Kısmi"
 
+
+def test_build_payment_projection_rows_keeps_single_visible_row_for_multi_debt_allocation():
+    rows, allocations, cards = google_sheets._build_payment_projection_rows(
+        record=BillRecord(
+            document_date="2026-03-31",
+            total_amount=8008.37,
+            tax_number="4540007255",
+            recipient_name="MUZAFFER KARAKAŞ",
+            sender_name="H.KARAKAYA İNŞ.TİC.SAN.LTD.ŞTİ.",
+            description="GİDEN FAST",
+        ),
+        category=DocumentCategory.ODEME_DEKONTU,
+        item_id="odeme-multi-1",
+        debt_state=[
+            {
+                "row_id": "debt-1",
+                "party_key": "tax:4540007255",
+                "display_name": "ŞEMSETTİN YILMAZ",
+                "tax_number": "4540007255.0",
+                "date": "2026-03-18",
+                "original_amount": 3857.94,
+                "remaining_amount": 3857.94,
+                "aliases": (),
+                "sort_index": 0,
+            },
+            {
+                "row_id": "debt-2",
+                "party_key": "tax:4540007255",
+                "display_name": "ŞEMSETTİN YILMAZ",
+                "tax_number": "4540007255.0",
+                "date": "2026-03-28",
+                "original_amount": 8204.51,
+                "remaining_amount": 8204.51,
+                "aliases": (),
+                "sort_index": 1,
+            },
+        ],
+        drive_link=None,
+    )
+
+    assert len(rows) == 1
+    assert len(allocations) == 2
+    assert cards[0]["party_key"] == "tax:4540007255"
+    assert rows[0][0] == "ŞEMSETTİN YILMAZ"
+    assert rows[0][1] == "GİDEN FAST | 2 borca dağıtıldı"
+    assert rows[0][4] == 8008.37
+    assert rows[0][6] == 4054.08
+    assert rows[0][7] == "Kısmi"
+    assert rows[0][10] == "tax:4540007255"
+    assert allocations[0][2] == "debt-1"
+    assert allocations[1][2] == "debt-2"
+    assert allocations[0][7] == 3857.94
+    assert allocations[1][7] == 4150.43
+
+
+
+def test_build_visible_projection_snapshot_includes_hidden_payment_allocations(monkeypatch):
+    monkeypatch.setattr(google_sheets._canonical_store, "list_documents", lambda: ["doc"])
+    monkeypatch.setattr(google_sheets, "_build_projection_debt_state", lambda documents: [{"row_id": "debt-1"}])
+    monkeypatch.setattr(
+        google_sheets,
+        "_build_payment_projection_rows_from_documents",
+        lambda documents, debt_state: ([['payment-row']], {'doc-1': 'hash-1'}, [['alloc-row']]),
+    )
+    monkeypatch.setattr(google_sheets, "_build_expense_projection_rows", lambda debt_state: ([['expense-row']], {'exp-1': 'hash-exp'}))
+    monkeypatch.setattr(google_sheets, "_build_invoice_projection_rows", lambda documents: ([['invoice-row']], {'inv-1': 'hash-inv'}))
+    monkeypatch.setattr(google_sheets, "_build_shipment_projection_rows", lambda documents: ([['shipment-row']], {'ship-1': 'hash-ship'}))
+
+    rows_by_tab, hashes_by_tab = google_sheets._build_visible_projection_snapshot()
+
+    assert rows_by_tab['Banka Ödemeleri'] == [['payment-row']]
+    assert rows_by_tab['__Ödeme_Dağıtımları'] == [['alloc-row']]
+    assert hashes_by_tab['Banka Ödemeleri'] == {'doc-1': 'hash-1'}
 
 
 def test_remap_legacy_fatura_row_replaces_sparse_bank_columns_with_dense_fields():
