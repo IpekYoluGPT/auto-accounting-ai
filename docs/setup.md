@@ -90,8 +90,9 @@ In your service's **Variables** tab, add all variables from `.env.example`:
 | `PERISKOPE_SIGNING_KEY` | HMAC signing key from Periskope Webhooks settings |
 | `PERISKOPE_TOOL_TOKEN` | Shared secret for custom tool endpoints |
 | `GEMINI_API_KEY` | Google Gemini API key |
-| `GEMINI_CLASSIFIER_MODEL` | Defaults to `gemini-flash-lite-latest` |
-| `GEMINI_EXTRACTOR_MODEL` | Defaults to `gemini-flash-lite-latest` |
+| `GEMINI_CLASSIFIER_MODEL` | Defaults to `gemini-3.1-pro-preview` |
+| `GEMINI_EXTRACTOR_MODEL` | Defaults to `gemini-3.1-pro-preview` |
+| `GEMINI_VALIDATION_MODEL` | Defaults to `gemini-3.1-pro-preview` |
 | `STORAGE_DIR` | `/app/storage` (Railway persistent volume) |
 | `LOG_LEVEL` | `INFO` |
 

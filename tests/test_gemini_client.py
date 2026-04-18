@@ -81,7 +81,7 @@ def test_generate_structured_content_uses_configured_fallback_model(monkeypatch)
         return SampleSchema(value=model)
 
     monkeypatch.setattr(gemini_client, "_call_model", fake_call_model)
-    monkeypatch.setattr(gemini_client.settings, "gemini_validation_model", "gemini-2.5-pro")
+    monkeypatch.setattr(gemini_client.settings, "gemini_validation_model", "gemini-3.1-pro-preview")
     monkeypatch.setattr(gemini_client.settings, "gemini_extractor_model", "gemini-primary")
     monkeypatch.setattr(gemini_client.settings, "gemini_classifier_model", "gemini-primary")
 
@@ -92,5 +92,5 @@ def test_generate_structured_content_uses_configured_fallback_model(monkeypatch)
         thinking_level="low",
     )
 
-    assert result == SampleSchema(value="gemini-2.5-pro")
-    assert calls == ["gemini-primary", "gemini-2.5-pro"]
+    assert result == SampleSchema(value="gemini-3.1-pro-preview")
+    assert calls == ["gemini-primary", "gemini-3.1-pro-preview"]
