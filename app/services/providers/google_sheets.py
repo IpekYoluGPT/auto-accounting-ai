@@ -18,6 +18,7 @@ import hashlib
 import json
 import shutil
 import ssl
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -652,80 +653,36 @@ def _month_sheet_title() -> str:
 
 
 def _next_month_rollover_at(now: datetime | None = None) -> datetime:
-    current = now or _now()
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=_get_business_timezone())
+    from app.services.providers import google_sheets_scheduler
 
-    year = current.year
-    month = current.month + 1
-    if month == 13:
-        month = 1
-        year += 1
-
-    return current.replace(
-        year=year,
-        month=month,
-        day=1,
-        hour=0,
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
+    return google_sheets_scheduler.next_month_rollover_at(sys.modules[__name__], now)
 
 
 def _seconds_until_next_month_rollover(now: datetime | None = None) -> float:
-    current = now or _now()
-    rollover_at = _next_month_rollover_at(current)
-    return max((rollover_at - current).total_seconds(), 1.0)
+    from app.services.providers import google_sheets_scheduler
+
+    return google_sheets_scheduler.seconds_until_next_month_rollover(sys.modules[__name__], now)
 
 
 # ─── Client initialisation ────────────────────────────────────────────────────
 
 
 def _get_client():
-    global _gspread_client, _creds
-    if _gspread_client is not None:
-        return _gspread_client
-    if not settings.google_service_account_json:
-        logger.debug("GOOGLE_SERVICE_ACCOUNT_JSON not set; Google Sheets disabled.")
-        return None
-    try:
-        import gspread
-        from google.oauth2.service_account import Credentials
+    from app.services.providers import google_sheets_clients
 
-        raw_json = base64.b64decode(settings.google_service_account_json).decode("utf-8")
-        creds_dict = json.loads(raw_json)
-        creds = Credentials.from_service_account_info(creds_dict, scopes=_SCOPES)
-        _creds = creds  # store for Drive service reuse
-        _gspread_client = gspread.authorize(creds)
-        logger.info(
-            "Google Sheets client initialised (service account: %s)",
-            creds_dict.get("client_email", "?"),
-        )
-        return _gspread_client
-    except Exception as exc:
-        logger.error("Failed to initialise Google Sheets client: %s", exc, exc_info=True)
-        return None
+    return google_sheets_clients.get_client(settings=settings, logger=logger, scopes=_SCOPES)
 
 
 def _get_drive_service(*, force_refresh: bool = False):
     """Return a Google Drive API v3 service, sharing credentials with gspread."""
-    global _drive_service
-    if force_refresh:
-        _drive_service = None
-    if _drive_service is not None:
-        return _drive_service
-    _get_client()  # ensure _creds is populated
-    if _creds is None:
-        return None
-    try:
-        from googleapiclient.discovery import build
-        _drive_service = build("drive", "v3", credentials=_creds, cache_discovery=False)
-        logger.debug("Google Drive service initialised.")
-        return _drive_service
-    except Exception as exc:
-        logger.error("Failed to initialise Drive service: %s", exc, exc_info=True)
-        return None
+    from app.services.providers import google_sheets_clients
+
+    return google_sheets_clients.get_drive_service(
+        settings=settings,
+        logger=logger,
+        scopes=_SCOPES,
+        force_refresh=force_refresh,
+    )
 
 
 def _get_sheets_service():
@@ -734,20 +691,9 @@ def _get_sheets_service():
     Used to CREATE spreadsheets — the Sheets API creates native Workspace files
     which do not require Drive storage quota (unlike the Drive Files API).
     """
-    global _sheets_service
-    if _sheets_service is not None:
-        return _sheets_service
-    _get_client()  # ensure _creds is populated
-    if _creds is None:
-        return None
-    try:
-        from googleapiclient.discovery import build
-        _sheets_service = build("sheets", "v4", credentials=_creds, cache_discovery=False)
-        logger.debug("Google Sheets API service initialised.")
-        return _sheets_service
-    except Exception as exc:
-        logger.error("Failed to initialise Sheets API service: %s", exc, exc_info=True)
-        return None
+    from app.services.providers import google_sheets_clients
+
+    return google_sheets_clients.get_sheets_service(settings=settings, logger=logger, scopes=_SCOPES)
 
 
 def _get_oauth_creds():
@@ -756,71 +702,28 @@ def _get_oauth_creds():
     These credentials are used ONLY for creating new files (spreadsheets, folders)
     because service accounts cannot create Google Workspace files.
     """
-    global _oauth_creds
-    if _oauth_creds is not None:
-        return _oauth_creds
+    from app.services.providers import google_sheets_clients
 
-    if (
-        not settings.google_oauth_client_id
-        or not settings.google_oauth_client_secret
-        or not settings.google_oauth_refresh_token
-    ):
-        return None
-
-    try:
-        from google.oauth2.credentials import Credentials
-
-        _oauth_creds = Credentials(
-            token=None,
-            refresh_token=settings.google_oauth_refresh_token,
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=settings.google_oauth_client_id,
-            client_secret=settings.google_oauth_client_secret,
-            scopes=_SCOPES,
-        )
-        logger.info("OAuth2 user credentials initialised for file creation.")
-        return _oauth_creds
-    except Exception as exc:
-        logger.error("Failed to build OAuth2 credentials: %s", exc, exc_info=True)
-        return None
+    return google_sheets_clients.get_oauth_creds(settings=settings, logger=logger, scopes=_SCOPES)
 
 
 def _get_oauth_drive_service(*, force_refresh: bool = False):
     """Return a Google Drive API v3 service using OAuth2 user credentials."""
-    global _oauth_drive_service
-    if force_refresh:
-        _oauth_drive_service = None
-    if _oauth_drive_service is not None:
-        return _oauth_drive_service
-    creds = _get_oauth_creds()
-    if creds is None:
-        return None
-    try:
-        from googleapiclient.discovery import build
-        _oauth_drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
-        logger.debug("OAuth Drive service initialised.")
-        return _oauth_drive_service
-    except Exception as exc:
-        logger.error("Failed to initialise OAuth Drive service: %s", exc, exc_info=True)
-        return None
+    from app.services.providers import google_sheets_clients
+
+    return google_sheets_clients.get_oauth_drive_service(
+        settings=settings,
+        logger=logger,
+        scopes=_SCOPES,
+        force_refresh=force_refresh,
+    )
 
 
 def _get_oauth_sheets_service():
     """Return a Google Sheets API v4 service using OAuth2 user credentials."""
-    global _oauth_sheets_service
-    if _oauth_sheets_service is not None:
-        return _oauth_sheets_service
-    creds = _get_oauth_creds()
-    if creds is None:
-        return None
-    try:
-        from googleapiclient.discovery import build
-        _oauth_sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
-        logger.debug("OAuth Sheets API service initialised.")
-        return _oauth_sheets_service
-    except Exception as exc:
-        logger.error("Failed to initialise OAuth Sheets service: %s", exc, exc_info=True)
-        return None
+    from app.services.providers import google_sheets_clients
+
+    return google_sheets_clients.get_oauth_sheets_service(settings=settings, logger=logger, scopes=_SCOPES)
 
 
 def _is_rate_limit_exception(exc: Exception) -> bool:
@@ -2520,70 +2423,22 @@ def _rewrite_drive_cells(ws, tab_name: str, row_formulas: list[tuple[int, str]])
 
 
 def force_rewrite_drive_links(*, spreadsheet_id: Optional[str] = None, target_tabs: set[str] | None = None) -> dict[str, int]:
-    client = _get_client()
-    if client is None:
-        raise RuntimeError("Google Sheets client unavailable.")
+    from app.services.providers import google_sheets_audit
 
-    with _lock:
-        sh = _open_spreadsheet_by_key(client, spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
-        resolved_tabs = []
-        if target_tabs:
-            for tab_name in target_tabs:
-                canonical = _canonical_tab_name(tab_name)
-                if canonical not in resolved_tabs:
-                    resolved_tabs.append(canonical)
-        else:
-            for tab_name in _TABS:
-                if _header_index(tab_name, _VISIBLE_DRIVE_LINK_HEADER) is None:
-                    continue
-                if _tab_spec(tab_name).hidden_tab:
-                    continue
-                resolved_tabs.append(tab_name)
-
-        raw_drive_links = _raw_document_drive_link_map(sh)
-        repaired_by_tab: dict[str, int] = {}
-        for tab_name in resolved_tabs:
-            if _header_index(tab_name, _VISIBLE_DRIVE_LINK_HEADER) is None:
-                repaired_by_tab[tab_name] = 0
-                continue
-
-            ws = _ensure_tab_exists_for_projection(sh, tab_name)
-            row_formulas: list[tuple[int, str]] = []
-            for row_number, row_map in _iter_visible_row_maps(ws, tab_name, value_render_option='FORMULA'):
-                url = _extract_drive_link_from_cell_value(row_map.get(_VISIBLE_DRIVE_LINK_HEADER))
-                if not url:
-                    source_doc_id = _coalesce_text(row_map.get(_HIDDEN_SOURCE_DOC_ID_HEADER))
-                    url = raw_drive_links.get(source_doc_id, '')
-                if not url:
-                    continue
-                row_formulas.append((row_number, _drive_cell(url, spreadsheet=ws.spreadsheet)))
-
-            repaired = _rewrite_drive_cells(ws, tab_name, row_formulas)
-            repaired_by_tab[tab_name] = repaired
-            if repaired:
-                logger.info("Force-rewrote %d Drive link cell(s) on '%s'.", repaired, tab_name)
-
-        return repaired_by_tab
+    return google_sheets_audit.force_rewrite_drive_links(
+        sys.modules[__name__],
+        spreadsheet_id=spreadsheet_id,
+        target_tabs=target_tabs,
+    )
 
 
 def hide_nonvisible_tabs(*, spreadsheet_id: Optional[str] = None) -> dict[str, int]:
-    client = _get_client()
-    if client is None:
-        raise RuntimeError("Google Sheets client unavailable.")
+    from app.services.providers import google_sheets_audit
 
-    with _lock:
-        sh = _open_spreadsheet_by_key(client, spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
-        hidden_counts = {"canonical_hidden": 0, "ignored_orphans": 0}
-        for ws in _list_worksheets(sh):
-            title = getattr(ws, "title", "")
-            if title in _TABS and _tab_spec(title).hidden_tab:
-                _set_worksheet_hidden(ws, hidden=True)
-                hidden_counts["canonical_hidden"] += 1
-                continue
-            if _is_ignored_orphan_title(title):
-                _set_worksheet_hidden(ws, hidden=True)
-                hidden_counts["ignored_orphans"] += 1
-        return hidden_counts
+    return google_sheets_audit.hide_nonvisible_tabs(
+        sys.modules[__name__],
+        spreadsheet_id=spreadsheet_id,
+    )
 
 
 def audit_current_month_spreadsheet(
@@ -2593,19 +2448,15 @@ def audit_current_month_spreadsheet(
     target_tabs: set[str] | None = None,
     refresh_formatting: bool = False,
 ) -> dict[str, object]:
-    client = _get_client()
-    if client is None:
-        raise RuntimeError("Google Sheets client unavailable.")
+    from app.services.providers import google_sheets_audit
 
-    with _lock:
-        sh = _open_spreadsheet_by_key(client, spreadsheet_id) if spreadsheet_id else _get_or_create_spreadsheet(client)
-        findings = _audit_spreadsheet_layout(sh, repair=repair, target_tabs=target_tabs, refresh_formatting=refresh_formatting)
-        return {
-            "spreadsheet_id": sh.id,
-            "month_key": _month_key(),
-            "findings": findings,
-            "queue": queue_status(),
-        }
+    return google_sheets_audit.audit_current_month_spreadsheet(
+        sys.modules[__name__],
+        spreadsheet_id=spreadsheet_id,
+        repair=repair,
+        target_tabs=target_tabs,
+        refresh_formatting=refresh_formatting,
+    )
 
 
 def recommended_audit_tabs_for_test_drift(*, action: str, tab_name: str | None = None) -> list[str]:
@@ -5275,42 +5126,15 @@ def _monthly_rollover_worker(stop_event: threading.Event) -> None:
 
 
 def start_monthly_rollover_scheduler() -> None:
-    if not current_pipeline_context().is_production:
-        return
+    from app.services.providers import google_sheets_scheduler
 
-    global _rollover_thread, _rollover_stop_event
-
-    with _rollover_lock:
-        if _rollover_thread is not None and _rollover_thread.is_alive():
-            return
-
-        _rollover_stop_event = threading.Event()
-        _rollover_thread = threading.Thread(
-            target=_monthly_rollover_worker,
-            args=(_rollover_stop_event,),
-            name="google-sheets-monthly-rollover",
-            daemon=True,
-        )
-        _rollover_thread.start()
-        logger.info(
-            "Started Google Sheets monthly rollover scheduler (timezone=%s).",
-            settings.business_timezone,
-        )
+    google_sheets_scheduler.start_monthly_rollover_scheduler(sys.modules[__name__])
 
 
 def stop_monthly_rollover_scheduler() -> None:
-    global _rollover_thread, _rollover_stop_event
+    from app.services.providers import google_sheets_scheduler
 
-    with _rollover_lock:
-        stop_event = _rollover_stop_event
-        thread = _rollover_thread
-        _rollover_stop_event = None
-        _rollover_thread = None
-
-    if stop_event is not None:
-        stop_event.set()
-    if thread is not None and thread.is_alive():
-        thread.join(timeout=1.0)
+    google_sheets_scheduler.stop_monthly_rollover_scheduler(sys.modules[__name__])
 
 
 def ensure_summary_tab_exists(spreadsheet_id: Optional[str] = None) -> None:
@@ -5895,233 +5719,52 @@ def queue_pending_document_upload(
     source_doc_ids: list[str] | None = None,
     source_message_id: str | None = None,
 ) -> None:
-    normalized_targets = [_normalize_drive_link_target(target) for target in (targets or [])]
-    normalized_doc_ids = [str(source_doc_id or "").strip() for source_doc_id in (source_doc_ids or []) if str(source_doc_id or "").strip()]
-    if not normalized_targets and not normalized_doc_ids:
-        return
+    from app.services.providers import google_sheets_drive
 
-    normalized_source_message_id = _root_source_message_id(source_message_id)
-    storage_guard.prune_stale_transient_storage()
-    if storage_guard.should_stop_payload_writes():
-        logger.warning(
-            "Skipping pending Drive upload queue for message id=%s because disk pressure forbids transient writes.",
-            normalized_source_message_id or "?",
-        )
-        return
-
-    with _pending_drive_uploads_lock:
-        items = _load_pending_drive_uploads()
-        if source_message_id:
-            for existing in items:
-                if (
-                    str(existing.get("source_message_id") or "") == normalized_source_message_id
-                    and str(existing.get("filename") or "") == filename
-                    and str(existing.get("mime_type") or "") == mime_type
-                ):
-                    known_targets = {
-                        _drive_link_target_key(target)
-                        for target in existing.get("targets", [])
-                    }
-                    for target in normalized_targets:
-                        target_key = _drive_link_target_key(target)
-                        if target_key not in known_targets:
-                            existing.setdefault("targets", []).append(target)
-                            known_targets.add(target_key)
-                    known_doc_ids = set(str(source_doc_id or "").strip() for source_doc_id in existing.get("source_doc_ids", []))
-                    for source_doc_id in normalized_doc_ids:
-                        if source_doc_id not in known_doc_ids:
-                            existing.setdefault("source_doc_ids", []).append(source_doc_id)
-                            known_doc_ids.add(source_doc_id)
-                    _save_pending_drive_uploads(items)
-                    start_pending_drive_upload_worker()
-                    return
-
-    pending_id = uuid4().hex
-    payload_path = _pending_drive_uploads_dir() / f"{pending_id}.bin"
-    payload_path.write_bytes(file_bytes)
-    item = {
-        "id": pending_id,
-        "filename": filename,
-        "mime_type": mime_type,
-        "payload_path": str(payload_path),
-        "targets": normalized_targets,
-        "source_doc_ids": normalized_doc_ids,
-        "source_message_id": normalized_source_message_id,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "attempts": 0,
-    }
-
-    with _pending_drive_uploads_lock:
-        items = _load_pending_drive_uploads()
-        items.append(item)
-        _save_pending_drive_uploads(items)
-
-    start_pending_drive_upload_worker()
+    google_sheets_drive.queue_pending_document_upload(
+        sys.modules[__name__],
+        file_bytes=file_bytes,
+        filename=filename,
+        mime_type=mime_type,
+        targets=targets,
+        source_doc_ids=source_doc_ids,
+        source_message_id=source_message_id,
+    )
 
 
 def process_pending_document_uploads(*, max_items: int | None = None) -> int:
-    processed = 0
+    from app.services.providers import google_sheets_drive
 
-    while True:
-        if max_items is not None and processed >= max_items:
-            break
-
-        with _pending_drive_uploads_lock:
-            items = _load_pending_drive_uploads()
-            if not items:
-                break
-            item = dict(items[0])
-
-        payload_path = Path(str(item.get("payload_path", "")))
-        if not payload_path.exists():
-            with _pending_drive_uploads_lock:
-                items = [
-                    existing for existing in _load_pending_drive_uploads()
-                    if str(existing.get("id") or "") != str(item.get("id") or "")
-                ]
-                _save_pending_drive_uploads(items)
-            continue
-
-        drive_link = str(item.get("drive_link") or "").strip()
-        try:
-            if not drive_link:
-                drive_link = upload_document(
-                    payload_path.read_bytes(),
-                    filename=str(item.get("filename") or payload_path.name),
-                    mime_type=str(item.get("mime_type") or "application/octet-stream"),
-                )
-            if not drive_link:
-                raise RuntimeError("Drive upload returned no link.")
-
-            for source_doc_id in item.get("source_doc_ids", []):
-                _canonical_store.set_drive_link(str(source_doc_id), drive_link)
-            for target in item.get("targets", []):
-                _write_drive_link_to_target(target, drive_link)
-
-            with _pending_drive_uploads_lock:
-                items = [
-                    existing for existing in _load_pending_drive_uploads()
-                    if str(existing.get("id") or "") != str(item.get("id") or "")
-                ]
-                _save_pending_drive_uploads(items)
-            payload_path.unlink(missing_ok=True)
-            processed += 1
-        except Exception as exc:
-            with _pending_drive_uploads_lock:
-                items = _load_pending_drive_uploads()
-                for existing in items:
-                    if str(existing.get("id") or "") != str(item.get("id") or ""):
-                        continue
-                    existing["attempts"] = int(existing.get("attempts", 0)) + 1
-                    existing["last_error"] = str(exc)
-                    if drive_link:
-                        existing["drive_link"] = drive_link
-                    break
-                _save_pending_drive_uploads(items)
-            logger.warning(
-                "Pending Drive upload retry failed for message id=%s: %s",
-                item.get("source_message_id") or "?",
-                exc,
-            )
-            break
-
-    return processed
+    return google_sheets_drive.process_pending_document_uploads(
+        sys.modules[__name__],
+        max_items=max_items,
+    )
 
 
 def queue_status() -> dict[str, int]:
-    status: dict[str, int | str] = {
-        "pending_sheet_appends": _canonical_store.pending_projection_count(),
-        "pending_projection_rows": _canonical_store.pending_projection_count(),
-        "pending_drive_uploads": len(_load_pending_drive_uploads()),
-        "pending_drive_link_backfills": len(_load_pending_drive_uploads()),
-        "sheet_flush_count": int(_canonical_store.get_state("sheet_flush_count") or "0"),
-        "sheet_write_request_count": int(_canonical_store.get_state("sheet_write_request_count") or "0"),
-        "last_visible_flush_at": _canonical_store.last_visible_flush_at() or "",
-        "last_override_sync_at": _canonical_store.last_override_sync_at() or "",
-    }
-    try:
-        from app.services.accounting import inbound_queue
+    from app.services.providers import google_sheets_projection
 
-        status.update(inbound_queue.queue_status())
-    except Exception:
-        status.setdefault("pending_inbound_jobs", 0)
-        status.setdefault("retry_waiting_inbound_jobs", 0)
-        status.setdefault("failed_inbound_jobs", 0)
-        status.setdefault("inbound_payload_storage_bytes", 0)
-
-    try:
-        status.update(storage_guard.storage_snapshot().as_dict())
-    except Exception:
-        status.setdefault("disk_total_bytes", 0)
-        status.setdefault("disk_used_bytes", 0)
-        status.setdefault("disk_free_bytes", 0)
-        status.setdefault("total_managed_storage_bytes", 0)
-        status.setdefault("disk_pressure_state", "unknown")
-    return status  # type: ignore[return-value]
+    return google_sheets_projection.queue_status(sys.modules[__name__])
 
 
 def has_pending_visible_appends(*, message_id: str, chat_id: str | None = None, platform: str | None = None) -> bool:
-    if _canonical_store.feedback_pending_for_message(message_id=message_id, chat_id=chat_id, platform=platform):
-        return True
+    from app.services.providers import google_sheets_projection
 
-    normalized_message_id = (message_id or "").strip()
-    if not normalized_message_id:
-        return False
-
-    with _pending_sheet_appends_lock:
-        items = _load_pending_sheet_appends()
-    for item in items:
-        if not bool(item.get("is_visible_tab")):
-            continue
-        if str(item.get("feedback_message_id") or "").strip() != normalized_message_id:
-            continue
-        if chat_id is not None and str(item.get("feedback_chat_id") or "").strip() != chat_id:
-            continue
-        if platform is not None and str(item.get("feedback_platform") or "").strip() != platform:
-            continue
-        return True
-    return False
+    return google_sheets_projection.has_pending_visible_appends(
+        sys.modules[__name__],
+        message_id=message_id,
+        chat_id=chat_id,
+        platform=platform,
+    )
 
 
 def process_pending_sheet_appends(*, max_items: int | None = None) -> int:
-    _migrate_legacy_pending_sheet_appends_to_canonical_store()
-    pending_doc_ids = _canonical_store.pending_projection_doc_ids(limit=max_items)
-    if not pending_doc_ids:
-        return 0
+    from app.services.providers import google_sheets_projection
 
-    client = _get_client()
-    if client is None:
-        raise RuntimeError("Google Sheets client unavailable for projection flush.")
-
-    rows_by_tab, hashes_by_tab = _build_visible_projection_snapshot()
-    try:
-        with _lock:
-            sh = _get_or_create_spreadsheet(client)
-            request_count = _write_visible_projection_rows(sh, rows_by_tab)
-    except Exception as exc:
-        if _is_rate_limit_exception(exc):
-            logger.warning(
-                "Projection flush deferred by Google Sheets rate limiting for %d document(s): %s",
-                len(pending_doc_ids),
-                exc,
-            )
-            return 0
-
-        with _lock:
-            sh = _get_or_create_spreadsheet(client)
-            _ensure_projection_workbook_layout(sh)
-            request_count = _write_visible_projection_rows(sh, rows_by_tab)
-
-    for tab_name, hashes in hashes_by_tab.items():
-        _canonical_store.update_last_sheet_hashes(tab_name, hashes)
-    _canonical_store.record_projection_flush(request_count=request_count, processed_doc_ids=pending_doc_ids)
-    _dispatch_projection_success_feedback(pending_doc_ids)
-    logger.info(
-        "Projection flush completed for %d document(s) with %d Sheets write request(s).",
-        len(pending_doc_ids),
-        request_count,
+    return google_sheets_projection.process_pending_sheet_appends(
+        sys.modules[__name__],
+        max_items=max_items,
     )
-    return len(pending_doc_ids)
 
 
 def _projection_worker_loop() -> None:
@@ -6144,19 +5787,9 @@ def _projection_worker_loop() -> None:
 
 
 def start_pending_sheet_append_worker() -> None:
-    if not current_pipeline_context().is_production:
-        return
+    from app.services.providers import google_sheets_projection
 
-    global _pending_sheet_worker_thread
-    with _pending_sheet_worker_lock:
-        if _pending_sheet_worker_thread is not None and _pending_sheet_worker_thread.is_alive():
-            return
-        _pending_sheet_worker_thread = threading.Thread(
-            target=_projection_worker_loop,
-            name="google-sheets-projection-worker",
-            daemon=True,
-        )
-        _pending_sheet_worker_thread.start()
+    google_sheets_projection.start_pending_sheet_append_worker(sys.modules[__name__])
 
 
 def reset_current_month_spreadsheet_data(*, spreadsheet_id: Optional[str] = None) -> int:
@@ -6190,73 +5823,31 @@ def append_record(
     pending_document_mime_type: str | None = None,
     feedback_target: dict[str, str] | None = None,
 ) -> list[dict[str, str | int]]:
-    try:
-        normalized_category = DocumentCategory.FATURA if category == DocumentCategory.IADE else category
-        source_doc_id = str(record.source_message_id or uuid4().hex).strip()
-        _canonical_store.upsert_document(
-            source_doc_id=source_doc_id,
-            record=record,
-            category=normalized_category,
-            return_source_category=category if category == DocumentCategory.IADE else None,
-            drive_link=drive_link,
-            feedback_target=feedback_target,
-            projection_reason="append_record",
-        )
-        if not drive_link and pending_document_bytes:
-            queue_pending_document_upload(
-                file_bytes=pending_document_bytes,
-                filename=pending_document_filename or (record.source_filename or f"{source_doc_id}.bin"),
-                mime_type=pending_document_mime_type or "application/octet-stream",
-                targets=[],
-                source_doc_ids=[source_doc_id],
-                source_message_id=record.source_message_id or source_doc_id,
-            )
-        start_pending_sheet_append_worker()
-        return [{"source_doc_id": source_doc_id, "category": normalized_category.value}]
-    except Exception as exc:
-        logger.error(
-            "Google Sheets canonical append queueing failed for category=%s message_id=%s: %s",
-            category,
-            record.source_message_id,
-            exc,
-            exc_info=True,
-        )
-        return []
+    from app.services.providers import google_sheets_projection
+
+    return google_sheets_projection.append_record(
+        sys.modules[__name__],
+        record,
+        category,
+        is_return=is_return,
+        drive_link=drive_link,
+        pending_document_bytes=pending_document_bytes,
+        pending_document_filename=pending_document_filename,
+        pending_document_mime_type=pending_document_mime_type,
+        feedback_target=feedback_target,
+    )
 
 
 def ensure_current_month_spreadsheet_ready() -> str | None:
-    client = _get_client()
-    if client is None:
-        logger.debug("Google Sheets projection bootstrap skipped; client unavailable.")
-        return None
+    from app.services.providers import google_sheets_scheduler
 
-    with _lock:
-        try:
-            sh = _get_or_create_spreadsheet(client)
-            if _was_recently_prepared(sh):
-                _audit_spreadsheet_layout(sh, repair=True, refresh_formatting=False)
-            else:
-                _ensure_projection_workbook_layout(sh)
-            logger.info("Google Sheets projection workbook is ready for %s.", _month_key())
-            return sh.id
-        except Exception as exc:
-            logger.warning("Could not prepare current month's spreadsheet: %s", exc)
-            return None
+    return google_sheets_scheduler.ensure_current_month_spreadsheet_ready(sys.modules[__name__])
 
 
 def _bootstrap_spreadsheet_tabs(sh) -> None:
-    try:
-        summary_ws = sh.sheet1
-        summary_ws.update_title("📊 Özet")
-        for tab_name in _projection_target_tabs():
-            headers = _headers(tab_name)
-            new_ws = sh.add_worksheet(title=tab_name, rows=1000, cols=len(headers) + 2)
-            _setup_worksheet(new_ws, tab_name, lightweight=True)
-        _setup_summary_tab(summary_ws, _month_label(), lightweight=True)
-        _mark_recently_prepared(sh)
-        logger.info("Bootstrapped projection tabs on new spreadsheet.")
-    except Exception as exc:
-        logger.warning("Could not bootstrap projection tabs: %s", exc)
+    from app.services.providers import google_sheets_layout
+
+    google_sheets_layout.bootstrap_projection_tabs(sys.modules[__name__], sh)
 
 
 def _safe_dimension_value(value: object, default: int = 0) -> int:

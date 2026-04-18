@@ -14,9 +14,9 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, R
 
 from app.config import settings
 from app.models.schemas import WhatsAppWebhookPayload
-from app.services.accounting import inbound_queue
+from app.services.accounting import inbound_queue, ingress_service
 from app.services.providers import whatsapp
-from app.services.accounting.intake import MessageRoute, REACTION_PROCESSING, REACTION_WARNING, process_incoming_message
+from app.services.accounting.intake import MessageRoute
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -71,55 +71,29 @@ async def receive_webhook(
 def _process_message(message, sender_name: str | None = None) -> None:
     """Process a single WhatsApp message in the background."""
     route = _resolve_message_route(message, sender_name=sender_name)
-    if message.type == "text":
-        process_incoming_message(
-            message_id=message.id,
-            msg_type="text",
-            route=route,
-            send_text=_send_meta_text_message,
-            text=message.text.body if message.text else "",
-        )
-        return
-
-    if message.type == "image" and message.image:
-        result = inbound_queue.enqueue_media_job(
-            message_id=message.id,
-            msg_type="image",
-            route=route,
-            mime_type=message.image.mime_type or "image/jpeg",
-            filename=f"{message.image.id}.jpg",
-            source_type="image",
-            media_id=message.image.id,
-        )
-        if result.status == "enqueued":
-            _safe_meta_reaction(route, REACTION_PROCESSING)
-        elif result.status == "rejected_due_to_storage":
-            _safe_meta_reaction(route, REACTION_WARNING)
-            _safe_meta_text_message(route, result.message or inbound_queue.MSG_STORAGE_PRESSURE)
-        return
-
-    if message.type == "document" and message.document:
-        result = inbound_queue.enqueue_media_job(
-            message_id=message.id,
-            msg_type="document",
-            route=route,
-            mime_type=message.document.mime_type or "application/pdf",
-            filename=message.document.filename or f"{message.document.id}.pdf",
-            source_type="document",
-            media_id=message.document.id,
-        )
-        if result.status == "enqueued":
-            _safe_meta_reaction(route, REACTION_PROCESSING)
-        elif result.status == "rejected_due_to_storage":
-            _safe_meta_reaction(route, REACTION_WARNING)
-            _safe_meta_text_message(route, result.message or inbound_queue.MSG_STORAGE_PRESSURE)
-        return
-
-    process_incoming_message(
+    ingress_service.process_or_enqueue_message(
         message_id=message.id,
         msg_type=message.type,
         route=route,
         send_text=_send_meta_text_message,
+        send_reaction=_send_meta_reaction,
+        text=message.text.body if message.text else "",
+        mime_type=(
+            message.image.mime_type if message.type == "image" and message.image else
+            message.document.mime_type if message.type == "document" and message.document else
+            None
+        ) or ("image/jpeg" if message.type == "image" else "application/pdf" if message.type == "document" else None),
+        filename=(
+            f"{message.image.id}.jpg" if message.type == "image" and message.image else
+            message.document.filename or f"{message.document.id}.pdf" if message.type == "document" and message.document else
+            None
+        ),
+        source_type=message.type if message.type in {"image", "document"} else None,
+        media_id=(
+            message.image.id if message.type == "image" and message.image else
+            message.document.id if message.type == "document" and message.document else
+            None
+        ),
     )
 
 

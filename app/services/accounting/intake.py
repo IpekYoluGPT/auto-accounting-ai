@@ -14,11 +14,8 @@ Special path for the company manager:
 
 from __future__ import annotations
 
-import hashlib
-
-from dataclasses import dataclass
+import sys
 from datetime import datetime, timezone
-from typing import Callable, Literal
 
 from app.config import settings
 from app.models.schemas import BillRecord, DocumentCategory
@@ -28,6 +25,27 @@ from app.services.accounting import (
     gemini_extractor,
     media_prep,
     record_store,
+)
+from app.services.accounting.intake_messages import (
+    handle_media_failure as _messages_handle_media_failure,
+    maybe_send_sheet_backlog_notice as _messages_maybe_send_sheet_backlog_notice,
+    safe_send_reaction as _messages_safe_send_reaction,
+    safe_send_text_message as _messages_safe_send_text_message,
+    send_throttled_warning as _messages_send_throttled_warning,
+)
+from app.services.accounting.intake_types import (
+    FetchMediaFn,
+    MediaPayload,
+    MediaProcessingResult,
+    MessageRoute,
+    SendReactionFn,
+    SendTextFn,
+)
+from app.services.accounting.media_pipeline import (
+    is_temporary_media_exception as _pipeline_is_temporary_media_exception,
+    message_for_media_exception as _pipeline_message_for_media_exception,
+    process_media_payload as _pipeline_process_media_payload,
+    record_meets_minimum_fields as _pipeline_record_meets_minimum_fields,
 )
 from app.services.accounting.pipeline_context import PipelineContext, current_pipeline_context, pipeline_context_scope
 from app.services.providers import google_sheets
@@ -130,38 +148,6 @@ _RETRYABLE_MEDIA_OUTCOMES = {
     "extraction_failed",
     "multi_document_retry_required",
 }
-
-_BACKLOG_NOTICE_THRESHOLD = 5
-
-
-# ─── Route descriptor ─────────────────────────────────────────────────────────
-
-
-@dataclass(frozen=True)
-class MessageRoute:
-    platform: Literal["meta_whatsapp", "periskope"]
-    sender_id: str
-    chat_id: str
-    chat_type: Literal["individual", "group"]
-    recipient_type: str
-    sender_name: str | None = None
-    group_id: str | None = None
-    reply_to_message_id: str | None = None
-
-
-SendTextFn = Callable[[MessageRoute, str], None]
-SendReactionFn = Callable[[MessageRoute, str], None]
-FetchMediaFn = Callable[[], bytes]
-
-
-@dataclass(frozen=True)
-class MediaProcessingResult:
-    outcome: str
-    exported_count: int = 0
-    retryable: bool = False
-    user_message: str | None = None
-    stage: str = "processing"
-
 
 # ─── Manager phone helper ─────────────────────────────────────────────────────
 
@@ -461,170 +447,18 @@ def process_media_payload(
     source_type: str,
     attachment_url: str | None = None,
 ) -> MediaProcessingResult:
-    media_sha256 = hashlib.sha256(raw_bytes).hexdigest()
-
-    prepared = media_prep.prepare_media(raw_bytes, mime_type=mime_type)
-    working_bytes = prepared.media_bytes
-    working_mime_type = prepared.mime_type
-    if prepared.warnings:
-        logger.info(
-            "Media prepared for Gemini: message_id=%s warnings=%s",
-            message_id,
-            prepared.warnings,
-        )
-
-    try:
-        analysis = doc_classifier.analyze_document(working_bytes, mime_type=working_mime_type)
-    except Exception as exc:
-        logger.warning("Failed to analyze media for message id=%s: %s", message_id, exc)
-        return MediaProcessingResult(
-            outcome="classification_failed",
-            retryable=is_temporary_media_exception(exc),
-            user_message=_message_for_media_exception(exc, MSG_MEDIA_CLASSIFICATION_ERROR),
-            stage="classification",
-        )
-
-    logger.info(
-        "Document analysis: financial=%s category=%s is_return=%s count=%d quality=%s retry=%s confidence=%.2f reason=%s",
-        analysis.is_financial_document,
-        analysis.category.value,
-        analysis.is_return,
-        analysis.document_count,
-        analysis.quality,
-        analysis.needs_retry,
-        analysis.confidence,
-        (analysis.reason or "")[:120],
-    )
-
-    if not analysis.is_financial_document:
-        return MediaProcessingResult(
-            outcome="warned_non_bill_media",
-            user_message=MSG_UNRELATED_IMAGE,
-            stage="classification",
-        )
-
-    if analysis.needs_retry and analysis.quality == "unusable":
-        return MediaProcessingResult(
-            outcome="category_failed",
-            user_message=MSG_MEDIA_RETRY_QUALITY,
-            stage="classification",
-        )
-
-    category = analysis.category
-    is_return = analysis.is_return
-    expected_document_count = analysis.document_count if analysis.document_count > 1 else None
-
-    def _extract_valid_records(*, split_retry: bool) -> list[BillRecord]:
-        extracted_records = gemini_extractor.extract_bills(
-            image_bytes=working_bytes,
-            mime_type=working_mime_type,
-            source_message_id=message_id,
-            source_filename=filename,
+    return _pipeline_process_media_payload(
+        intake_module=sys.modules[__name__],
+        payload=MediaPayload(
+            message_id=message_id,
+            route=route,
+            raw_bytes=raw_bytes,
+            mime_type=mime_type,
+            filename=filename,
             source_type=source_type,
-            source_sender_id=route.sender_id,
-            source_sender_name=route.sender_name,
-            source_group_id=route.group_id,
-            source_chat_type=route.chat_type,
-            category_hint=category,
-            document_count_hint=expected_document_count,
-            is_return_hint=is_return,
-            strict_document_count=expected_document_count if split_retry else None,
-            split_retry=split_retry,
-        )
-        return [record for record in extracted_records if _record_meets_minimum_fields(record, category)]
-
-    try:
-        valid_records = _extract_valid_records(split_retry=False)
-    except Exception as exc:
-        logger.warning("Failed to extract bills for message id=%s: %s", message_id, exc)
-        return MediaProcessingResult(
-            outcome="extraction_failed",
-            retryable=is_temporary_media_exception(exc),
-            user_message=_message_for_media_exception(exc, MSG_MEDIA_EXTRACTION_ERROR),
-            stage="extraction",
-        )
-
-    if expected_document_count and len(valid_records) != expected_document_count:
-        logger.warning(
-            "Multi-document extraction count mismatch for message id=%s: expected=%d got=%d; retrying with strict split prompt.",
-            message_id,
-            expected_document_count,
-            len(valid_records),
-        )
-        try:
-            retry_records = _extract_valid_records(split_retry=True)
-        except Exception as exc:
-            logger.warning("Failed strict multi-document extraction for message id=%s: %s", message_id, exc)
-            return MediaProcessingResult(
-                outcome="extraction_failed",
-                retryable=is_temporary_media_exception(exc),
-                user_message=_message_for_media_exception(exc, MSG_MEDIA_EXTRACTION_ERROR),
-                stage="extraction",
-            )
-
-        if len(retry_records) != expected_document_count:
-            logger.warning(
-                "Strict multi-document extraction still mismatched for message id=%s: expected=%d got=%d.",
-                message_id,
-                expected_document_count,
-                len(retry_records),
-            )
-            return MediaProcessingResult(
-                outcome="multi_document_retry_required",
-                user_message=MSG_MEDIA_MULTI_DOCUMENT_RETRY,
-                stage="extraction",
-            )
-        valid_records = retry_records
-
-    if not valid_records:
-        logger.warning("Gemini returned no usable documents for message id=%s", message_id)
-        return MediaProcessingResult(
-            outcome="empty_extraction",
-            user_message=MSG_MEDIA_RETRY_QUALITY if analysis.needs_retry else MSG_MEDIA_EMPTY_EXTRACTION,
-            stage="extraction",
-        )
-
-    try:
-        persisted_records: list[BillRecord] = []
-        for record in valid_records:
-            record.source_media_sha256 = media_sha256
-            persisted = record_store.persist_record_once(record)
-            if not persisted:
-                continue
-            persisted_records.append(record)
-
-        for record in persisted_records:
-            google_sheets.append_record(
-                record,
-                category,
-                is_return=is_return,
-                drive_link=None,
-                pending_document_bytes=raw_bytes,
-                pending_document_filename=filename,
-                pending_document_mime_type=mime_type,
-                feedback_target={
-                    "platform": route.platform,
-                    "chat_id": route.chat_id,
-                    "recipient_type": route.recipient_type,
-                    "message_id": message_id,
-                },
-            )
-    except Exception as exc:
-        logger.warning("Failed to persist media-derived records for message id=%s: %s", message_id, exc)
-        if is_temporary_media_exception(exc):
-            return MediaProcessingResult(
-                outcome="persistence_failed",
-                retryable=True,
-                user_message=MSG_MEDIA_TEMPORARY_UPSTREAM_ERROR,
-                stage="persistence",
-            )
-        raise
-
-    persisted_count = len(persisted_records)
-    if persisted_count == 0:
-        return MediaProcessingResult(outcome="already_exported", stage="persistence")
-
-    return MediaProcessingResult(outcome="exported", exported_count=persisted_count, stage="persistence")
+            attachment_url=attachment_url,
+        ),
+    )
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -633,26 +467,7 @@ def process_media_payload(
 def _safe_send_text_message(
     route: MessageRoute, text: str, *, reason: str, send_text: SendTextFn
 ) -> None:
-    if current_pipeline_context().disable_outbound_messages:
-        logger.info(
-            "Skipping outbound text in namespace=%s for chat_id=%s reason=%s",
-            current_pipeline_context().normalized_namespace,
-            route.chat_id,
-            reason,
-        )
-        return
-    try:
-        send_text(route, text)
-    except Exception as exc:
-        logger.error(
-            "Failed to send %s to chat_id=%s (chat_type=%s platform=%s): %s",
-            reason,
-            route.chat_id,
-            route.chat_type,
-            route.platform,
-            exc,
-            exc_info=True,
-        )
+    _messages_safe_send_text_message(route, text, reason=reason, send_text=send_text)
 
 
 def _safe_send_reaction(
@@ -662,28 +477,7 @@ def _safe_send_reaction(
     reason: str,
     send_reaction: SendReactionFn | None,
 ) -> None:
-    if current_pipeline_context().disable_outbound_messages:
-        logger.info(
-            "Skipping outbound reaction in namespace=%s for chat_id=%s reason=%s",
-            current_pipeline_context().normalized_namespace,
-            route.chat_id,
-            reason,
-        )
-        return
-    if send_reaction is None:
-        return
-    try:
-        send_reaction(route, emoji)
-    except Exception as exc:
-        logger.error(
-            "Failed to send %s to chat_id=%s (chat_type=%s platform=%s): %s",
-            reason,
-            route.chat_id,
-            route.chat_type,
-            route.platform,
-            exc,
-            exc_info=True,
-        )
+    _messages_safe_send_reaction(route, emoji, reason=reason, send_reaction=send_reaction)
 
 
 def _handle_media_failure(
@@ -695,9 +489,14 @@ def _handle_media_failure(
     reason: str,
     outcome: str = "media_failure",
 ) -> str:
-    _safe_send_reaction(route, REACTION_WARNING, reason=f"{reason} reaction", send_reaction=send_reaction)
-    _safe_send_text_message(route, message, reason=reason, send_text=send_text)
-    return outcome
+    return _messages_handle_media_failure(
+        route,
+        send_text,
+        send_reaction,
+        message=message,
+        reason=reason,
+        outcome=outcome,
+    )
 
 
 def _send_throttled_warning(
@@ -708,70 +507,26 @@ def _send_throttled_warning(
     reason: str,
     send_text: SendTextFn,
 ) -> bool:
-    if not record_store.should_send_warning(route.chat_id, warning_key):
-        return False
-    _safe_send_text_message(route, text, reason=reason, send_text=send_text)
-    return True
-
-
-def maybe_send_sheet_backlog_notice(route: MessageRoute, *, send_text: SendTextFn) -> None:
-    try:
-        backlog = google_sheets.queue_status().get("pending_sheet_appends", 0)
-    except Exception as exc:
-        logger.warning("Could not inspect Google Sheets backlog for chat_id=%s: %s", route.chat_id, exc)
-        return
-
-    if backlog < _BACKLOG_NOTICE_THRESHOLD:
-        return
-
-    _send_throttled_warning(
+    return _messages_send_throttled_warning(
         route,
-        MSG_SHEET_BACKLOG_NOTICE,
-        warning_key="sheet_backlog_notice",
-        reason="sheet backlog notice",
+        text,
+        warning_key=warning_key,
+        reason=reason,
         send_text=send_text,
     )
 
 
-def _record_meets_minimum_fields(record: BillRecord, category: DocumentCategory) -> bool:
-    has_identity = bool(record.company_name or record.document_number or record.invoice_number or record.receipt_number)
-    has_total = record.total_amount is not None
-    has_date = bool(record.document_date)
+def maybe_send_sheet_backlog_notice(route: MessageRoute, *, send_text: SendTextFn) -> None:
+    _messages_maybe_send_sheet_backlog_notice(route, send_text=send_text)
 
-    if category == DocumentCategory.MALZEME:
-        return bool(record.description and (has_identity or record.notes))
-    if category == DocumentCategory.CEK:
-        return has_total and bool(record.document_number or record.company_name or record.document_date)
-    if category == DocumentCategory.ODEME_DEKONTU:
-        return has_total and has_date and bool(has_identity or record.description)
-    if category in {DocumentCategory.FATURA, DocumentCategory.HARCAMA_FISI, DocumentCategory.BELIRSIZ, DocumentCategory.IADE}:
-        return has_total and has_date and has_identity
-    if category == DocumentCategory.ELDEN_ODEME:
-        return has_total and bool(record.description)
-    return has_total and has_identity
+
+def _record_meets_minimum_fields(record: BillRecord, category: DocumentCategory) -> bool:
+    return _pipeline_record_meets_minimum_fields(record, category)
 
 
 def _message_for_media_exception(exc: Exception, default_message: str) -> str:
-    if is_temporary_media_exception(exc):
-        return MSG_MEDIA_TEMPORARY_UPSTREAM_ERROR
-    return default_message
+    return _pipeline_message_for_media_exception(exc, default_message)
 
 
 def is_temporary_media_exception(exc: Exception) -> bool:
-    error = str(exc).lower()
-    return any(
-        token in error
-        for token in (
-            "503",
-            "429",
-            "unavailable",
-            "resource_exhausted",
-            "overload",
-            "timed out",
-            "timeout",
-            "connection reset",
-            "temporarily unavailable",
-            "ssl",
-            "quota",
-        )
-    )
+    return _pipeline_is_temporary_media_exception(exc)
