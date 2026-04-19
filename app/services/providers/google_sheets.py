@@ -489,6 +489,31 @@ _AMOUNT_COLUMNS = {
     "Kalan",
 }
 
+# Columns that must stay literal text even when they look numeric.
+_TEXT_LITERAL_COLUMNS = {
+    "Belge No / Referans",
+    "Referans No",
+    "Fatura No",
+    "Fiş / Belge No",
+    "Belge No",
+    "Fiş No",
+    "Referans",
+    "Çek Seri No",
+    "Çek Hesap Ref",
+    "Belge ID",
+    "Kaynak Mesaj ID",
+    "Allocation ID",
+    "Party Key",
+    _HIDDEN_ROW_ID_HEADER,
+    _HIDDEN_SOURCE_DOC_ID_HEADER,
+    _HIDDEN_PARTY_KEY_HEADER,
+    _HIDDEN_TAX_NUMBER_HEADER,
+    _HIDDEN_RECORD_KIND_HEADER,
+    _HIDDEN_ALLOCATION_ID_HEADER,
+    _HIDDEN_PAYMENT_DOC_ID_HEADER,
+    _HIDDEN_DEBT_ROW_ID_HEADER,
+}
+
 
 def _add_conditional_format_rule(
     requests: list[dict],
@@ -1325,6 +1350,27 @@ def _visibility_requests(ws, tab_name: str) -> list[dict]:
 
 def _apply_lightweight_layout(ws, tab_name: str) -> None:
     requests = _visibility_requests(ws, tab_name)
+    headers = _headers(tab_name)
+    for index, header in enumerate(headers):
+        if header not in _TEXT_LITERAL_COLUMNS:
+            continue
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": ws.id,
+                    "startRowIndex": 2,
+                    "startColumnIndex": index,
+                    "endColumnIndex": index + 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "numberFormat": {"type": "TEXT"},
+                        "horizontalAlignment": "LEFT",
+                    }
+                },
+                "fields": "userEnteredFormat(numberFormat,horizontalAlignment)",
+            }
+        })
     if not requests:
         return
     try:
@@ -1435,6 +1481,24 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
                         "userEnteredFormat": {
                             "numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"},
                             "horizontalAlignment": "RIGHT",
+                        }
+                    },
+                    "fields": "userEnteredFormat(numberFormat,horizontalAlignment)",
+                }
+            })
+        if header in _TEXT_LITERAL_COLUMNS:
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": 2,
+                        "startColumnIndex": i,
+                        "endColumnIndex": i + 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {"type": "TEXT"},
+                            "horizontalAlignment": "LEFT",
                         }
                     },
                     "fields": "userEnteredFormat(numberFormat,horizontalAlignment)",
@@ -2917,6 +2981,36 @@ def _safe(v):
     if isinstance(v, (int, float)) and not isinstance(v, bool):
         return v
     return str(v)
+
+
+def _sheet_literal_text(value: object) -> str:
+    text = "" if value is None else str(value)
+    if not text:
+        return ""
+    return text if text.startswith("'") else f"'{text}"
+
+
+def _prepare_rows_for_sheet_update(tab_name: str, rows: list[list[object]]) -> list[list[object]]:
+    if not rows:
+        return rows
+
+    literal_indexes = {
+        index
+        for index, header in enumerate(_headers(tab_name))
+        if header in _TEXT_LITERAL_COLUMNS
+    }
+    if not literal_indexes:
+        return rows
+
+    prepared_rows: list[list[object]] = []
+    for row in rows:
+        prepared = list(row)
+        for index in literal_indexes:
+            if index >= len(prepared):
+                continue
+            prepared[index] = _sheet_literal_text(prepared[index])
+        prepared_rows.append(prepared)
+    return prepared_rows
 
 
 def _drive_column_letter(tab_name: str) -> str:
@@ -5494,7 +5588,10 @@ def _write_visible_projection_rows(sh, rows_by_tab: dict[str, list[list[object]]
         _clear_projection_tab_rows(ws, tab_name, len(rows))
         request_count += 1
         if rows:
-            _retry_on_rate_limit(lambda ws=ws, rows=rows: ws.update(rows, "A3", value_input_option="USER_ENTERED"))
+            prepared_rows = _prepare_rows_for_sheet_update(tab_name, rows)
+            _retry_on_rate_limit(
+                lambda ws=ws, rows=prepared_rows: ws.update(rows, "A3", value_input_option="USER_ENTERED")
+            )
             request_count += 1
     return request_count
 

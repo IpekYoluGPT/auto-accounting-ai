@@ -191,3 +191,26 @@ uvicorn app.main:app --host 0.0.0.0 --port $PORT
 ```
 
 If you deploy on Railway, align `STORAGE_DIR` with the mounted volume path. The app logs a warning when it detects that storage is outside the persistent volume.
+
+### Railway test reset (clear sheet values only)
+
+Use this when you want a clean workbook for manual testing without clearing queue/canonical files in `STORAGE_DIR`.
+
+1. Verify you are targeting the API service URL:
+
+```bash
+curl -i "$APP_BASE_URL/health"
+```
+
+Expect `200` with `{"status":"ok"}`. If you get an HTML page or `404`, you are likely pointing to the wrong Railway service/domain.
+
+2. Clear workbook values only:
+
+```bash
+curl -X POST "$APP_BASE_URL/setup/reset-sheet" \
+  -H "Authorization: Bearer $PERISKOPE_TOOL_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"clear_storage": false}'
+```
+
+`"clear_storage": false` keeps queue/canonical runtime state and only resets visible workbook values.
