@@ -170,6 +170,10 @@ Use `PERISKOPE_TOOL_TOKEN` as the shared Bearer token.
 
 ## Deployment Notes
 
+For customer-owned managed deployments and billing handoff, see:
+
+- [docs/customer-handoff.md](docs/customer-handoff.md)
+
 ### Persistent storage is mandatory
 
 Do not deploy this app with ephemeral-only storage if you expect reliable media retries and reconciliation. The following live state would otherwise be lost on restart:

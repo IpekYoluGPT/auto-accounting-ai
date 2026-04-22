@@ -249,6 +249,66 @@ def test_periskope_group_image_webhook_exports_and_reacts():
         assert react_mock.call_args_list[1].args == ("peri-msg-1", "✅")
 
 
+def test_periskope_duplicate_delivery_writes_only_one_export_row():
+    payload = _periskope_event(_periskope_image_message())
+    signature = _sign_payload(payload, "periskope-secret")
+    record = BillRecord(
+        company_name="ABC Market",
+        total_amount=245.5,
+        currency="TRY",
+        source_message_id="peri-msg-1",
+        source_filename="receipt-1.jpg",
+        source_type="image",
+        source_sender_id="905456952965@c.us",
+        source_group_id="120363410789660631@g.us",
+        source_chat_type="group",
+        document_date="2026-04-09",
+        confidence=0.93,
+    )
+
+    with TemporaryDirectory() as tmpdir:
+        client = TestClient(app)
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.routes.periskope.periskope.fetch_media",
+            return_value=b"fake-image",
+        ) as fetch_mock, patch(
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(DocumentCategory.FATURA, confidence=0.96),
+        ) as classify_mock, patch(
+            "app.services.accounting.intake.gemini_extractor.extract_bills",
+            return_value=[record],
+        ) as extract_mock, patch(
+            "app.services.accounting.intake.google_sheets.upload_document",
+            return_value="https://drive.google.com/file/d/test/view",
+        ), patch(
+            "app.routes.periskope.periskope.send_text_message",
+        ) as send_mock, patch(
+            "app.routes.periskope.periskope.react_to_message",
+        ) as react_mock:
+            response_one = client.post(
+                "/integrations/periskope/webhook",
+                json=payload,
+                headers={"x-periskope-signature": signature},
+            )
+            response_two = client.post(
+                "/integrations/periskope/webhook",
+                json=payload,
+                headers={"x-periskope-signature": signature},
+            )
+
+        assert response_one.status_code == 200
+        assert response_two.status_code == 200
+        assert response_one.json() == {"status": "ok"}
+        assert response_two.json() == {"status": "ok"}
+        rows = _read_export_rows(tmpdir)
+        assert len(rows) == 1
+        send_mock.assert_not_called()
+        assert react_mock.call_count == 2
+        fetch_mock.assert_called_once()
+        classify_mock.assert_called_once()
+        extract_mock.assert_called_once()
+
+
 def test_periskope_sender_name_is_forwarded_to_extractor():
     payload = _periskope_event(_periskope_image_message(sender_name="Ahmet Yılmaz"))
     signature = _sign_payload(payload, "periskope-secret")

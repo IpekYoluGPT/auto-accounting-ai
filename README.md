@@ -86,6 +86,22 @@ Kurulum ayrıntıları ve eksik Google env değişkenleri için:
 - [docs/architecture.md](docs/architecture.md)
 - [docs/runtime-pipeline.md](docs/runtime-pipeline.md)
 
+## Delivery Smoke
+
+Teslim öncesi en kritik yolakları tek komutla doğrulamak için:
+
+```bash
+python scripts/delivery_smoke.py
+```
+
+Bu komut canlı hot path için temel env blokajlarını kontrol eder ve şu kritik smoke testlerini birlikte çalıştırır:
+
+- Periskope image/document ingress queue davranışı
+- başarılı grup belge akışı ve export üretimi
+- duplicate delivery dedupe koruması
+- signature doğrulama ve allowlist güvenlik kapıları
+- export yüzeyi ve storage hard-reject güvenliği
+
 ## API Yüzeyi
 
 Birincil ingress ve operasyon endpoint'leri:

@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     # User must share this folder with the service account (Editor).
     google_drive_parent_folder_id: str = ""
     # Google account email to share every auto-created spreadsheet with (editor access).
-    google_sheets_owner_email: str = "yilmazatakan4423@gmail.com"
+    google_sheets_owner_email: str = ""
 
     # Google OAuth2 (for spreadsheet creation on behalf of user)
     # Service accounts cannot create Sheets files (403 quota/permission error).
