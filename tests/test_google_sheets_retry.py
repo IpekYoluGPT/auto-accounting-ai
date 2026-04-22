@@ -920,6 +920,35 @@ def test_build_row_for_fatura_uses_line_count_for_multi_item_invoice():
 
 
 
+def test_prepare_rows_for_sheet_update_forces_reference_columns_to_plain_text_literals():
+    rows = [[
+        '2026-04-18',
+        'Malzeme',
+        'ABC Ltd.',
+        'Aciklama',
+        '1.031,00',
+        1500.0,
+        0.0,
+        1500.0,
+        '',
+        'row-1',
+        'party-1',
+        'doc-1',
+        '0012345678',
+        'harcama_fisi',
+        0.0,
+    ]]
+
+    prepared = google_sheets._prepare_rows_for_sheet_update('Masraf Kayıtları', rows)
+
+    assert prepared[0][4] == "'1.031,00"
+    assert prepared[0][9] == "'row-1"
+    assert prepared[0][10] == "'party-1"
+    assert prepared[0][11] == "'doc-1"
+    assert prepared[0][12] == "'0012345678"
+    assert prepared[0][5] == 1500.0
+
+
 def test_build_row_for_sevk_formats_quantity_with_unit_and_uses_line_item_summary():
     record = google_sheets.BillRecord(
         company_name='SOMAY PETROL SAN. VE TİC. LTD. ŞTİ.',

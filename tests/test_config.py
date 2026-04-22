@@ -17,6 +17,7 @@ def test_gemini_model_defaults(monkeypatch):
     assert settings.periskope_media_base_url == "https://api.periskope.app"
     assert settings.business_timezone == "Europe/Istanbul"
     assert settings.google_document_ai_location == "eu"
+    assert settings.google_sheets_owner_email == ""
     assert settings.ocr_min_text_chars == 60
     assert settings.ocr_min_parse_score == 0.72
     assert settings.ocr_min_quality_score == 0.45

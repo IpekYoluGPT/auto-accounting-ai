@@ -355,7 +355,7 @@ def test_sandbox_ensure_returns_structured_payload():
         "app.routes.setup.settings.periskope_tool_token",
         "secret-token",
     ), patch(
-        "app.routes.setup._ensure_sandbox_context",
+        "app.routes.setup_sandbox._ensure_sandbox_context",
         return_value=(context, "sandbox-sheet-1", False),
     ), patch(
         "app.routes.setup.google_sheets._month_key",
@@ -386,7 +386,7 @@ def test_sandbox_intake_rejects_invalid_base64():
         "app.routes.setup.settings.periskope_tool_token",
         "secret-token",
     ), patch(
-        "app.routes.setup._ensure_sandbox_context",
+        "app.routes.setup_sandbox._ensure_sandbox_context",
         return_value=(context, "sandbox-sheet-1", False),
     ):
         with TestClient(app) as client:
@@ -412,7 +412,7 @@ def test_sandbox_intake_processes_text_in_sandbox_context():
         "app.routes.setup.settings.periskope_tool_token",
         "secret-token",
     ), patch(
-        "app.routes.setup._ensure_sandbox_context",
+        "app.routes.setup_sandbox._ensure_sandbox_context",
         return_value=(context, "sandbox-sheet-1", False),
     ), patch(
         "app.routes.setup.record_store.find_export_rows",
@@ -421,7 +421,7 @@ def test_sandbox_intake_processes_text_in_sandbox_context():
         "app.routes.setup.intake.process_incoming_message",
         return_value="exported",
     ) as intake_mock, patch(
-        "app.routes.setup._drain_sandbox_queues",
+        "app.routes.setup_sandbox._drain_sandbox_queues",
         return_value={"pending_sheet_appends_processed": 1, "pending_drive_uploads_processed": 1},
     ), patch(
         "app.routes.setup.google_sheets.queue_status",
@@ -456,7 +456,7 @@ def test_sandbox_intake_reports_rows_by_source_message_id():
         "app.routes.setup.settings.periskope_tool_token",
         "secret-token",
     ), patch(
-        "app.routes.setup._ensure_sandbox_context",
+        "app.routes.setup_sandbox._ensure_sandbox_context",
         return_value=(context, "sandbox-sheet-1", False),
     ), patch(
         "app.routes.setup.record_store.find_export_rows",
@@ -465,7 +465,7 @@ def test_sandbox_intake_reports_rows_by_source_message_id():
         "app.routes.setup.intake.process_incoming_message",
         return_value="exported",
     ), patch(
-        "app.routes.setup._drain_sandbox_queues",
+        "app.routes.setup_sandbox._drain_sandbox_queues",
         return_value={"pending_sheet_appends_processed": 1, "pending_drive_uploads_processed": 0},
     ), patch(
         "app.routes.setup.google_sheets.queue_status",
@@ -494,7 +494,7 @@ def test_sandbox_audit_returns_404_for_unknown_session():
         "app.routes.setup.settings.periskope_tool_token",
         "secret-token",
     ), patch(
-        "app.routes.setup._resolve_existing_sandbox_spreadsheet_id",
+        "app.routes.setup_sandbox._resolve_existing_sandbox_spreadsheet_id",
         return_value=None,
     ):
         with TestClient(app) as client:
@@ -513,7 +513,7 @@ def test_sandbox_audit_passes_target_tabs_to_google_sheets():
         "app.routes.setup.settings.periskope_tool_token",
         "secret-token",
     ), patch(
-        "app.routes.setup._require_existing_sandbox_context",
+        "app.routes.setup_sandbox._require_existing_sandbox_context",
         return_value=(context, "sandbox-sheet-1"),
     ), patch(
         "app.routes.setup.google_sheets.audit_current_month_spreadsheet",

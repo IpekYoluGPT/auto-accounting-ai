@@ -20,8 +20,8 @@ from app.models.schemas import (
     PeriskopeSubmissionStatusRequest,
 )
 from app.services.providers import periskope
-from app.services.accounting import inbound_queue, record_store
-from app.services.accounting.intake import MessageRoute, REACTION_PROCESSING, REACTION_WARNING, process_incoming_message
+from app.services.accounting import inbound_queue, ingress_service, record_store
+from app.services.accounting.intake import MessageRoute
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -166,40 +166,21 @@ def _process_periskope_message(message: PeriskopeMessage) -> None:
         logger.info("Ignoring Periskope message from non-allowed chat_id=%s", route.chat_id)
         return
 
-    if message.message_type in {"text", "chat"}:
-        process_incoming_message(
-            message_id=message.message_id,
-            msg_type="text",
-            route=route,
-            send_text=_send_periskope_text_message,
-            text=message.body or "",
-        )
-        return
-
-    if message.message_type in {"image", "document"}:
-        media = message.media
-        result = inbound_queue.enqueue_media_job(
-            message_id=message.message_id,
-            msg_type=message.message_type,
-            route=route,
-            mime_type=(media.mimetype if media and media.mimetype else _default_mime_type(message.message_type)),
-            filename=(media.filename if media and media.filename else f"{message.message_id}.{_default_extension(message.message_type)}"),
-            source_type=message.message_type,
-            media_path=(media.path if media and media.path else None),
-            attachment_url=(media.path if media and media.path and media.path.startswith("http") else None),
-        )
-        if result.status == "enqueued":
-            _safe_periskope_reaction(route, REACTION_PROCESSING)
-        elif result.status == "rejected_due_to_storage":
-            _safe_periskope_reaction(route, REACTION_WARNING)
-            _safe_periskope_text_message(route, result.message or inbound_queue.MSG_STORAGE_PRESSURE)
-        return
-
-    process_incoming_message(
+    media = message.media
+    ingress_service.process_or_enqueue_message(
         message_id=message.message_id,
         msg_type=message.message_type,
         route=route,
         send_text=_send_periskope_text_message,
+        send_reaction=_send_periskope_reaction,
+        text=message.body or "",
+        mime_type=(media.mimetype if media and media.mimetype else _default_mime_type(message.message_type))
+        if message.message_type in {"image", "document"} else None,
+        filename=(media.filename if media and media.filename else f"{message.message_id}.{_default_extension(message.message_type)}")
+        if message.message_type in {"image", "document"} else None,
+        source_type=message.message_type if message.message_type in {"image", "document"} else None,
+        media_path=(media.path if media and media.path else None),
+        attachment_url=(media.path if media and media.path and media.path.startswith("http") else None),
     )
 
 

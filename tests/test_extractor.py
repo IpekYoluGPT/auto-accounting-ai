@@ -113,6 +113,23 @@ class TestNormalizeRecord:
         record = _normalize_record(self._raw(sender_name="Ahmet Yılmaz"))
         assert record.sender_name == "Ahmet Yılmaz"
 
+    def test_identifier_fields_preserve_leading_zeroes_and_strip_numeric_punctuation(self):
+        record = _normalize_record(
+            self._raw(
+                document_number="1.031,00",
+                invoice_number="00123",
+                receipt_number="00 81",
+                cheque_serial_number="00 45",
+                cheque_account_ref="7,00",
+            )
+        )
+
+        assert record.document_number == "103100"
+        assert record.invoice_number == "00123"
+        assert record.receipt_number == "0081"
+        assert record.cheque_serial_number == "0045"
+        assert record.cheque_account_ref == "700"
+
     def test_new_structured_fields_are_normalized(self):
         record = _normalize_record(
             self._raw(

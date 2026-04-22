@@ -4,6 +4,7 @@ Gemini-backed extraction with category-aware prompts.
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from app.config import settings
@@ -23,6 +24,7 @@ Rules:
 - When values are missing, return null.
 - Normalize dates to YYYY-MM-DD and times to HH:MM when clearly visible.
 - Convert Turkish formatted numbers to JSON numbers.
+- document_number, invoice_number, receipt_number, cheque_serial_number, and cheque_account_ref are identifiers, not monetary numbers. Return them as strings exactly as seen, preserve leading zeroes, and do not drop digits because of Turkish number punctuation.
 - If multiple documents are present, return one object per distinct document sorted left-to-right, then top-to-bottom.
 - Do not merge separate documents into one record.
 - For return documents, extract the values exactly as shown; do not flip signs unless the document itself shows a negative or return amount.
@@ -112,6 +114,8 @@ _MULTI_DOCUMENT_RETRY_INSTRUCTIONS = """Bu goruntude birden fazla belge var ve o
 - Tek bir object dondurup diger belgeleri yoksayma.
 - Belge sayisi kesin olarak verildiyse tam o sayida object dondur; eksik veya fazla dondurme.
 """
+
+_THOUSANDS_STYLE_IDENTIFIER_RE = re.compile(r"^\d{1,3}(?:\.\d{3})+$")
 
 
 def _parse_tr_number(value: str) -> Optional[float]:
@@ -206,6 +210,39 @@ def _normalize_record(raw: dict) -> BillRecord:
         s = str(v).strip()
         return s if s else None
 
+    def _safe_identifier_str(v) -> Optional[str]:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            return str(v)
+        if isinstance(v, int):
+            return str(v)
+        if isinstance(v, float):
+            return str(int(v)) if v.is_integer() else str(v)
+
+        raw_text = str(v).strip()
+        if not raw_text:
+            return None
+
+        compact_whitespace = "".join(raw_text.split())
+        if compact_whitespace.isdigit():
+            return compact_whitespace
+
+        if "," in compact_whitespace and "." in compact_whitespace:
+            digits_only = compact_whitespace.replace(".", "").replace(",", "")
+            if digits_only.isdigit():
+                return digits_only
+
+        if "," in compact_whitespace:
+            digits_only = compact_whitespace.replace(",", "")
+            if digits_only.isdigit():
+                return digits_only
+
+        if _THOUSANDS_STYLE_IDENTIFIER_RE.fullmatch(compact_whitespace):
+            return compact_whitespace.replace(".", "")
+
+        return raw_text
+
     line_items_raw = raw.get("line_items") or []
     normalized_line_items: list[InvoiceLineItem] = []
     if isinstance(line_items_raw, list):
@@ -231,9 +268,9 @@ def _normalize_record(raw: dict) -> BillRecord:
         company_name=_safe_str(raw.get("company_name")),
         tax_number=_safe_str(raw.get("tax_number")),
         tax_office=_safe_str(raw.get("tax_office")),
-        document_number=_safe_str(raw.get("document_number")),
-        invoice_number=_safe_str(raw.get("invoice_number")),
-        receipt_number=_safe_str(raw.get("receipt_number")),
+        document_number=_safe_identifier_str(raw.get("document_number")),
+        invoice_number=_safe_identifier_str(raw.get("invoice_number")),
+        receipt_number=_safe_identifier_str(raw.get("receipt_number")),
         document_date=ocr.normalize_date(_safe_str(raw.get("document_date"))) or _safe_str(raw.get("document_date")),
         document_time=ocr.normalize_time(_safe_str(raw.get("document_time"))) or _safe_str(raw.get("document_time")),
         currency=currency_raw,
@@ -264,10 +301,10 @@ def _normalize_record(raw: dict) -> BillRecord:
         cheque_issue_place=_safe_str(raw.get("cheque_issue_place")),
         cheque_issue_date=ocr.normalize_date(_safe_str(raw.get("cheque_issue_date"))) or _safe_str(raw.get("cheque_issue_date")),
         cheque_due_date=ocr.normalize_date(_safe_str(raw.get("cheque_due_date"))) or _safe_str(raw.get("cheque_due_date")),
-        cheque_serial_number=_safe_str(raw.get("cheque_serial_number")),
+        cheque_serial_number=_safe_identifier_str(raw.get("cheque_serial_number")),
         cheque_bank_name=_safe_str(raw.get("cheque_bank_name")),
         cheque_branch=_safe_str(raw.get("cheque_branch")),
-        cheque_account_ref=_safe_str(raw.get("cheque_account_ref")),
+        cheque_account_ref=_safe_identifier_str(raw.get("cheque_account_ref")),
         line_items=normalized_line_items or None,
         source_message_id=_safe_str(raw.get("source_message_id")),
         source_filename=_safe_str(raw.get("source_filename")),
