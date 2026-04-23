@@ -104,6 +104,9 @@ _TAB_SPECS: dict[str, SheetSpec] = {
             "Açıklama",
             "Referans No",
             "Gönderen",
+            "Gönderen IBAN",
+            "Alıcı IBAN",
+            "Banka",
             "Ödeme Tutarı (TL)",
             "Ödeme Tarihi",
             "Kalan Bakiye (TL)",
@@ -121,6 +124,32 @@ _TAB_SPECS: dict[str, SheetSpec] = {
             _HIDDEN_RECORD_KIND_HEADER,
         ),
         color={"red": 0.13, "green": 0.55, "blue": 0.13},
+        total_header="Ödeme Tutarı (TL)",
+    ),
+    "Çekler": SheetSpec(
+        visible_headers=(
+            "Alıcı / Tedarikçi",
+            "Açıklama",
+            "Referans No",
+            "Gönderen",
+            "Ödeme Tutarı (TL)",
+            "Ödeme Tarihi",
+            "Kalan Bakiye (TL)",
+            "Durum",
+            "Banka",
+            _VISIBLE_DRIVE_LINK_HEADER,
+        ),
+        hidden_headers=(
+            _HIDDEN_ROW_ID_HEADER,
+            _HIDDEN_PARTY_KEY_HEADER,
+            _HIDDEN_SOURCE_DOC_ID_HEADER,
+            _HIDDEN_PAYMENT_DOC_ID_HEADER,
+            _HIDDEN_DEBT_ROW_ID_HEADER,
+            _HIDDEN_ALLOCATION_ID_HEADER,
+            _HIDDEN_TAX_NUMBER_HEADER,
+            _HIDDEN_RECORD_KIND_HEADER,
+        ),
+        color={"red": 0.34, "green": 0.44, "blue": 0.18},
         total_header="Ödeme Tutarı (TL)",
     ),
     "Faturalar": SheetSpec(
@@ -223,7 +252,8 @@ _TAB_SPECS: dict[str, SheetSpec] = {
             "Gönderen",
             "Alıcı",
             "Referans",
-            "IBAN",
+            "Gönderen IBAN",
+            "Alıcı IBAN",
             "Banka",
             "Çek Seri No",
             "Çek Banka",
@@ -278,7 +308,7 @@ _CATEGORY_VISIBLE_TAB: dict[DocumentCategory, str] = {
     DocumentCategory.FATURA: "Faturalar",
     DocumentCategory.ODEME_DEKONTU: "Banka Ödemeleri",
     DocumentCategory.HARCAMA_FISI: "Masraf Kayıtları",
-    DocumentCategory.CEK: "Banka Ödemeleri",
+    DocumentCategory.CEK: "Çekler",
     DocumentCategory.ELDEN_ODEME: "Masraf Kayıtları",
     DocumentCategory.MALZEME: "Sevk Fişleri",
     DocumentCategory.IADE: "Faturalar",
@@ -295,7 +325,8 @@ _TAB_ALIASES: dict[str, str] = {
     "Banka Odemeleri": "Banka Ödemeleri",
     "Banka Ödemeleri": "Banka Ödemeleri",
     "💳 Dekontlar": "Banka Ödemeleri",
-    "📝 Çekler": "Banka Ödemeleri",
+    "Çekler": "Çekler",
+    "📝 Çekler": "Çekler",
     "Faturalar": "Faturalar",
     "🧾 Faturalar": "Faturalar",
     "Sevk Fisleri": "Sevk Fişleri",
@@ -333,6 +364,8 @@ _COL_WIDTHS: dict[str, int] = {
     "Kişi Toplam Borcu (TL)": 96,
     "Referans No": 98,
     "Gönderen": 140,
+    "Gönderen IBAN": 154,
+    "Alıcı IBAN": 154,
     "Ödeme Tutarı (TL)": 92,
     "Ödeme Tarihi": 78,
     "Kalan Bakiye (TL)": 94,
@@ -412,10 +445,25 @@ _TAB_COLUMN_WIDTHS: dict[str, dict[str, int]] = {
         "Açıklama": 154,
         "Referans No": 92,
         "Gönderen": 126,
+        "Gönderen IBAN": 148,
+        "Alıcı IBAN": 148,
+        "Banka": 118,
         "Ödeme Tutarı (TL)": 88,
         "Ödeme Tarihi": 74,
         "Kalan Bakiye (TL)": 90,
         "Durum": 80,
+        "Belge": 64,
+    },
+    "Çekler": {
+        "Alıcı / Tedarikçi": 132,
+        "Açıklama": 154,
+        "Referans No": 92,
+        "Gönderen": 126,
+        "Ödeme Tutarı (TL)": 88,
+        "Ödeme Tarihi": 74,
+        "Kalan Bakiye (TL)": 90,
+        "Durum": 80,
+        "Banka": 118,
         "Belge": 64,
     },
     "Faturalar": {
@@ -493,6 +541,8 @@ _AMOUNT_COLUMNS = {
 _TEXT_LITERAL_COLUMNS = {
     "Belge No / Referans",
     "Referans No",
+    "Gönderen IBAN",
+    "Alıcı IBAN",
     "Fatura No",
     "Fiş / Belge No",
     "Belge No",
@@ -982,6 +1032,79 @@ def _get_or_create_month_drive_folder() -> Optional[str]:
         return parent  # fallback to root folder
 
 
+def _get_or_create_drive_subfolder(parent_id: str, folder_name: str) -> Optional[str]:
+    cache_key = f"{parent_id}:{folder_name}"
+    if cache_key in _drive_folder_cache:
+        return _drive_folder_cache[cache_key]
+
+    oauth_drive = _get_oauth_drive_service()
+    sa_drive = _get_drive_service()
+    search_drive = oauth_drive or sa_drive
+    create_drive = oauth_drive or sa_drive
+
+    if search_drive is None:
+        return None
+
+    try:
+        q = (
+            f"name='{folder_name}' and "
+            f"'{parent_id}' in parents and "
+            "mimeType='application/vnd.google-apps.folder' and "
+            "trashed=false"
+        )
+        results = search_drive.files().list(
+            q=q,
+            fields="files(id)",
+            pageSize=1,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        files = results.get("files", [])
+        if files:
+            folder_id = files[0]["id"]
+            _drive_folder_cache[cache_key] = folder_id
+            return folder_id
+
+        if create_drive is None:
+            return None
+
+        meta = {
+            "name": folder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id],
+        }
+        folder = create_drive.files().create(
+            body=meta,
+            fields="id",
+            supportsAllDrives=True,
+        ).execute()
+        folder_id = folder["id"]
+        _drive_folder_cache[cache_key] = folder_id
+        logger.info("Created Drive subfolder '%s' under %s (id=%s)", folder_name, parent_id, folder_id)
+
+        if create_drive is oauth_drive and oauth_drive is not None:
+            _share_with_service_account(folder_id, oauth_drive)
+
+        return folder_id
+    except Exception as exc:
+        logger.warning("Could not get/create Drive subfolder %s under %s: %s", folder_name, parent_id, exc)
+        return None
+
+
+def _uses_resimler_subfolder(mime_type: str) -> bool:
+    normalized = (mime_type or "").lower()
+    return normalized.startswith("image/") or normalized == "application/pdf"
+
+
+def _upload_destination_folder_id(mime_type: str) -> Optional[str]:
+    month_folder_id = _get_or_create_month_drive_folder()
+    if not month_folder_id:
+        return None
+    if _uses_resimler_subfolder(mime_type):
+        return _get_or_create_drive_subfolder(month_folder_id, "Resimler") or month_folder_id
+    return month_folder_id
+
+
 def upload_document(
     file_bytes: bytes,
     filename: str,
@@ -1019,7 +1142,7 @@ def upload_document(
                         self.mimetype = mimetype
                         self.resumable = resumable
 
-            folder_id = _get_or_create_month_drive_folder()
+            folder_id = _upload_destination_folder_id(mime_type)
             file_meta: dict = {"name": filename}
             if folder_id:
                 file_meta["parents"] = [folder_id]
@@ -1039,7 +1162,12 @@ def upload_document(
             uploaded = _retry_on_transient_drive_error(_upload_once)
 
             link = uploaded.get("webViewLink", "")
-            logger.info("Uploaded '%s' to Drive folder '%s' → %s", filename, _month_drive_folder_name(), link)
+            folder_label = (
+                f"{_month_drive_folder_name()}/Resimler"
+                if _uses_resimler_subfolder(mime_type)
+                else _month_drive_folder_name()
+            )
+            logger.info("Uploaded '%s' to Drive folder '%s' → %s", filename, folder_label, link)
             return link
 
         except Exception as exc:
@@ -1550,7 +1678,7 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
                     index=rule_index,
                 )
                 rule_index += 1
-        if tab_name == "Banka Ödemeleri":
+        if tab_name in {"Banka Ödemeleri", "Çekler"}:
             remaining_idx = _header_index(tab_name, "Kalan Bakiye (TL)")
             if remaining_idx is not None:
                 _add_conditional_format_rule(
@@ -2096,7 +2224,10 @@ def _remap_legacy_visible_row(
             row_map.get("Alıcı / Tedarikçi", ""),
             row_map.get("Açıklama", ""),
             _coalesce_text(detail_row.get("Referans"), raw_row.get("Fatura No"), raw_row.get("Belge No"), raw_row.get("Fiş No")),
-            _coalesce_text(detail_row.get("Gönderen"), raw_row.get("Gönderen"), raw_row.get("Firma")),
+            _coalesce_text(detail_row.get("Gönderen"), raw_row.get("Gönderen")),
+            _coalesce_text(detail_row.get("Gönderen IBAN")),
+            _coalesce_text(detail_row.get("Alıcı IBAN")),
+            _coalesce_text(detail_row.get("Banka"), raw_row.get("Banka")),
             row_map.get("Ödeme Tutarı (TL)", ""),
             row_map.get("Ödeme Tarihi", ""),
             row_map.get("Kalan Bakiye (TL)", ""),
@@ -2776,13 +2907,22 @@ def _find_existing_spreadsheet_in_drive(title: str) -> Optional[str]:
         return None
 
     try:
-        # Search in the monthly subfolder first, then in the parent folder
-        for parent_id in [
-            _drive_folder_cache.get(_month_drive_folder_name()),
-            settings.google_drive_parent_folder_id,
-        ]:
+        month_folder_id = _drive_folder_cache.get(_month_drive_folder_name())
+        if not month_folder_id:
+            # Cold starts clear the in-memory folder cache, so resolve the
+            # current month's subfolder before deciding the sheet is missing.
+            month_folder_id = _get_or_create_month_drive_folder()
+
+        parent_candidates: list[str] = []
+        for parent_id in (month_folder_id, settings.google_drive_parent_folder_id):
             if not parent_id:
                 continue
+            if parent_id in parent_candidates:
+                continue
+            parent_candidates.append(parent_id)
+
+        # Search in the monthly subfolder first, then in the parent folder.
+        for parent_id in parent_candidates:
             q = (
                 f"name='{title}' and "
                 f"'{parent_id}' in parents and "
@@ -2990,6 +3130,32 @@ def _sheet_literal_text(value: object) -> str:
     return text if text.startswith("'") else f"'{text}"
 
 
+def _visible_placeholder_indexes(tab_name: str) -> set[int]:
+    if _tab_spec(tab_name).hidden_tab:
+        return set()
+
+    return {
+        index
+        for index, header in enumerate(_headers(tab_name)[:_visible_header_count(tab_name)])
+        if header != _VISIBLE_DRIVE_LINK_HEADER
+    }
+
+
+def _placeholder_missing_visible_values(tab_name: str, row: list[object]) -> list[object]:
+    placeholder_indexes = _visible_placeholder_indexes(tab_name)
+    if not placeholder_indexes:
+        return row
+
+    updated = list(row)
+    for index in placeholder_indexes:
+        if index >= len(updated):
+            continue
+        value = updated[index]
+        if value is None or (isinstance(value, str) and not value.strip()):
+            updated[index] = "-"
+    return updated
+
+
 def _prepare_rows_for_sheet_update(tab_name: str, rows: list[list[object]]) -> list[list[object]]:
     if not rows:
         return rows
@@ -3004,7 +3170,7 @@ def _prepare_rows_for_sheet_update(tab_name: str, rows: list[list[object]]) -> l
 
     prepared_rows: list[list[object]] = []
     for row in rows:
-        prepared = list(row)
+        prepared = _placeholder_missing_visible_values(tab_name, list(row))
         for index in literal_indexes:
             if index >= len(prepared):
                 continue
@@ -3110,6 +3276,24 @@ def _display_sender_or_company(record: BillRecord) -> str:
     return _sender_display_name(record) or _coalesce_text(record.company_name)
 
 
+def _payment_sender_display_name(record: BillRecord) -> str:
+    return _sender_display_name(record)
+
+
+def _payment_sender_iban(record: BillRecord) -> str:
+    return _text_value(record.sender_iban)
+
+
+def _payment_recipient_iban(record: BillRecord) -> str:
+    return _text_value(record.recipient_iban)
+
+
+def _payment_bank_name(record: BillRecord, category: DocumentCategory) -> str:
+    if category == DocumentCategory.CEK:
+        return _coalesce_text(record.cheque_bank_name, record.bank_name)
+    return _coalesce_text(record.bank_name)
+
+
 def _document_reference(record: BillRecord) -> str:
     return str(record.invoice_number or record.document_number or record.receipt_number or record.cheque_serial_number or "")
 
@@ -3175,9 +3359,9 @@ def _counterparty_name(record: BillRecord, category: DocumentCategory) -> str:
     if category == DocumentCategory.ELDEN_ODEME:
         return str(record.recipient_name or record.buyer_name or record.company_name or record.description or "")
     if category == DocumentCategory.ODEME_DEKONTU:
-        return str(record.recipient_name or record.buyer_name or record.company_name or _sender_display_name(record) or "")
+        return str(record.recipient_name or record.buyer_name or "")
     if category == DocumentCategory.CEK:
-        return str(record.recipient_name or record.notes or record.company_name or "")
+        return str(record.recipient_name or record.buyer_name or record.notes or "")
     return str(record.recipient_name or record.company_name or record.buyer_name or _sender_display_name(record) or "")
 
 
@@ -3530,7 +3714,8 @@ def _build_row_for_tab(
             _safe(_sender_display_name(record)),
             _safe(record.recipient_name or record.buyer_name),
             _safe(record.document_number or record.invoice_number),
-            _safe(record.iban or record.cheque_account_ref),
+            _safe(record.sender_iban),
+            _safe(record.recipient_iban),
             _safe(record.bank_name or record.cheque_bank_name),
             _safe(record.cheque_serial_number or record.document_number),
             _safe(record.cheque_bank_name),
@@ -3570,6 +3755,9 @@ def _build_payment_allocation_row(
     description: str,
     reference_number: str,
     sender_name: str,
+    sender_iban: str = '',
+    recipient_iban: str = '',
+    bank_name: str = '',
     payment_amount: float | int | str | None,
     payment_date: str,
     remaining_balance: float | int | str | None,
@@ -3581,18 +3769,32 @@ def _build_payment_allocation_row(
     debt_row_id: str,
     tax_number: str = '',
     allocation_id: str = '',
+    target_tab: str = "Banka Ödemeleri",
     spreadsheet=None,
 ) -> list:
-    return [
+    visible_values = [
         _safe(party_name),
         _safe(description),
         _safe(reference_number),
         _safe(sender_name),
+    ]
+    if target_tab == "Banka Ödemeleri":
+        visible_values.extend([
+            _safe(sender_iban),
+            _safe(recipient_iban),
+            _safe(bank_name),
+        ])
+    visible_values.extend([
         _safe(payment_amount),
         _safe(payment_date),
         _safe(remaining_balance),
         _safe(status),
-        _drive_cell(drive_link, spreadsheet=spreadsheet),
+    ])
+    if target_tab == "Çekler":
+        visible_values.append(_safe(bank_name))
+    visible_values.append(_drive_cell(drive_link, spreadsheet=spreadsheet))
+
+    hidden_values = [
         row_id,
         _safe(party_key),
         _safe(source_doc_id),
@@ -3602,6 +3804,7 @@ def _build_payment_allocation_row(
         _safe(tax_number),
         'odeme',
     ]
+    return visible_values + hidden_values
 
 
 def _build_allocation_detail_row(
@@ -3851,6 +4054,7 @@ def _build_payment_projection_rows(
     spreadsheet=None,
 ) -> tuple[list[list], list[list], list[dict[str, object]]]:
     source_doc_id = item_id
+    target_tab = "Çekler" if category == DocumentCategory.CEK else "Banka Ödemeleri"
     amount = float(_primary_amount(record) or 0)
     payment_magnitude = abs(amount)
     payment_date = str(record.document_date or record.cheque_due_date or record.cheque_issue_date or '')
@@ -3858,7 +4062,10 @@ def _build_payment_projection_rows(
     payment_party_name = _counterparty_name(record, category)
     receivable_party_name = _receivable_counterparty_name(record)
     payment_reference = _document_reference(record)
-    payment_sender_name = _display_sender_or_company(record)
+    payment_sender_name = _payment_sender_display_name(record)
+    payment_sender_iban = _payment_sender_iban(record)
+    payment_recipient_iban = _payment_recipient_iban(record)
+    payment_bank_name = _payment_bank_name(record, category)
     payment_tax_number = ledger.normalize_tax_number(record.tax_number)
 
     payable_match = ledger.match_payment_party(
@@ -4024,6 +4231,9 @@ def _build_payment_projection_rows(
         description=row_description,
         reference_number=payment_reference,
         sender_name=payment_sender_name,
+        sender_iban=payment_sender_iban,
+        recipient_iban=payment_recipient_iban,
+        bank_name=payment_bank_name,
         payment_amount=amount,
         payment_date=payment_date,
         remaining_balance=row_remaining_balance,
@@ -4035,6 +4245,7 @@ def _build_payment_projection_rows(
         debt_row_id='',
         tax_number=row_tax_number,
         allocation_id='',
+        target_tab=target_tab,
         spreadsheet=spreadsheet,
     ))
 
@@ -4613,7 +4824,7 @@ def _pending_sheet_batch_priority(item: dict) -> tuple[int, int]:
     tab_name = str(item.get("tab_name") or "")
     if tab_name in {"Masraf Kayıtları", "Faturalar", "Sevk Fişleri"}:
         return (0, 0)
-    if tab_name == "Banka Ödemeleri":
+    if tab_name in {"Banka Ödemeleri", "Çekler"}:
         return (1, 0)
     if tab_name.startswith("__") and tab_name != "__Raw Belgeler":
         return (2, 0)
@@ -4887,7 +5098,7 @@ def process_pending_sheet_appends(*, max_items: int | None = None) -> int:
             with _lock:
                 sh = _open_spreadsheet_by_key(client, spreadsheet_id)
                 audit_tabs = {tab_name, '📊 Özet'}
-                if tab_name == 'Banka Ödemeleri':
+                if tab_name in {'Banka Ödemeleri', 'Çekler'}:
                     audit_tabs.update({'Masraf Kayıtları', '__Ödeme_Dağıtımları', '__Cari_Kartlar'})
                 _audit_spreadsheet_layout(sh, repair=True, target_tabs=audit_tabs)
                 ws = _ensure_tab_exists(sh, tab_name)
@@ -4906,7 +5117,7 @@ def process_pending_sheet_appends(*, max_items: int | None = None) -> int:
                 ]
 
                 if new_items:
-                    if tab_name == 'Banka Ödemeleri':
+                    if tab_name in {'Banka Ödemeleri', 'Çekler'}:
                         allocation_ws = _ensure_tab_exists(sh, '__Ödeme_Dağıtımları', lightweight=True)
                         debt_state = _load_expense_debt_state(sh)
                         start_row_number = len(ws.col_values(1)) + 1
@@ -4929,13 +5140,13 @@ def process_pending_sheet_appends(*, max_items: int | None = None) -> int:
                             )
                             row_targets_by_item[item_id] = []
                             row_start = start_row_number + len(visible_rows)
-                            row_id_idx = _header_index('Banka Ödemeleri', _HIDDEN_ROW_ID_HEADER)
+                            row_id_idx = _header_index(tab_name, _HIDDEN_ROW_ID_HEADER)
                             for offset, row in enumerate(built_visible_rows):
                                 row_id = str(row[row_id_idx] if row_id_idx is not None else item_id)
                                 row_targets_by_item[item_id].append(
                                     _build_drive_link_target(
                                         spreadsheet_id=spreadsheet_id,
-                                        tab_name='Banka Ödemeleri',
+                                        tab_name=tab_name,
                                         row_number=row_start + offset,
                                         row_id=row_id,
                                     )
@@ -5253,7 +5464,8 @@ _ACTIVE_WORKBOOK_TABS = ["📊 Özet", *_VISIBLE_TABS]
 _RESETTABLE_WORKBOOK_TABS = ["📊 Özet", *_VISIBLE_TABS, "__Ödeme_Dağıtımları"]
 _AUTHORITATIVE_FIELDS: dict[str, tuple[str, ...]] = {
     "Masraf Kayıtları": ("Kategori", "Alıcı / Tedarikçi", "Açıklama", "Belge No / Referans"),
-    "Banka Ödemeleri": ("Alıcı / Tedarikçi", "Açıklama", "Referans No", "Gönderen"),
+    "Banka Ödemeleri": ("Alıcı / Tedarikçi", "Açıklama", "Referans No", "Gönderen", "Gönderen IBAN", "Alıcı IBAN", "Banka"),
+    "Çekler": ("Alıcı / Tedarikçi", "Açıklama", "Referans No", "Gönderen", "Banka"),
     "Faturalar": ("Fatura Tipi", "Alıcı", "Açıklama / Hizmet"),
     "Sevk Fişleri": ("Satıcı", "Alıcı", "Ürün Cinsi", "Ürün Miktarı", "Sevk Yeri", "Açıklama"),
 }
@@ -5310,7 +5522,12 @@ def _override_value(overrides: dict[str, object], header: str, fallback: object)
     return fallback
 
 
-def _payment_record_with_overrides(record: BillRecord, overrides: dict[str, object]) -> BillRecord:
+def _payment_record_with_overrides(
+    record: BillRecord,
+    overrides: dict[str, object],
+    *,
+    tab_name: str,
+) -> BillRecord:
     if not overrides:
         return record
 
@@ -5323,6 +5540,15 @@ def _payment_record_with_overrides(record: BillRecord, overrides: dict[str, obje
         updates["document_number"] = _text_value(overrides.get("Referans No"))
     if "Gönderen" in overrides:
         updates["sender_name"] = _text_value(overrides.get("Gönderen"))
+    if tab_name == "Banka Ödemeleri":
+        if "Gönderen IBAN" in overrides:
+            updates["sender_iban"] = _text_value(overrides.get("Gönderen IBAN"))
+        if "Alıcı IBAN" in overrides:
+            updates["recipient_iban"] = _text_value(overrides.get("Alıcı IBAN"))
+    if "Banka" in overrides:
+        bank_name = _text_value(overrides.get("Banka"))
+        updates["bank_name"] = bank_name
+        updates["cheque_bank_name"] = bank_name
     if not updates:
         return record
     return record.model_copy(update=updates)
@@ -5460,17 +5686,22 @@ def _build_shipment_projection_rows(documents: list[_canonical_store.StoredDocum
 def _build_payment_projection_rows_from_documents(
     documents: list[_canonical_store.StoredDocument],
     debt_state: list[dict[str, object]],
-) -> tuple[list[list[object]], dict[str, str], list[list[object]]]:
-    overrides_by_doc_id = _canonical_store.override_map_for_tab("Banka Ödemeleri")
-    rows: list[list] = []
-    hashes: dict[str, str] = {}
+) -> tuple[list[list[object]], list[list[object]], dict[str, str], dict[str, str], list[list[object]]]:
+    payment_overrides_by_doc_id = _canonical_store.override_map_for_tab("Banka Ödemeleri")
+    cheque_overrides_by_doc_id = _canonical_store.override_map_for_tab("Çekler")
+    payment_rows: list[list] = []
+    cheque_rows: list[list] = []
+    payment_hashes: dict[str, str] = {}
+    cheque_hashes: dict[str, str] = {}
     allocation_rows: list[list[object]] = []
 
     for document in documents:
         if document.category not in {DocumentCategory.ODEME_DEKONTU, DocumentCategory.CEK}:
             continue
+        tab_name = "Çekler" if document.category == DocumentCategory.CEK else "Banka Ödemeleri"
+        overrides_by_doc_id = cheque_overrides_by_doc_id if tab_name == "Çekler" else payment_overrides_by_doc_id
         overrides = overrides_by_doc_id.get(document.source_doc_id, {})
-        record = _payment_record_with_overrides(document.record, overrides)
+        record = _payment_record_with_overrides(document.record, overrides, tab_name=tab_name)
         visible_rows, built_allocation_rows, _ = _build_payment_projection_rows(
             record=record,
             category=document.category,
@@ -5480,14 +5711,20 @@ def _build_payment_projection_rows_from_documents(
         )
         if not visible_rows:
             continue
-        row = _apply_authoritative_overrides("Banka Ödemeleri", visible_rows[0], overrides_by_doc_id, document.source_doc_id)
-        rows.append(row)
+        row = _apply_authoritative_overrides(tab_name, visible_rows[0], overrides_by_doc_id, document.source_doc_id)
+        if tab_name == "Çekler":
+            cheque_rows.append(row)
+            cheque_hashes[document.source_doc_id] = _authoritative_hash(
+                _authoritative_values_from_row("Çekler", row)
+            )
+        else:
+            payment_rows.append(row)
+            payment_hashes[document.source_doc_id] = _authoritative_hash(
+                _authoritative_values_from_row("Banka Ödemeleri", row)
+            )
         allocation_rows.extend(built_allocation_rows)
-        hashes[document.source_doc_id] = _authoritative_hash(
-            _authoritative_values_from_row("Banka Ödemeleri", row)
-        )
 
-    return rows, hashes, allocation_rows
+    return payment_rows, cheque_rows, payment_hashes, cheque_hashes, allocation_rows
 
 
 def _build_expense_projection_rows(
@@ -5538,7 +5775,7 @@ def _build_expense_projection_rows(
 def _build_visible_projection_snapshot() -> tuple[dict[str, list[list[object]]], dict[str, dict[str, str]]]:
     documents = _canonical_store.list_documents()
     debt_state = _build_projection_debt_state(documents)
-    payment_rows, payment_hashes, allocation_rows = _build_payment_projection_rows_from_documents(documents, debt_state)
+    payment_rows, cheque_rows, payment_hashes, cheque_hashes, allocation_rows = _build_payment_projection_rows_from_documents(documents, debt_state)
     expense_rows, expense_hashes = _build_expense_projection_rows(debt_state)
     invoice_rows, invoice_hashes = _build_invoice_projection_rows(documents)
     shipment_rows, shipment_hashes = _build_shipment_projection_rows(documents)
@@ -5546,6 +5783,7 @@ def _build_visible_projection_snapshot() -> tuple[dict[str, list[list[object]]],
     rows_by_tab = {
         "Masraf Kayıtları": expense_rows,
         "Banka Ödemeleri": payment_rows,
+        "Çekler": cheque_rows,
         "Faturalar": invoice_rows,
         "Sevk Fişleri": shipment_rows,
         "__Ödeme_Dağıtımları": allocation_rows,
@@ -5553,6 +5791,7 @@ def _build_visible_projection_snapshot() -> tuple[dict[str, list[list[object]]],
     hashes_by_tab = {
         "Masraf Kayıtları": expense_hashes,
         "Banka Ödemeleri": payment_hashes,
+        "Çekler": cheque_hashes,
         "Faturalar": invoice_hashes,
         "Sevk Fişleri": shipment_hashes,
     }

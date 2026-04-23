@@ -134,6 +134,8 @@ class TestNormalizeRecord:
         record = _normalize_record(
             self._raw(
                 recipient_name="Mehmet Kaya",
+                sender_iban="TR330001100000000000000001",
+                recipient_iban="TR440001100000000000000002",
                 buyer_name="Kaya İnşaat",
                 invoice_type="E-Arşiv Fatura",
                 line_quantity="2,5",
@@ -182,6 +184,8 @@ class TestNormalizeRecord:
         assert record.withholding_rate == pytest.approx(20.0)
         assert record.withholding_amount == pytest.approx(75.0)
         assert record.payable_amount == pytest.approx(300.0)
+        assert record.sender_iban == "TR330001100000000000000001"
+        assert record.recipient_iban == "TR440001100000000000000002"
         assert record.iban == "TR120006200000000123456789"
         assert record.bank_name == "Yapı Kredi"
         assert record.shipment_origin == "Elazığ"
@@ -408,7 +412,9 @@ class TestExtractBill:
         prompt = mock_generate.call_args.kwargs["prompt"]
         assert "recipient_name aliciyi" in prompt
         assert "sender_name alanina sadece gonderen kisi/firma adini yaz" in prompt
-        assert "iban ve bank_name gorunuyorsa ayrica doldur" in prompt
+        assert "sender_iban gonderen hesabin ibanidir" in prompt
+        assert "recipient_iban alici hesabin ibanidir" in prompt
+        assert "Taraf net degilse ilgili alani null birak" in prompt
 
     def test_cheque_prompt_requests_bank_and_cheque_metadata(self, monkeypatch):
         monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
