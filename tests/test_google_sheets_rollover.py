@@ -42,6 +42,7 @@ def test_active_layout_excludes_iade_tab_and_keeps_technical_tabs_hidden():
     assert google_sheets._VISIBLE_TABS == [
         "Masraf Kayıtları",
         "Banka Ödemeleri",
+        "Çekler",
         "Faturalar",
         "Sevk Fişleri",
     ]
@@ -49,6 +50,7 @@ def test_active_layout_excludes_iade_tab_and_keeps_technical_tabs_hidden():
     assert google_sheets._header_index("Faturalar", google_sheets._VISIBLE_DRIVE_LINK_HEADER) == 17
     assert google_sheets._header_index("Faturalar", google_sheets._HIDDEN_DRIVE_LINK_HEADER) is None
     assert google_sheets._drive_column_letter("Faturalar") == "R"
+    assert google_sheets._canonical_tab_name("📝 Çekler") == "Çekler"
 
 
 def test_month_drive_folder_name_uses_fisler_prefix():
@@ -307,6 +309,9 @@ def test_payment_allocation_row_uses_reference_and_sender_columns():
         description="GİDEN FAST",
         reference_number="581829",
         sender_name="Yapı Kredi",
+        sender_iban="TR330001100000000000000001",
+        recipient_iban="TR440001100000000000000002",
+        bank_name="Garanti Bankası",
         payment_amount=444000.0,
         payment_date="2026-08-30",
         remaining_balance=444000.0,
@@ -318,7 +323,15 @@ def test_payment_allocation_row_uses_reference_and_sender_columns():
         debt_row_id="",
     )
 
-    assert row[:4] == ["MUZAFFER KARAKAŞ", "GİDEN FAST", "581829", "Yapı Kredi"]
+    assert row[:7] == [
+        "MUZAFFER KARAKAŞ",
+        "GİDEN FAST",
+        "581829",
+        "Yapı Kredi",
+        "TR330001100000000000000001",
+        "TR440001100000000000000002",
+        "Garanti Bankası",
+    ]
 
 
 def test_build_payment_projection_rows_marks_borc_yok_when_party_matches_but_open_debt_missing():
@@ -352,10 +365,10 @@ def test_build_payment_projection_rows_marks_borc_yok_when_party_matches_but_ope
     assert allocations == []
     assert len(rows) == 1
     assert cards[0]["party_key"] == "tax:4540007255"
-    assert rows[0][6] == 0
-    assert rows[0][7] == "Borç Yok"
-    assert rows[0][4] == -8008.37
-    assert rows[0][10] == "tax:4540007255"
+    assert rows[0][9] == 0
+    assert rows[0][10] == "Borç Yok"
+    assert rows[0][7] == -8008.37
+    assert rows[0][13] == "tax:4540007255"
 
 
 def test_build_payment_projection_rows_uses_receivable_side_for_cheque_matching():
@@ -394,7 +407,8 @@ def test_build_payment_projection_rows_uses_receivable_side_for_cheque_matching(
     assert rows[0][4] == 4000.0
     assert rows[0][6] == 4204.51
     assert rows[0][7] == "Kısmi"
-    assert rows[0][10] == "tax:4960863229"
+    assert rows[0][8] == ""
+    assert rows[0][11] == "tax:4960863229"
     assert allocations[0][2] == "receivable:recv-1"
     assert allocations[0][7] == 4000.0
 
@@ -428,9 +442,9 @@ def test_build_payment_projection_rows_allocates_negative_outgoing_payment_by_ab
     assert len(rows) == 1
     assert cards[0]["party_key"] == "name:abc market"
     assert allocations[0][7] == 40.0
-    assert rows[0][4] == -40.0
-    assert rows[0][6] == 60.0
-    assert rows[0][7] == "Kısmi"
+    assert rows[0][7] == -40.0
+    assert rows[0][9] == 60.0
+    assert rows[0][10] == "Kısmi"
 
 
 def test_build_payment_projection_rows_keeps_single_visible_row_for_multi_debt_allocation():
@@ -477,15 +491,74 @@ def test_build_payment_projection_rows_keeps_single_visible_row_for_multi_debt_a
     assert cards[0]["party_key"] == "tax:4540007255"
     assert rows[0][0] == "ŞEMSETTİN YILMAZ"
     assert rows[0][1] == "GİDEN FAST | 2 borca dağıtıldı"
-    assert rows[0][4] == 8008.37
-    assert rows[0][6] == 4054.08
-    assert rows[0][7] == "Kısmi"
-    assert rows[0][10] == "tax:4540007255"
+    assert rows[0][7] == 8008.37
+    assert rows[0][9] == 4054.08
+    assert rows[0][10] == "Kısmi"
+    assert rows[0][13] == "tax:4540007255"
     assert allocations[0][2] == "debt-1"
     assert allocations[1][2] == "debt-2"
     assert allocations[0][7] == 3857.94
     assert allocations[1][7] == 4150.43
 
+
+
+def test_build_visible_projection_snapshot_splits_cheques_from_banka_odemeleri(monkeypatch):
+    dekont = google_sheets._canonical_store.StoredDocument(
+        source_doc_id="dekont-1",
+        category=DocumentCategory.ODEME_DEKONTU,
+        return_source_category=None,
+        source_message_id="wamid-dekont-1",
+        record=BillRecord(
+            document_date="2026-04-11",
+            document_number="REF-123",
+            total_amount=1500.0,
+            sender_name="Ahmet Yılmaz",
+            sender_iban="TR330001100000000000000001",
+            recipient_name="Mehmet Demir",
+            recipient_iban="TR440001100000000000000002",
+            bank_name="Garanti Bankası",
+        ),
+        drive_link=None,
+        feedback_platform=None,
+        feedback_chat_id=None,
+        feedback_recipient_type=None,
+        feedback_message_id=None,
+        created_at="2026-04-11T10:00:00+00:00",
+        updated_at="2026-04-11T10:00:00+00:00",
+    )
+    cek = google_sheets._canonical_store.StoredDocument(
+        source_doc_id="cek-1",
+        category=DocumentCategory.CEK,
+        return_source_category=None,
+        source_message_id="wamid-cek-1",
+        record=BillRecord(
+            cheque_due_date="2026-04-12",
+            cheque_serial_number="CHK-1",
+            total_amount=2500.0,
+            sender_name="KANSA",
+            recipient_name="H. KARAKAYA",
+            cheque_bank_name="Ziraat Bankası",
+        ),
+        drive_link=None,
+        feedback_platform=None,
+        feedback_chat_id=None,
+        feedback_recipient_type=None,
+        feedback_message_id=None,
+        created_at="2026-04-11T10:00:00+00:00",
+        updated_at="2026-04-11T10:00:00+00:00",
+    )
+
+    monkeypatch.setattr(google_sheets._canonical_store, "list_documents", lambda: [dekont, cek])
+    monkeypatch.setattr(google_sheets, "_build_projection_debt_state", lambda documents: [])
+
+    rows_by_tab, hashes_by_tab = google_sheets._build_visible_projection_snapshot()
+
+    assert len(rows_by_tab["Banka Ödemeleri"]) == 1
+    assert len(rows_by_tab["Çekler"]) == 1
+    assert rows_by_tab["Banka Ödemeleri"][0][4] == "TR330001100000000000000001"
+    assert rows_by_tab["Banka Ödemeleri"][0][5] == "TR440001100000000000000002"
+    assert rows_by_tab["Çekler"][0][8] == "Ziraat Bankası"
+    assert set(hashes_by_tab) >= {"Banka Ödemeleri", "Çekler"}
 
 
 def test_build_visible_projection_snapshot_includes_hidden_payment_allocations(monkeypatch):
@@ -494,7 +567,7 @@ def test_build_visible_projection_snapshot_includes_hidden_payment_allocations(m
     monkeypatch.setattr(
         google_sheets,
         "_build_payment_projection_rows_from_documents",
-        lambda documents, debt_state: ([['payment-row']], {'doc-1': 'hash-1'}, [['alloc-row']]),
+        lambda documents, debt_state: ([['payment-row']], [['cheque-row']], {'doc-1': 'hash-1'}, {'doc-2': 'hash-2'}, [['alloc-row']]),
     )
     monkeypatch.setattr(google_sheets, "_build_expense_projection_rows", lambda debt_state: ([['expense-row']], {'exp-1': 'hash-exp'}))
     monkeypatch.setattr(google_sheets, "_build_invoice_projection_rows", lambda documents: ([['invoice-row']], {'inv-1': 'hash-inv'}))
@@ -503,8 +576,10 @@ def test_build_visible_projection_snapshot_includes_hidden_payment_allocations(m
     rows_by_tab, hashes_by_tab = google_sheets._build_visible_projection_snapshot()
 
     assert rows_by_tab['Banka Ödemeleri'] == [['payment-row']]
+    assert rows_by_tab['Çekler'] == [['cheque-row']]
     assert rows_by_tab['__Ödeme_Dağıtımları'] == [['alloc-row']]
     assert hashes_by_tab['Banka Ödemeleri'] == {'doc-1': 'hash-1'}
+    assert hashes_by_tab['Çekler'] == {'doc-2': 'hash-2'}
 
 
 def test_remap_legacy_fatura_row_replaces_sparse_bank_columns_with_dense_fields():
@@ -554,6 +629,52 @@ def test_remap_legacy_fatura_row_replaces_sparse_bank_columns_with_dense_fields(
     assert remapped[16] == "Banka: Yapı Kredi | IBAN: TR123 | Not: İade notu"
     assert remapped[17] == '=HYPERLINK("https://drive.google.com/file/d/test/view";"Görüntüle")'
 
+
+
+def test_remap_legacy_banka_odemeleri_row_leaves_split_ibans_blank_when_only_legacy_iban_exists():
+    legacy_headers = google_sheets._legacy_header_variants("Banka Ödemeleri")[0]
+    row = [
+        "MUZAFFER KARAKAŞ",
+        "GİDEN FAST",
+        "2026-03-31",
+        "0",
+        "8008.37",
+        "2026-03-31",
+        "0",
+        "Borç Yok",
+        '=HYPERLINK("https://drive.google.com/file/d/test/view";"Görüntüle")',
+        "row-1",
+        "party-1",
+        "doc-1",
+        "doc-1",
+        "",
+        "",
+        "4540007255",
+        "odeme",
+    ]
+
+    remapped = google_sheets._remap_legacy_visible_row(
+        "Banka Ödemeleri",
+        row,
+        legacy_headers=legacy_headers,
+        raw_by_doc_id={"doc-1": {"Banka": "Garanti Bankası", "IBAN": "TR-OLD"}},
+        payment_detail_by_doc_id={"doc-1": {"Referans": "REF-123", "Gönderen": "Ahmet Yılmaz"}},
+    )
+
+    assert remapped[:12] == [
+        "MUZAFFER KARAKAŞ",
+        "GİDEN FAST",
+        "REF-123",
+        "Ahmet Yılmaz",
+        "",
+        "",
+        "Garanti Bankası",
+        "8008.37",
+        "2026-03-31",
+        "0",
+        "Borç Yok",
+        '=HYPERLINK("https://drive.google.com/file/d/test/view";"Görüntüle")',
+    ]
 
 
 def test_apply_remapped_visible_rows_rewrites_drive_cells_after_bulk_update(monkeypatch):
@@ -659,7 +780,7 @@ def test_repair_drive_link_formulas_rewrites_old_comma_separator():
 
     ws.update.assert_called_once_with(
         [['=HYPERLINK("https://drive.google.com/file/d/a/view";"Görüntüle")']],
-        "I3",
+        "L3",
         value_input_option="USER_ENTERED",
     )
 
@@ -784,6 +905,84 @@ def test_get_or_create_spreadsheet_creates_new_month_without_overwriting_old_reg
     )
     client.open_by_key.assert_called_once_with("sheet-april")
     bootstrap_mock.assert_called_once_with(spreadsheet)
+
+
+def test_get_or_create_spreadsheet_reuses_existing_month_sheet_when_registry_missing_and_cache_cold():
+    client = MagicMock()
+    spreadsheet = MagicMock()
+    client.open_by_key.return_value = spreadsheet
+
+    with patch(
+        "app.services.providers.google_sheets._load_registry",
+        return_value={"2026-03": "sheet-march"},
+    ), patch(
+        "app.services.providers.google_sheets._save_registry",
+    ) as save_registry_mock, patch(
+        "app.services.providers.google_sheets._month_key",
+        return_value="2026-04",
+    ), patch(
+        "app.services.providers.google_sheets._month_label",
+        return_value="Nisan 2026",
+    ), patch(
+        "app.services.providers.google_sheets.settings.google_sheets_spreadsheet_id",
+        "",
+    ), patch(
+        "app.services.providers.google_sheets.settings.google_sheets_owner_email",
+        "",
+    ), patch(
+        "app.services.providers.google_sheets._find_existing_spreadsheet_in_drive",
+        return_value="sheet-april-existing",
+    ) as find_existing_mock, patch(
+        "app.services.providers.google_sheets._try_create_spreadsheet_in_drive",
+    ) as create_mock, patch(
+        "app.services.providers.google_sheets._bootstrap_spreadsheet_tabs",
+    ) as bootstrap_mock:
+        google_sheets._drive_folder_cache.clear()
+        result = google_sheets._get_or_create_spreadsheet(client)
+
+    assert result is spreadsheet
+    find_existing_mock.assert_called_once_with("Muhasebe — Nisan 2026")
+    save_registry_mock.assert_called_once_with(
+        {"2026-03": "sheet-march", "2026-04": "sheet-april-existing"}
+    )
+    client.open_by_key.assert_called_once_with("sheet-april-existing")
+    create_mock.assert_not_called()
+    bootstrap_mock.assert_not_called()
+
+
+def test_find_existing_spreadsheet_in_drive_searches_month_folder_when_cache_is_cold():
+    drive = MagicMock()
+    list_mock = drive.files.return_value.list
+
+    def _list_for_query(*, q, **kwargs):
+        if "'folder-april' in parents" in q:
+            return MagicMock(execute=MagicMock(return_value={"files": [{"id": "sheet-april-existing"}]}))
+        if "'parent-folder' in parents" in q:
+            return MagicMock(execute=MagicMock(return_value={"files": []}))
+        raise AssertionError(q)
+
+    list_mock.side_effect = _list_for_query
+
+    with patch(
+        "app.services.providers.google_sheets.settings.google_drive_parent_folder_id",
+        "parent-folder",
+    ), patch(
+        "app.services.providers.google_sheets._get_oauth_drive_service",
+        return_value=drive,
+    ), patch(
+        "app.services.providers.google_sheets._get_drive_service",
+        return_value=None,
+    ), patch(
+        "app.services.providers.google_sheets._get_or_create_month_drive_folder",
+        return_value="folder-april",
+    ), patch(
+        "app.services.providers.google_sheets._month_drive_folder_name",
+        return_value="Fişler — Nisan 2026",
+    ):
+        google_sheets._drive_folder_cache.clear()
+        result = google_sheets._find_existing_spreadsheet_in_drive("Muhasebe — Nisan 2026")
+
+    assert result == "sheet-april-existing"
 
 
 def test_google_sheets_startup_bootstrap_runs_preparation_and_queue_drain_steps():

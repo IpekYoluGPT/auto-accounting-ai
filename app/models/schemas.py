@@ -259,6 +259,8 @@ class BillRecord(BaseModel):
     withholding_rate: Optional[float] = None
     withholding_amount: Optional[float] = None
     payable_amount: Optional[float] = None
+    sender_iban: Optional[str] = None
+    recipient_iban: Optional[str] = None
     iban: Optional[str] = None
     bank_name: Optional[str] = None
     shipment_origin: Optional[str] = None
@@ -325,6 +327,8 @@ class AIExtractionResult(BaseModel):
     withholding_rate: Optional[float] = None
     withholding_amount: Optional[float] = None
     payable_amount: Optional[float] = None
+    sender_iban: Optional[str] = None
+    recipient_iban: Optional[str] = None
     iban: Optional[str] = None
     bank_name: Optional[str] = None
     shipment_origin: Optional[str] = None

@@ -55,8 +55,11 @@ _CATEGORY_SPECIFIC_INSTRUCTIONS: dict[DocumentCategory, str] = {
 - recipient_name aliciyi / paranin gittigi kisi veya firmayi belirtir.
 - document_number alanina referans / islem / dekont numarasini koy.
 - total_amount transfer edilen nihai tutardir.
+- sender_iban gonderen hesabin ibanidir; net degilse null birak.
+- recipient_iban alici hesabin ibanidir; net degilse null birak.
 - iban ve bank_name gorunuyorsa ayrica doldur.
 - sender_name alanina sadece gonderen kisi/firma adini yaz; telefon, IBAN, hesap numarasi, referans veya aciklama yazma. Isim gorunmuyorsa null birak.
+- Taraf net degilse ilgili alani null birak; banka/firma adiyla tahmin yapma.
 - description alanina alici veya islem aciklamasini kisa ve yararli bicimde koy.""",
     DocumentCategory.HARCAMA_FISI: """Belge ailesi: HARCAMA FISI.
 - company_name satici isletmedir.
@@ -290,6 +293,8 @@ def _normalize_record(raw: dict) -> BillRecord:
         withholding_rate=_safe_float(raw.get("withholding_rate")),
         withholding_amount=_safe_float(raw.get("withholding_amount")),
         payable_amount=_safe_float(raw.get("payable_amount")),
+        sender_iban=_safe_str(raw.get("sender_iban")),
+        recipient_iban=_safe_str(raw.get("recipient_iban")),
         iban=_safe_str(raw.get("iban")),
         bank_name=_safe_str(raw.get("bank_name")),
         shipment_origin=_safe_str(raw.get("shipment_origin")),

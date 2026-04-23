@@ -24,8 +24,8 @@ class FakeApiError(Exception):
 
 
 def _banka_odemeleri_lookup_row(row_id: str) -> list[str]:
-    row = [""] * 12
-    row[9] = row_id
+    row = [""] * 13
+    row[12] = row_id
     return row
 
 
@@ -133,6 +133,11 @@ def test_upload_document_retries_transient_ssl_error(monkeypatch):
         "_get_or_create_month_drive_folder",
         lambda: "folder-1",
     )
+    monkeypatch.setattr(
+        google_sheets,
+        "_upload_destination_folder_id",
+        lambda mime_type: "folder-1",
+    )
     monkeypatch.setattr("app.services.providers.google_sheets.time.sleep", lambda seconds: None)
 
     link = google_sheets.upload_document(
@@ -143,6 +148,72 @@ def test_upload_document_retries_transient_ssl_error(monkeypatch):
 
     assert link == "https://drive.google.com/file/d/test/view"
     assert call_state["count"] == 2
+
+
+def test_upload_document_places_images_in_resimler_subfolder(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeCreateRequest:
+        def execute(self):
+            return {"webViewLink": "https://drive.google.com/file/d/test/view"}
+
+    class FakeFilesResource:
+        def create(self, **kwargs):
+            captured["parents"] = kwargs["body"].get("parents")
+            return FakeCreateRequest()
+
+    class FakeDriveService:
+        def files(self):
+            return FakeFilesResource()
+
+    monkeypatch.setattr(google_sheets.settings, "google_drive_parent_folder_id", "folder-root")
+    monkeypatch.setattr(
+        google_sheets,
+        "_get_oauth_drive_service",
+        lambda force_refresh=False: None,
+    )
+    monkeypatch.setattr(
+        google_sheets,
+        "_get_drive_service",
+        lambda force_refresh=False: FakeDriveService(),
+    )
+    monkeypatch.setattr(
+        google_sheets,
+        "_get_or_create_month_drive_folder",
+        lambda: "folder-root",
+    )
+    monkeypatch.setattr(
+        google_sheets,
+        "_upload_destination_folder_id",
+        lambda mime_type: "folder-images",
+        raising=False,
+    )
+
+    link = google_sheets.upload_document(
+        b"fake-image",
+        filename="receipt.jpg",
+        mime_type="image/jpeg",
+    )
+
+    assert link == "https://drive.google.com/file/d/test/view"
+    assert captured["parents"] == ["folder-images"]
+
+
+def test_upload_destination_folder_id_places_pdfs_in_resimler_subfolder(monkeypatch):
+    monkeypatch.setattr(
+        google_sheets,
+        "_get_or_create_month_drive_folder",
+        lambda: "folder-root",
+    )
+    monkeypatch.setattr(
+        google_sheets,
+        "_get_or_create_drive_subfolder",
+        lambda parent_id, folder_name: "folder-images",
+    )
+
+    folder_id = google_sheets._upload_destination_folder_id("application/pdf")
+
+    assert folder_id == "folder-images"
 
 
 def test_upload_document_serializes_concurrent_drive_requests(monkeypatch):
@@ -191,6 +262,11 @@ def test_upload_document_serializes_concurrent_drive_requests(monkeypatch):
         google_sheets,
         "_get_or_create_month_drive_folder",
         lambda: "folder-1",
+    )
+    monkeypatch.setattr(
+        google_sheets,
+        "_upload_destination_folder_id",
+        lambda mime_type: "folder-1",
     )
 
     results: list[str | None] = []
@@ -288,7 +364,7 @@ def test_process_pending_document_uploads_backfills_missing_drive_links(tmp_path
     fake_sheet.worksheet.assert_called_once_with("Banka Ödemeleri")
     fake_ws.update.assert_called_once_with(
         [['=HYPERLINK("https://drive.google.com/file/d/pending/view";"Görüntüle")']],
-        "I7",
+        "L7",
         value_input_option="USER_ENTERED",
     )
     assert google_sheets._load_pending_drive_uploads() == []
@@ -332,10 +408,10 @@ def test_process_pending_document_uploads_resolves_row_id_after_row_reorder(tmp_
     processed = google_sheets.process_pending_document_uploads()
 
     assert processed == 1
-    fake_ws.get.assert_called_once_with("A3:L")
+    fake_ws.get.assert_called_once_with("A3:O")
     fake_ws.update.assert_called_once_with(
         [['=HYPERLINK("https://drive.google.com/file/d/pending/view";"Görüntüle")']],
-        "I4",
+        "L4",
         value_input_option="USER_ENTERED",
     )
 
@@ -390,7 +466,7 @@ def test_process_pending_document_uploads_reuses_cached_drive_link_after_row_loo
     assert upload_calls["count"] == 1
     fake_ws.update.assert_called_once_with(
         [['=HYPERLINK("https://drive.google.com/file/d/pending/view";"Görüntüle")']],
-        "I3",
+        "L3",
         value_input_option="USER_ENTERED",
     )
     assert google_sheets._load_pending_drive_uploads() == []
@@ -456,8 +532,8 @@ def test_queue_pending_document_upload_merges_targets_for_split_documents(tmp_pa
     assert len(items) == 1
     assert items[0]["source_message_id"] == "wamid-merge-split"
     assert items[0]["targets"] == [
-        {"spreadsheet_id": "sheet-1", "tab_name": "Banka Ödemeleri", "row_number": 3, "row_id": "row-check-1"},
-        {"spreadsheet_id": "sheet-1", "tab_name": "Banka Ödemeleri", "row_number": 4, "row_id": "row-check-2"},
+        {"spreadsheet_id": "sheet-1", "tab_name": "Çekler", "row_number": 3, "row_id": "row-check-1"},
+        {"spreadsheet_id": "sheet-1", "tab_name": "Çekler", "row_number": 4, "row_id": "row-check-2"},
     ]
 
 
@@ -947,6 +1023,92 @@ def test_prepare_rows_for_sheet_update_forces_reference_columns_to_plain_text_li
     assert prepared[0][11] == "'doc-1"
     assert prepared[0][12] == "'0012345678"
     assert prepared[0][5] == 1500.0
+
+
+def test_prepare_rows_for_sheet_update_fills_missing_visible_cells_with_dash():
+    rows = [[
+        '2026-04-18',
+        'Toptan Satış Faturası',
+        'ABC Ltd.',
+        '',
+        '123',
+        'Musteri A',
+        'Aciklama',
+        '3 kalem',
+        '',
+        2500.0,
+        20.0,
+        500.0,
+        'HAYIR',
+        0.0,
+        3000.0,
+        'TRY',
+        '',
+        '',
+        'row-1',
+        'party-1',
+        'doc-1',
+        '',
+        'fatura',
+    ]]
+
+    prepared = google_sheets._prepare_rows_for_sheet_update('Faturalar', rows)
+
+    assert prepared[0][3] == '-'
+    assert prepared[0][8] == '-'
+    assert prepared[0][16] == '-'
+    assert prepared[0][17] == ''
+    assert prepared[0][21] == ''
+
+
+def test_prepare_rows_for_sheet_update_keeps_hidden_tabs_without_dash_placeholders():
+    rows = [[
+        '',
+        '',
+        '',
+        '',
+        '',
+        '',
+        '',
+        '',
+        '',
+        '',
+        '',
+    ]]
+
+    prepared = google_sheets._prepare_rows_for_sheet_update('__Ödeme_Dağıtımları', rows)
+
+    assert prepared == rows
+
+
+def test_prepare_rows_for_sheet_update_applies_dash_after_blank_visible_override():
+    row = [
+        '2026-04-18',
+        'Malzeme',
+        'ABC Ltd.',
+        'Aciklama',
+        'REF-1',
+        1500.0,
+        0.0,
+        1500.0,
+        '',
+        'row-1',
+        'party-1',
+        'doc-1',
+        '0012345678',
+        'harcama_fisi',
+        0.0,
+    ]
+
+    overridden = google_sheets._apply_authoritative_overrides(
+        'Masraf Kayıtları',
+        row,
+        {'doc-1': {'Belge No / Referans': ''}},
+        'doc-1',
+    )
+    prepared = google_sheets._prepare_rows_for_sheet_update('Masraf Kayıtları', [overridden])
+
+    assert prepared[0][4] == "'-"
 
 
 def test_build_row_for_sevk_formats_quantity_with_unit_and_uses_line_item_summary():
