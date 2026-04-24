@@ -66,15 +66,19 @@ _CATEGORY_SPECIFIC_INSTRUCTIONS: dict[DocumentCategory, str] = {
 - recipient_name fiste gorunen alici / musteri / teslim alan varsa onu yaz.
 - receipt_number icin once Fis No, yoksa Belge No kullan.
 - total_amount fisteki nihai toplamdir.
-- description alanina kisa urun/hizmet ozeti yaz.""",
+- line_items varsa her gorunen urun/hizmet satirini ayri cikar; description, line_quantity, line_unit, unit_price ve line_amount alanlarini doldur.
+- description alanina gorunen urun/hizmet satirlarini aynen koruyarak yaz; miktar, birim, birim fiyat ve urun adini atlama. Ornek: 75,170 LT X 62,53 | MOT V MAX E Dz10%20.
+- Sadece genel kategori yazma; Akaryakit alimi gibi ozetler gorunen satir detayinin yerine gecemez.""",
     DocumentCategory.CEK: """Belge ailesi: CEK.
 - document_number cek seri / belge numarasidir.
-- recipient_name lehdar / alici / cekin gidecegi kisi veya firmadir.
-- company_name duzenleyen banka veya firma adidir.
+- recipient_name lehdar / alici / cekin gidecegi kisi veya firmadir; recipient_name yalniz el yazisi ile yazilan "emrine" / payee satirindan alinmalidir.
+- sender_name veya company_name matbu/basilmis cek sahibi, kesideci veya duzenleyen kisi/firma adidir; el yazisi lehdar ile karistirma.
+- cheque_bank_name cek uzerindeki bankadir; banka adini sender_name/company_name alanina yazma.
 - cheque_issue_place, cheque_issue_date, cheque_due_date, cheque_serial_number, cheque_bank_name, cheque_branch ve cheque_account_ref gorunuyorsa ayri ayri doldur.
 - document_date alanina vade tarihi gorunuyorsa onu yaz; aksi halde gorunur ana tarihi yaz.
 - total_amount veya payable_amount cek tutari gorunuyorsa doldur.
-- notes alanina lehdar/alici gibi onemli serbest metni koy.""",
+- description alanini sadece ayri bir ticari not varsa doldur; lehdar/alici, kesideci/gonderen, cek tutari, yazi ile tutar, banka, sube, seri no, tarih, IBAN veya emrine satirini description alanina yazma.
+- notes alanina yalnizca description'a sigmayan gercek ek notlari koy; lehdar/alici veya tutar tekrarini koyma.""",
     DocumentCategory.MALZEME: """Belge ailesi: MALZEME / IRSALIYE / SEVK.
 - company_name tedarikci veya belge ust bilgisindeki firmadir.
 - recipient_name teslim alan / alici / sevk edilen taraf gorunuyorsa onu yaz.
