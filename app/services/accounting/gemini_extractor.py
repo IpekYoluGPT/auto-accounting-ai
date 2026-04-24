@@ -72,6 +72,9 @@ _CATEGORY_SPECIFIC_INSTRUCTIONS: dict[DocumentCategory, str] = {
     DocumentCategory.CEK: """Belge ailesi: CEK.
 - document_number cek seri / belge numarasidir.
 - recipient_name lehdar / alici / cekin gidecegi kisi veya firmadir; recipient_name yalniz el yazisi ile yazilan "emrine" / payee satirindan alinmalidir.
+- Cekte HAMILINE veya HAMİLİNE gorunuyorsa ve ayrica isimli payee yoksa recipient_name degerini "HAMİLİNE" yaz; null veya "-" birakma.
+- El yazisi lehdar matbu kesideciye benziyorsa bile recipient_name'i bos birakma; gorunen el yazisi payee satirini oldugu gibi yaz.
+- Yatay, ters veya yan donmus cek fotografini zihnen cevir; birden fazla cek varsa her cek icin kendi el yazisi payee satirini ayri oku.
 - sender_name veya company_name matbu/basilmis cek sahibi, kesideci veya duzenleyen kisi/firma adidir; el yazisi lehdar ile karistirma.
 - cheque_bank_name cek uzerindeki bankadir; banka adini sender_name/company_name alanina yazma.
 - cheque_issue_place, cheque_issue_date, cheque_due_date, cheque_serial_number, cheque_bank_name, cheque_branch ve cheque_account_ref gorunuyorsa ayri ayri doldur.
@@ -354,12 +357,18 @@ def extract_bills(
         raise RuntimeError("GEMINI_API_KEY is not configured.")
 
     model_name = settings.gemini_extractor_model
+    ocr_hint = _build_ocr_hint(
+        image_bytes=image_bytes,
+        mime_type=mime_type,
+        category_hint=category_hint,
+    )
     prompt = _build_extraction_prompt(
         category_hint=category_hint,
         document_count_hint=document_count_hint,
         is_return_hint=is_return_hint,
         strict_document_count=strict_document_count,
         split_retry=split_retry,
+        ocr_hint=ocr_hint,
     )
 
     logger.info(
@@ -410,6 +419,28 @@ def extract_bills(
 
 
 
+def _build_ocr_hint(
+    *,
+    image_bytes: bytes,
+    mime_type: str,
+    category_hint: DocumentCategory | None,
+) -> str | None:
+    if category_hint != DocumentCategory.CEK:
+        return None
+
+    try:
+        prepared = ocr.prepare_document(image_bytes, mime_type)
+        bundle = getattr(prepared, "ocr_bundle", None)
+        if bundle is None:
+            return None
+        hint = ocr.serialize_ocr_bundle(bundle, max_lines=80, max_tables=1)
+    except Exception as exc:
+        logger.info("Cheque OCR hint unavailable; continuing with Gemini vision only: %s", exc)
+        return None
+
+    return hint or None
+
+
 def extract_bill(
     image_bytes: bytes,
     mime_type: str = "image/jpeg",
@@ -449,6 +480,7 @@ def _build_extraction_prompt(
     is_return_hint: bool,
     strict_document_count: int | None,
     split_retry: bool,
+    ocr_hint: str | None = None,
 ) -> str:
     category = category_hint or DocumentCategory.BELIRSIZ
     category_instructions = _CATEGORY_SPECIFIC_INSTRUCTIONS.get(
@@ -490,5 +522,10 @@ def _build_extraction_prompt(
     ]
     if retry_lines:
         prompt_parts.append("\n\n".join(retry_lines))
+    if ocr_hint:
+        prompt_parts.append(
+            "OCR ipucu (goruntuyle dogrula; lehdar/payee, HAMİLİNE ve cek numarasi icin kullan):\n"
+            f"{ocr_hint}"
+        )
     prompt_parts.append(_EXTRACTION_EXAMPLES)
     return "\n\n".join(prompt_parts)
