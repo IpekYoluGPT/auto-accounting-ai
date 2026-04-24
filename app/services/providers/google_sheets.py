@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import shutil
 import ssl
 import sys
@@ -128,10 +129,10 @@ _TAB_SPECS: dict[str, SheetSpec] = {
     ),
     "Çekler": SheetSpec(
         visible_headers=(
-            "Alıcı / Tedarikçi",
+            "Lehdar",
             "Açıklama",
-            "Referans No",
-            "Gönderen",
+            "Çek No",
+            "Çeki Düzenleyen",
             "Ödeme Tutarı (TL)",
             "Ödeme Tarihi",
             "Kalan Bakiye (TL)",
@@ -455,10 +456,10 @@ _TAB_COLUMN_WIDTHS: dict[str, dict[str, int]] = {
         "Belge": 64,
     },
     "Çekler": {
-        "Alıcı / Tedarikçi": 132,
+        "Lehdar": 132,
         "Açıklama": 154,
-        "Referans No": 92,
-        "Gönderen": 126,
+        "Çek No": 92,
+        "Çeki Düzenleyen": 126,
         "Ödeme Tutarı (TL)": 88,
         "Ödeme Tarihi": 74,
         "Kalan Bakiye (TL)": 90,
@@ -537,10 +538,20 @@ _AMOUNT_COLUMNS = {
     "Kalan",
 }
 
+_DATE_COLUMNS = {
+    "Tarih",
+    "Ödeme Tarihi",
+    "Fatura Tarihi",
+    "Borç Tarihi",
+    "Keşide Tarihi",
+    "Vade Tarihi",
+}
+
 # Columns that must stay literal text even when they look numeric.
 _TEXT_LITERAL_COLUMNS = {
     "Belge No / Referans",
     "Referans No",
+    "Çek No",
     "Gönderen IBAN",
     "Alıcı IBAN",
     "Fatura No",
@@ -654,6 +665,18 @@ _LEGACY_VISIBLE_HEADER_VARIANTS: dict[str, tuple[tuple[str, ...], ...]] = {
         "Ödeme Tarihi",
         "Kalan Bakiye (TL)",
         "Durum",
+        _VISIBLE_DRIVE_LINK_HEADER,
+    ),),
+    "Çekler": ((
+        "Alıcı / Tedarikçi",
+        "Açıklama",
+        "Referans No",
+        "Gönderen",
+        "Ödeme Tutarı (TL)",
+        "Ödeme Tarihi",
+        "Kalan Bakiye (TL)",
+        "Durum",
+        "Banka",
         _VISIBLE_DRIVE_LINK_HEADER,
     ),),
     "Faturalar": ((
@@ -1480,25 +1503,42 @@ def _apply_lightweight_layout(ws, tab_name: str) -> None:
     requests = _visibility_requests(ws, tab_name)
     headers = _headers(tab_name)
     for index, header in enumerate(headers):
-        if header not in _TEXT_LITERAL_COLUMNS:
-            continue
-        requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws.id,
-                    "startRowIndex": 2,
-                    "startColumnIndex": index,
-                    "endColumnIndex": index + 1,
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "numberFormat": {"type": "TEXT"},
-                        "horizontalAlignment": "LEFT",
-                    }
-                },
-                "fields": "userEnteredFormat(numberFormat,horizontalAlignment)",
-            }
-        })
+        if header in _TEXT_LITERAL_COLUMNS:
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": 2,
+                        "startColumnIndex": index,
+                        "endColumnIndex": index + 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {"type": "TEXT"},
+                            "horizontalAlignment": "LEFT",
+                        }
+                    },
+                    "fields": "userEnteredFormat(numberFormat,horizontalAlignment)",
+                }
+            })
+        if header in _DATE_COLUMNS:
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": 2,
+                        "startColumnIndex": index,
+                        "endColumnIndex": index + 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {"type": "DATE", "pattern": "dd-mm-yyyy"},
+                            "horizontalAlignment": "CENTER",
+                        }
+                    },
+                    "fields": "userEnteredFormat(numberFormat,horizontalAlignment)",
+                }
+            })
     if not requests:
         return
     try:
@@ -1627,6 +1667,24 @@ def _setup_worksheet(ws, tab_name: str, *, lightweight: bool = False) -> None:
                         "userEnteredFormat": {
                             "numberFormat": {"type": "TEXT"},
                             "horizontalAlignment": "LEFT",
+                        }
+                    },
+                    "fields": "userEnteredFormat(numberFormat,horizontalAlignment)",
+                }
+            })
+        if header in _DATE_COLUMNS:
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": 2,
+                        "startColumnIndex": i,
+                        "endColumnIndex": i + 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {"type": "DATE", "pattern": "dd-mm-yyyy"},
+                            "horizontalAlignment": "CENTER",
                         }
                     },
                     "fields": "userEnteredFormat(numberFormat,horizontalAlignment)",
@@ -2232,6 +2290,30 @@ def _remap_legacy_visible_row(
             row_map.get("Ödeme Tarihi", ""),
             row_map.get("Kalan Bakiye (TL)", ""),
             row_map.get("Durum", ""),
+            drive_value,
+        ]
+        return visible_values + _legacy_row_hidden_values(tab_name, row_map)
+
+    if tab_name == "Çekler":
+        cheque_description = row_map.get("Açıklama", "")
+        cheque_record = BillRecord(
+            recipient_name=_coalesce_text(row_map.get("Lehdar"), row_map.get("Alıcı / Tedarikçi")),
+            sender_name=_coalesce_text(row_map.get("Çeki Düzenleyen"), row_map.get("Gönderen")),
+            cheque_serial_number=_coalesce_text(row_map.get("Çek No"), row_map.get("Referans No")),
+            cheque_bank_name=_coalesce_text(row_map.get("Banka")),
+        )
+        if _is_cheque_description_noise(cheque_description, cheque_record):
+            cheque_description = ""
+        visible_values = [
+            row_map.get("Lehdar", row_map.get("Alıcı / Tedarikçi", "")),
+            cheque_description,
+            row_map.get("Çek No", row_map.get("Referans No", "")),
+            row_map.get("Çeki Düzenleyen", row_map.get("Gönderen", "")),
+            row_map.get("Ödeme Tutarı (TL)", ""),
+            row_map.get("Ödeme Tarihi", ""),
+            row_map.get("Kalan Bakiye (TL)", ""),
+            row_map.get("Durum", ""),
+            row_map.get("Banka", ""),
             drive_value,
         ]
         return visible_values + _legacy_row_hidden_values(tab_name, row_map)
@@ -3276,7 +3358,13 @@ def _display_sender_or_company(record: BillRecord) -> str:
     return _sender_display_name(record) or _coalesce_text(record.company_name)
 
 
-def _payment_sender_display_name(record: BillRecord) -> str:
+def _cheque_drawer_display_name(record: BillRecord) -> str:
+    return _coalesce_text(record.sender_name, record.company_name, record.source_sender_name)
+
+
+def _payment_sender_display_name(record: BillRecord, category: DocumentCategory | None = None) -> str:
+    if category == DocumentCategory.CEK:
+        return _cheque_drawer_display_name(record)
     return _sender_display_name(record)
 
 
@@ -3292,6 +3380,118 @@ def _payment_bank_name(record: BillRecord, category: DocumentCategory) -> str:
     if category == DocumentCategory.CEK:
         return _coalesce_text(record.cheque_bank_name, record.bank_name)
     return _coalesce_text(record.bank_name)
+
+
+_CHEQUE_AMOUNT_WORDS = {
+    "yalniz",
+    "yalnız",
+    "tl",
+    "try",
+    "turk",
+    "türk",
+    "lira",
+    "lirasi",
+    "lirası",
+    "kr",
+    "krs",
+    "kurus",
+    "kuruş",
+    "sifir",
+    "sıfır",
+    "bir",
+    "iki",
+    "uc",
+    "üç",
+    "dort",
+    "dört",
+    "bes",
+    "beş",
+    "alti",
+    "altı",
+    "yedi",
+    "sekiz",
+    "dokuz",
+    "on",
+    "yirmi",
+    "otuz",
+    "kirk",
+    "kırk",
+    "elli",
+    "altmis",
+    "altmış",
+    "yetmis",
+    "yetmiş",
+    "seksen",
+    "doksan",
+    "yuz",
+    "yüz",
+    "bin",
+    "milyon",
+    "milyar",
+}
+
+
+def _comparison_text(value: object) -> str:
+    return re.sub(r"[^0-9a-zçğıöşü]+", "", _text_value(value).casefold())
+
+
+def _cheque_description_is_amount_like(description: str) -> bool:
+    text = description.casefold()
+    tokens = re.findall(r"[a-zçğıöşü]+", text)
+    has_digit = any(ch.isdigit() for ch in text)
+    if has_digit and (set(tokens) <= _CHEQUE_AMOUNT_WORDS or "tl" in tokens or "try" in tokens):
+        return True
+    if tokens and set(tokens) <= _CHEQUE_AMOUNT_WORDS and any(
+        token in tokens for token in {"tl", "try", "lira", "lirasi", "lirası", "bin", "milyon", "milyar"}
+    ):
+        return True
+    return False
+
+
+def _is_cheque_description_noise(description: object, record: BillRecord) -> bool:
+    text = _text_value(description)
+    if not text or text in {"-", "—"}:
+        return True
+    if _cheque_description_is_amount_like(text):
+        return True
+    if re.fullmatch(r"[\d\s.,/:#-]+", text) and len(re.findall(r"\d", text)) >= 4:
+        return True
+
+    normalized = _comparison_text(text)
+    if not normalized:
+        return True
+
+    for candidate in (
+        record.recipient_name,
+        record.buyer_name,
+        record.sender_name,
+        record.company_name,
+        record.cheque_bank_name,
+        record.bank_name,
+        record.cheque_branch,
+        record.document_number,
+        record.cheque_serial_number,
+        record.cheque_account_ref,
+        record.tax_number,
+    ):
+        candidate_normalized = _comparison_text(candidate)
+        if len(candidate_normalized) < 6:
+            continue
+        if candidate_normalized in normalized:
+            if len(candidate_normalized) / max(len(normalized), 1) >= 0.55:
+                return True
+        elif normalized in candidate_normalized:
+            if len(normalized) / max(len(candidate_normalized), 1) >= 0.55:
+                return True
+    return False
+
+
+def _cheque_visible_description(record: BillRecord) -> str:
+    for candidate in (record.notes, record.description):
+        text = _text_value(candidate)
+        if text and not _is_cheque_description_noise(text, record):
+            return text
+    return ""
 
 
 def _document_reference(record: BillRecord) -> str:
@@ -3518,6 +3718,39 @@ def _shipment_quantity_display(record: BillRecord) -> str:
     return _display_quantity(quantity, unit, compact=True)
 
 
+def _expense_line_item_detail(item: dict[str, object]) -> str:
+    description = _text_value(item.get("description"))
+    quantity_value = _text_value(item.get("quantity"))
+    raw_unit = _text_value(item.get("unit"))
+    quantity = f"{quantity_value} {raw_unit}".strip() if quantity_value else ""
+    if quantity_value and not raw_unit:
+        quantity = _display_quantity(item.get("quantity"), item.get("unit"), compact=False)
+    unit_price = _text_value(item.get("unit_price"))
+    line_amount = _text_value(item.get("line_amount"))
+
+    parts: list[str] = []
+    if quantity and unit_price:
+        parts.append(f"{quantity} X {unit_price}")
+    elif quantity:
+        parts.append(quantity)
+    if description:
+        parts.append(description)
+    if not parts and line_amount:
+        parts.append(line_amount)
+    return " | ".join(parts)
+
+
+def _expense_visible_description(record: BillRecord) -> str:
+    line_details = [
+        detail
+        for detail in (_expense_line_item_detail(item) for item in _line_item_rows(record))
+        if detail
+    ]
+    if line_details:
+        return ", ".join(line_details)
+    return _coalesce_text(record.description, record.notes)
+
+
 def _is_generic_invoice_description(record: BillRecord, description: str | None) -> bool:
     normalized = " ".join(str(description or "").split()).casefold()
     if not normalized:
@@ -3649,7 +3882,7 @@ def _build_row_for_tab(
             _safe(record.document_date),
             _safe(record.expense_category or record.invoice_type or _return_source_label(return_source_category or category)),
             _safe(_counterparty_name(record, category)),
-            _safe(record.description or record.notes),
+            _safe(_expense_visible_description(record)),
             _safe(_document_reference(record)),
             _safe(signed_amount),
             _masraf_paid_formula(row_number, spreadsheet=separator_spreadsheet, spreadsheet_id=separator_spreadsheet_id),
@@ -4058,11 +4291,15 @@ def _build_payment_projection_rows(
     amount = float(_primary_amount(record) or 0)
     payment_magnitude = abs(amount)
     payment_date = str(record.document_date or record.cheque_due_date or record.cheque_issue_date or '')
-    description = str(record.description or record.notes or _document_reference(record) or '')
+    description = (
+        _cheque_visible_description(record)
+        if category == DocumentCategory.CEK
+        else str(record.description or record.notes or _document_reference(record) or '')
+    )
     payment_party_name = _counterparty_name(record, category)
     receivable_party_name = _receivable_counterparty_name(record)
     payment_reference = _document_reference(record)
-    payment_sender_name = _payment_sender_display_name(record)
+    payment_sender_name = _payment_sender_display_name(record, category)
     payment_sender_iban = _payment_sender_iban(record)
     payment_recipient_iban = _payment_recipient_iban(record)
     payment_bank_name = _payment_bank_name(record, category)
@@ -4226,8 +4463,9 @@ def _build_payment_projection_rows(
         else:
             row_status = ledger.STATUS_KISMI
 
+    visible_party_name = payment_party_name if category == DocumentCategory.CEK else matched_display_name
     visible_rows.append(_build_payment_allocation_row(
-        party_name=matched_display_name,
+        party_name=visible_party_name,
         description=row_description,
         reference_number=payment_reference,
         sender_name=payment_sender_name,
@@ -5465,9 +5703,16 @@ _RESETTABLE_WORKBOOK_TABS = ["📊 Özet", *_VISIBLE_TABS, "__Ödeme_Dağıtıml
 _AUTHORITATIVE_FIELDS: dict[str, tuple[str, ...]] = {
     "Masraf Kayıtları": ("Kategori", "Alıcı / Tedarikçi", "Açıklama", "Belge No / Referans"),
     "Banka Ödemeleri": ("Alıcı / Tedarikçi", "Açıklama", "Referans No", "Gönderen", "Gönderen IBAN", "Alıcı IBAN", "Banka"),
-    "Çekler": ("Alıcı / Tedarikçi", "Açıklama", "Referans No", "Gönderen", "Banka"),
+    "Çekler": ("Lehdar", "Açıklama", "Çek No", "Çeki Düzenleyen", "Banka"),
     "Faturalar": ("Fatura Tipi", "Alıcı", "Açıklama / Hizmet"),
     "Sevk Fişleri": ("Satıcı", "Alıcı", "Ürün Cinsi", "Ürün Miktarı", "Sevk Yeri", "Açıklama"),
+}
+_AUTHORITATIVE_FIELD_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
+    "Çekler": {
+        "Lehdar": ("Alıcı / Tedarikçi",),
+        "Çek No": ("Referans No",),
+        "Çeki Düzenleyen": ("Gönderen",),
+    },
 }
 _PROJECTION_WORKER_POLL_SECONDS = 30.0
 _OVERRIDE_SYNC_INTERVAL_SECONDS = 300.0
@@ -5475,6 +5720,24 @@ _OVERRIDE_SYNC_INTERVAL_SECONDS = 300.0
 
 def _projection_target_tabs() -> list[str]:
     return list(_VISIBLE_TABS)
+
+
+def _header_aliases(tab_name: str, header: str) -> tuple[str, ...]:
+    return (header, *_AUTHORITATIVE_FIELD_ALIASES.get(tab_name, {}).get(header, ()))
+
+
+def _row_map_value_for_header(row_map: dict[str, object], tab_name: str, header: str) -> object:
+    for candidate in _header_aliases(tab_name, header):
+        if candidate in row_map:
+            return row_map.get(candidate, "")
+    return ""
+
+
+def _override_value_for_header(overrides: dict[str, object], tab_name: str, header: str) -> tuple[bool, object]:
+    for candidate in _header_aliases(tab_name, header):
+        if candidate in overrides:
+            return True, overrides.get(candidate)
+    return False, ""
 
 
 def _authoritative_values_from_row(tab_name: str, row: list[object]) -> dict[str, str]:
@@ -5488,7 +5751,10 @@ def _authoritative_values_from_row(tab_name: str, row: list[object]) -> dict[str
 
 
 def _authoritative_values_from_row_map(tab_name: str, row_map: dict[str, object]) -> dict[str, str]:
-    return {header: _text_value(row_map.get(header, "")) for header in _AUTHORITATIVE_FIELDS.get(tab_name, ())}
+    return {
+        header: _text_value(_row_map_value_for_header(row_map, tab_name, header))
+        for header in _AUTHORITATIVE_FIELDS.get(tab_name, ())
+    }
 
 
 def _authoritative_hash(values: dict[str, str]) -> str:
@@ -5502,6 +5768,8 @@ def _apply_authoritative_overrides(
     row: list[object],
     overrides_by_doc_id: dict[str, dict[str, object]],
     source_doc_id: str,
+    *,
+    record: BillRecord | None = None,
 ) -> list[object]:
     overrides = overrides_by_doc_id.get(source_doc_id)
     if not isinstance(overrides, dict):
@@ -5510,9 +5778,13 @@ def _apply_authoritative_overrides(
     updated = list(row)
     for header in _AUTHORITATIVE_FIELDS.get(tab_name, ()):
         index = _header_index(tab_name, header)
-        if index is None or header not in overrides:
+        has_override, override_value = _override_value_for_header(overrides, tab_name, header)
+        if index is None or not has_override:
             continue
-        updated[index] = overrides.get(header, "")
+        if tab_name == "Çekler" and header == "Açıklama" and record is not None:
+            if _is_cheque_description_noise(override_value, record):
+                continue
+        updated[index] = override_value
     return updated
 
 
@@ -5532,14 +5804,20 @@ def _payment_record_with_overrides(
         return record
 
     updates: dict[str, object] = {}
-    if "Alıcı / Tedarikçi" in overrides:
-        updates["recipient_name"] = _text_value(overrides.get("Alıcı / Tedarikçi"))
-    if "Açıklama" in overrides:
-        updates["description"] = _text_value(overrides.get("Açıklama"))
-    if "Referans No" in overrides:
-        updates["document_number"] = _text_value(overrides.get("Referans No"))
-    if "Gönderen" in overrides:
-        updates["sender_name"] = _text_value(overrides.get("Gönderen"))
+    has_recipient, recipient_override = _override_value_for_header(overrides, tab_name, "Lehdar" if tab_name == "Çekler" else "Alıcı / Tedarikçi")
+    if has_recipient:
+        updates["recipient_name"] = _text_value(recipient_override)
+    has_description, description_value = _override_value_for_header(overrides, tab_name, "Açıklama")
+    if has_description:
+        description_override = _text_value(description_value)
+        if tab_name != "Çekler" or not _is_cheque_description_noise(description_override, record):
+            updates["description"] = description_override
+    has_reference, reference_value = _override_value_for_header(overrides, tab_name, "Çek No" if tab_name == "Çekler" else "Referans No")
+    if has_reference:
+        updates["document_number"] = _text_value(reference_value)
+    has_sender, sender_value = _override_value_for_header(overrides, tab_name, "Çeki Düzenleyen" if tab_name == "Çekler" else "Gönderen")
+    if has_sender:
+        updates["sender_name"] = _text_value(sender_value)
     if tab_name == "Banka Ödemeleri":
         if "Gönderen IBAN" in overrides:
             updates["sender_iban"] = _text_value(overrides.get("Gönderen IBAN"))
@@ -5569,7 +5847,7 @@ def _build_projection_debt_state(documents: list[_canonical_store.StoredDocument
 
         overrides = overrides_by_doc_id.get(document.source_doc_id, {})
         display_name = _text_value(_override_value(overrides, "Alıcı / Tedarikçi", _counterparty_name(record, document.category)))
-        description = _text_value(_override_value(overrides, "Açıklama", record.description or record.notes))
+        description = _text_value(_override_value(overrides, "Açıklama", _expense_visible_description(record)))
         reference = _text_value(_override_value(overrides, "Belge No / Referans", _document_reference(record)))
         category_label = _text_value(
             _override_value(
@@ -5711,7 +5989,13 @@ def _build_payment_projection_rows_from_documents(
         )
         if not visible_rows:
             continue
-        row = _apply_authoritative_overrides(tab_name, visible_rows[0], overrides_by_doc_id, document.source_doc_id)
+        row = _apply_authoritative_overrides(
+            tab_name,
+            visible_rows[0],
+            overrides_by_doc_id,
+            document.source_doc_id,
+            record=record,
+        )
         if tab_name == "Çekler":
             cheque_rows.append(row)
             cheque_hashes[document.source_doc_id] = _authoritative_hash(

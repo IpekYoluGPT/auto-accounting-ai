@@ -51,6 +51,12 @@ def test_active_layout_excludes_iade_tab_and_keeps_technical_tabs_hidden():
     assert google_sheets._header_index("Faturalar", google_sheets._HIDDEN_DRIVE_LINK_HEADER) is None
     assert google_sheets._drive_column_letter("Faturalar") == "R"
     assert google_sheets._canonical_tab_name("📝 Çekler") == "Çekler"
+    assert google_sheets._visible_headers("Çekler")[:4] == [
+        "Lehdar",
+        "Açıklama",
+        "Çek No",
+        "Çeki Düzenleyen",
+    ]
 
 
 def test_month_drive_folder_name_uses_fisler_prefix():
@@ -332,6 +338,55 @@ def test_payment_allocation_row_uses_reference_and_sender_columns():
         "TR440001100000000000000002",
         "Garanti Bankası",
     ]
+    assert row[8] == "2026-08-30"
+
+
+def test_expense_row_preserves_exact_visible_receipt_line_details():
+    row = google_sheets._build_row_for_tab(
+        BillRecord(
+            document_date="2026-03-05",
+            receipt_number="0007",
+            company_name="ZAİMOĞLU PETROL",
+            total_amount=4700.38,
+            description="Akaryakıt alımı",
+            line_items=[
+                InvoiceLineItem(
+                    description="MOT V MAX E Dz10%20",
+                    quantity=75.170,
+                    unit="LT",
+                    unit_price=62.53,
+                    line_amount=4700.38,
+                ),
+            ],
+        ),
+        "Masraf Kayıtları",
+        category=DocumentCategory.HARCAMA_FISI,
+        row_id="fuel-1",
+        row_number=3,
+        drive_link=None,
+        source_doc_id="fuel-1",
+    )
+
+    assert row[3] == "75.17 LT X 62.53 | MOT V MAX E Dz10%20"
+
+
+def test_lightweight_layout_formats_date_columns_as_day_month_year():
+    ws = MagicMock()
+    ws.id = 123
+    ws.title = "Çekler"
+
+    google_sheets._apply_lightweight_layout(ws, "Çekler")
+
+    requests = ws.spreadsheet.batch_update.call_args.args[0]["requests"]
+    payment_date_index = google_sheets._header_index("Çekler", "Ödeme Tarihi")
+    assert any(
+        request.get("repeatCell", {}).get("range", {}).get("startColumnIndex") == payment_date_index
+        and request["repeatCell"]["cell"]["userEnteredFormat"]["numberFormat"] == {
+            "type": "DATE",
+            "pattern": "dd-mm-yyyy",
+        }
+        for request in requests
+    )
 
 
 def test_build_payment_projection_rows_marks_borc_yok_when_party_matches_but_open_debt_missing():
@@ -402,8 +457,9 @@ def test_build_payment_projection_rows_uses_receivable_side_for_cheque_matching(
 
     assert len(rows) == 1
     assert len(allocations) == 1
+    assert rows[0][0] == "H. KARAKAYA İNŞAAT TİC. VE SAN. LTD. ŞTİ."
+    assert rows[0][3] == "KANSA GRUP GIDA TİCARET VE SANAYİ LİMİTED ŞİRKETİ"
     assert cards[0]["party_key"] == "tax:4960863229"
-    assert rows[0][0] == "KANSA GRUP GIDA TİCARET VE SANAYİ LİMİTED ŞİRKETİ"
     assert rows[0][4] == 4000.0
     assert rows[0][6] == 4204.51
     assert rows[0][7] == "Kısmi"
@@ -411,6 +467,26 @@ def test_build_payment_projection_rows_uses_receivable_side_for_cheque_matching(
     assert rows[0][11] == "tax:4960863229"
     assert allocations[0][2] == "receivable:recv-1"
     assert allocations[0][7] == 4000.0
+
+
+def test_cheque_projection_uses_printed_company_as_drawer_when_sender_missing():
+    rows, _, _ = google_sheets._build_payment_projection_rows(
+        record=BillRecord(
+            cheque_due_date="2026-08-30",
+            total_amount=1500000.0,
+            company_name="BERAT DEMİRCİ DENBER TAAHHÜT İNŞAAT",
+            recipient_name="H. KARAKAYA İNŞAAT TİC. LTD. ŞTİ.",
+            cheque_serial_number="0137440",
+            cheque_bank_name="Ziraat Bankası",
+        ),
+        category=DocumentCategory.CEK,
+        item_id="cek-drawer-1",
+        debt_state=[],
+        drive_link=None,
+    )
+
+    assert rows[0][0] == "H. KARAKAYA İNŞAAT TİC. LTD. ŞTİ."
+    assert rows[0][3] == "BERAT DEMİRCİ DENBER TAAHHÜT İNŞAAT"
 
 
 def test_build_payment_projection_rows_allocates_negative_outgoing_payment_by_absolute_amount():
@@ -559,6 +635,201 @@ def test_build_visible_projection_snapshot_splits_cheques_from_banka_odemeleri(m
     assert rows_by_tab["Banka Ödemeleri"][0][5] == "TR440001100000000000000002"
     assert rows_by_tab["Çekler"][0][8] == "Ziraat Bankası"
     assert set(hashes_by_tab) >= {"Banka Ödemeleri", "Çekler"}
+
+
+def test_cheque_projection_accepts_legacy_visible_override_names(monkeypatch):
+    cek = google_sheets._canonical_store.StoredDocument(
+        source_doc_id="cek-legacy-overrides",
+        category=DocumentCategory.CEK,
+        return_source_category=None,
+        source_message_id="wamid-cek-legacy-overrides",
+        record=BillRecord(
+            cheque_due_date="2026-08-30",
+            cheque_serial_number="CHK-1",
+            total_amount=1500000.0,
+            sender_name="BERAT DEMİRCİ",
+            recipient_name="H. Karkaya İnşaat",
+            cheque_bank_name="Ziraat Bankası",
+        ),
+        drive_link=None,
+        feedback_platform=None,
+        feedback_chat_id=None,
+        feedback_recipient_type=None,
+        feedback_message_id=None,
+        created_at="2026-04-11T10:00:00+00:00",
+        updated_at="2026-04-11T10:00:00+00:00",
+    )
+
+    monkeypatch.setattr(google_sheets._canonical_store, "list_documents", lambda: [cek])
+    monkeypatch.setattr(google_sheets, "_build_projection_debt_state", lambda documents: [])
+    monkeypatch.setattr(
+        google_sheets._canonical_store,
+        "override_map_for_tab",
+        lambda tab_name: {
+            "cek-legacy-overrides": {
+                "Alıcı / Tedarikçi": "Legacy Lehdar",
+                "Referans No": "LEGACY-CEK-1",
+                "Gönderen": "Legacy Düzenleyen",
+            }
+        } if tab_name == "Çekler" else {},
+    )
+
+    rows_by_tab, _ = google_sheets._build_visible_projection_snapshot()
+
+    assert rows_by_tab["Çekler"][0][:4] == [
+        "Legacy Lehdar",
+        "",
+        "LEGACY-CEK-1",
+        "Legacy Düzenleyen",
+    ]
+
+
+def test_remap_legacy_cheque_headers_renames_and_blanks_noisy_description():
+    legacy_headers = [
+        "Alıcı / Tedarikçi",
+        "Açıklama",
+        "Referans No",
+        "Gönderen",
+        "Ödeme Tutarı (TL)",
+        "Ödeme Tarihi",
+        "Kalan Bakiye (TL)",
+        "Durum",
+        "Banka",
+        google_sheets._VISIBLE_DRIVE_LINK_HEADER,
+        google_sheets._HIDDEN_ROW_ID_HEADER,
+        google_sheets._HIDDEN_PARTY_KEY_HEADER,
+        google_sheets._HIDDEN_SOURCE_DOC_ID_HEADER,
+        google_sheets._HIDDEN_PAYMENT_DOC_ID_HEADER,
+        google_sheets._HIDDEN_DEBT_ROW_ID_HEADER,
+        google_sheets._HIDDEN_ALLOCATION_ID_HEADER,
+        google_sheets._HIDDEN_TAX_NUMBER_HEADER,
+        google_sheets._HIDDEN_RECORD_KIND_HEADER,
+    ]
+    row = [
+        "H. Karkaya İnşaat",
+        "TL#1.500.000#",
+        "0137440",
+        "BERAT DEMİRCİ",
+        1500000.0,
+        "2026-08-30",
+        0.0,
+        "Borç Yok",
+        "Ziraat Bankası",
+        "",
+        "row-1",
+        "",
+        "doc-1",
+        "doc-1",
+        "",
+        "",
+        "",
+        "odeme",
+    ]
+
+    remapped = google_sheets._remap_legacy_visible_row(
+        "Çekler",
+        row,
+        legacy_headers=legacy_headers,
+        raw_by_doc_id={},
+        payment_detail_by_doc_id={},
+    )
+
+    assert remapped[:4] == ["H. Karkaya İnşaat", "", "0137440", "BERAT DEMİRCİ"]
+
+
+def test_cheque_projection_suppresses_amount_and_party_description_noise(monkeypatch):
+    cek = google_sheets._canonical_store.StoredDocument(
+        source_doc_id="cek-noisy-description",
+        category=DocumentCategory.CEK,
+        return_source_category=None,
+        source_message_id="wamid-cek-noisy",
+        record=BillRecord(
+            cheque_due_date="2026-08-30",
+            cheque_serial_number="0137440",
+            total_amount=1500000.0,
+            sender_name="BERAT DEMİRCİ DENBER TAAHHÜT İNŞAAT MADENCİLİK OTOMOTİV TURİZM SANAYİ TİCARET LİM",
+            recipient_name="H. Karkaya İnşaat Ticaret San. Tic. Ltd. Şti.",
+            cheque_bank_name="Ziraat Bankası",
+            description="H. Karkaya İnşaat Ticaret San. Tic. Ltd. Şti. emrine",
+        ),
+        drive_link=None,
+        feedback_platform=None,
+        feedback_chat_id=None,
+        feedback_recipient_type=None,
+        feedback_message_id=None,
+        created_at="2026-04-11T10:00:00+00:00",
+        updated_at="2026-04-11T10:00:00+00:00",
+    )
+    date_noise = google_sheets._canonical_store.StoredDocument(
+        source_doc_id="cek-date-description",
+        category=DocumentCategory.CEK,
+        return_source_category=None,
+        source_message_id="wamid-cek-date-noise",
+        record=BillRecord(
+            cheque_due_date="2026-08-30",
+            cheque_serial_number="0137441",
+            total_amount=1500000.0,
+            sender_name="BERAT DEMİRCİ",
+            recipient_name="H. Karkaya İnşaat",
+            cheque_bank_name="Ziraat Bankası",
+            description="30/08/2026",
+        ),
+        drive_link=None,
+        feedback_platform=None,
+        feedback_chat_id=None,
+        feedback_recipient_type=None,
+        feedback_message_id=None,
+        created_at="2026-04-11T10:00:00+00:00",
+        updated_at="2026-04-11T10:00:00+00:00",
+    )
+
+    monkeypatch.setattr(google_sheets._canonical_store, "list_documents", lambda: [cek, date_noise])
+    monkeypatch.setattr(google_sheets, "_build_projection_debt_state", lambda documents: [])
+    monkeypatch.setattr(
+        google_sheets._canonical_store,
+        "override_map_for_tab",
+        lambda tab_name: {
+            "cek-noisy-description": {"Açıklama": "TL#1.500.000#"}
+        } if tab_name == "Çekler" else {},
+    )
+
+    rows_by_tab, _ = google_sheets._build_visible_projection_snapshot()
+
+    assert rows_by_tab["Çekler"][0][1] == ""
+    assert rows_by_tab["Çekler"][1][1] == ""
+
+
+def test_cheque_projection_keeps_meaningful_description(monkeypatch):
+    cek = google_sheets._canonical_store.StoredDocument(
+        source_doc_id="cek-meaningful-description",
+        category=DocumentCategory.CEK,
+        return_source_category=None,
+        source_message_id="wamid-cek-meaningful",
+        record=BillRecord(
+            cheque_due_date="2026-08-30",
+            cheque_serial_number="0137440",
+            total_amount=1500000.0,
+            sender_name="BERAT DEMİRCİ",
+            recipient_name="H. Karkaya İnşaat",
+            cheque_bank_name="Ziraat Bankası",
+            description="Teminat çeki",
+        ),
+        drive_link=None,
+        feedback_platform=None,
+        feedback_chat_id=None,
+        feedback_recipient_type=None,
+        feedback_message_id=None,
+        created_at="2026-04-11T10:00:00+00:00",
+        updated_at="2026-04-11T10:00:00+00:00",
+    )
+
+    monkeypatch.setattr(google_sheets._canonical_store, "list_documents", lambda: [cek])
+    monkeypatch.setattr(google_sheets, "_build_projection_debt_state", lambda documents: [])
+    monkeypatch.setattr(google_sheets._canonical_store, "override_map_for_tab", lambda tab_name: {})
+
+    rows_by_tab, _ = google_sheets._build_visible_projection_snapshot()
+
+    assert rows_by_tab["Çekler"][0][1] == "Teminat çeki"
 
 
 def test_build_visible_projection_snapshot_includes_hidden_payment_allocations(monkeypatch):
