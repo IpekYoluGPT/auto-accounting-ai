@@ -618,7 +618,7 @@ def test_multi_document_image_exports_all_records_when_counts_match():
 
 
 
-def test_multi_document_image_requires_all_or_retry_when_split_stays_incomplete():
+def test_non_cheque_multi_document_image_requires_all_or_retry_when_split_stays_incomplete():
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
 
@@ -651,7 +651,7 @@ def test_multi_document_image_requires_all_or_retry_when_split_stays_incomplete(
             "app.routes.webhooks.whatsapp.fetch_media", return_value=b"same-image"
         ), patch(
             "app.services.accounting.intake.doc_classifier.analyze_document",
-            return_value=_analysis(DocumentCategory.CEK, confidence=0.95, document_count=3),
+            return_value=_analysis(DocumentCategory.FATURA, confidence=0.95, document_count=3),
         ), patch(
             "app.services.accounting.intake.gemini_extractor.extract_bills",
             side_effect=[partial_records, partial_records],
@@ -671,6 +671,75 @@ def test_multi_document_image_requires_all_or_retry_when_split_stays_incomplete(
         send_mock.assert_called_once()
         assert "birden fazla belge var" in send_mock.call_args.args[1].lower()
         assert [call.args[2] for call in reaction_mock.call_args_list] == ["⌛", "⚠️"]
+
+
+def test_cheque_multi_document_image_exports_usable_records_when_split_stays_incomplete():
+    with TemporaryDirectory() as tmpdir:
+        client = TestClient(app)
+
+        partial_records = [
+            BillRecord(
+                company_name="HALKBANK",
+                document_number="3941468",
+                document_date="2027-04-30",
+                total_amount=125000.0,
+                currency="TRY",
+                source_message_id="wamid-four-checks__doc1",
+                source_filename="checks.jpg",
+                source_type="image",
+                confidence=0.91,
+            ),
+            BillRecord(
+                company_name="QNB FİNANSBANK",
+                document_number="0448596",
+                document_date="2023-12-30",
+                total_amount=380000.0,
+                currency="TRY",
+                source_message_id="wamid-four-checks__doc2",
+                source_filename="checks.jpg",
+                source_type="image",
+                confidence=0.91,
+            ),
+            BillRecord(
+                company_name="Garanti BBVA",
+                document_number="0205893",
+                document_date="2023-12-05",
+                total_amount=200000.0,
+                currency="TRY",
+                source_message_id="wamid-four-checks__doc3",
+                source_filename="checks.jpg",
+                source_type="image",
+                confidence=0.91,
+            ),
+        ]
+
+        with _patch_runtime_settings(tmpdir), patch(
+            "app.routes.webhooks.whatsapp.fetch_media", return_value=b"same-image"
+        ), patch(
+            "app.services.accounting.intake.doc_classifier.analyze_document",
+            return_value=_analysis(DocumentCategory.CEK, confidence=0.95, document_count=4),
+        ), patch(
+            "app.services.accounting.intake.gemini_extractor.extract_bills",
+            side_effect=[partial_records, partial_records],
+        ) as extract_mock, patch(
+            "app.services.accounting.intake.google_sheets.append_record",
+            return_value=[],
+        ) as append_mock, patch(
+            "app.routes.webhooks.whatsapp.send_text_message"
+        ) as send_mock, patch(
+            "app.routes.webhooks.whatsapp.send_reaction_message"
+        ) as reaction_mock:
+            response = client.post("/webhook", json=_image_payload("wamid-four-checks"))
+
+        assert response.status_code == 200
+        rows = _read_export_rows(tmpdir)
+        assert len(rows) == 3
+        assert extract_mock.call_count == 2
+        assert extract_mock.call_args_list[1].kwargs["split_retry"] is True
+        assert extract_mock.call_args_list[1].kwargs["strict_document_count"] == 4
+        assert append_mock.call_count == 3
+        send_mock.assert_not_called()
+        assert [call.args[2] for call in reaction_mock.call_args_list] == ["⌛", "✅"]
 
 
 
