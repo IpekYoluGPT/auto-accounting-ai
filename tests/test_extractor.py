@@ -2,6 +2,7 @@
 Tests for the Gemini extractor service.
 """
 
+from types import SimpleNamespace
 from unittest.mock import ANY, patch
 
 import pytest
@@ -462,10 +463,42 @@ class TestExtractBill:
         assert "recipient_name lehdar / alici" in prompt
         assert "recipient_name yalniz el yazisi" in prompt
         assert "sender_name veya company_name matbu" in prompt
+        assert "El yazisi lehdar matbu kesideciye benziyorsa bile recipient_name'i bos birakma" in prompt
+        assert "Yatay, ters veya yan donmus cek fotografini zihnen cevir" in prompt
+        assert "HAMILINE veya HAMİLİNE" in prompt
         assert "cheque_issue_place, cheque_issue_date, cheque_due_date, cheque_serial_number, cheque_bank_name, cheque_branch ve cheque_account_ref" in prompt
         assert "total_amount veya payable_amount cek tutari" in prompt
         assert "description alanini sadece ayri bir ticari not varsa doldur" in prompt
         assert "lehdar/alici, kesideci/gonderen, cek tutari" in prompt
+
+    def test_cheque_prompt_includes_ocr_hints_when_available(self, monkeypatch):
+        monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
+        expected = AIMultiExtractionResult(
+            documents=[AIExtractionResult(company_name="Banka", currency="TRY", confidence=0.8)]
+        )
+
+        with patch(
+            "app.services.accounting.gemini_extractor.gemini_client.generate_structured_content",
+            return_value=expected,
+        ) as mock_generate, patch(
+            "app.services.accounting.gemini_extractor.ocr.prepare_document",
+            return_value=SimpleNamespace(ocr_bundle=object()),
+        ), patch(
+            "app.services.accounting.gemini_extractor.ocr.serialize_ocr_bundle",
+            return_value="OCR_TEXT:\n- HAMİLİNE\n- Karakaya PVC Doğ. Ltd. Şti",
+        ):
+            extract_bills(
+                b"fake_image",
+                mime_type="image/jpeg",
+                source_message_id="msg-cheque-ocr-1",
+                source_filename="cheque.jpg",
+                source_type="image",
+                category_hint=DocumentCategory.CEK,
+            )
+
+        prompt = mock_generate.call_args.kwargs["prompt"]
+        assert "OCR ipucu" in prompt
+        assert "HAMİLİNE" in prompt
 
     def test_shipment_prompt_requests_route_and_vehicle_details(self, monkeypatch):
         monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
