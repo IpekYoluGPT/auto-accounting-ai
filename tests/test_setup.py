@@ -1,5 +1,5 @@
 from contextlib import ExitStack
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 from fastapi.testclient import TestClient
 
@@ -129,6 +129,49 @@ def test_reset_sheet_calls_google_sheets_with_payload_id():
     }
     reset_mock.assert_called_once_with(spreadsheet_id="sheet-123")
     clear_mock.assert_called_once_with()
+
+
+def test_reset_sheet_clears_storage_before_resetting_workbook():
+    tracker = Mock()
+
+    def queue_status():
+        tracker.queue_status()
+        return {"pending_sheet_appends": 2, "pending_projection_rows": 2}
+
+    def clear_storage():
+        tracker.clear_storage()
+        return {"pending_sheet_appends": 2, "pending_projection_rows": 2}
+
+    def reset_workbook(*, spreadsheet_id: str | None = None):
+        tracker.reset_workbook(spreadsheet_id=spreadsheet_id)
+        return 8
+
+    with _lifespan_patches(), patch(
+        "app.routes.setup.settings.periskope_tool_token",
+        "secret-token",
+    ), patch(
+        "app.routes.setup.google_sheets.queue_status",
+        side_effect=queue_status,
+    ), patch(
+        "app.routes.setup.google_sheets.clear_current_namespace_storage",
+        side_effect=clear_storage,
+    ), patch(
+        "app.routes.setup.google_sheets.reset_current_month_spreadsheet_data",
+        side_effect=reset_workbook,
+    ):
+        with TestClient(app) as client:
+            response = client.post(
+                "/setup/reset-sheet",
+                json={"spreadsheet_id": "sheet-123", "clear_storage": True},
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+    assert response.status_code == 200
+    assert tracker.method_calls == [
+        call.queue_status(),
+        call.clear_storage(),
+        call.reset_workbook(spreadsheet_id="sheet-123"),
+    ]
 
 
 def test_reset_sheet_accepts_x_api_key_header():

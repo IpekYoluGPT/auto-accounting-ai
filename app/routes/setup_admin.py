@@ -61,10 +61,10 @@ async def reset_sheet(request: Request, payload: ResetSheetRequest) -> dict[str,
 
     try:
         queue_before = google_sheets.queue_status() if payload.clear_storage else None
+        queue_cleared = google_sheets.clear_current_namespace_storage() if payload.clear_storage else None
         reset_count = google_sheets.reset_current_month_spreadsheet_data(
             spreadsheet_id=payload.spreadsheet_id,
         )
-        queue_cleared = google_sheets.clear_current_namespace_storage() if payload.clear_storage else None
 
         response = {
             "status": "ok",
