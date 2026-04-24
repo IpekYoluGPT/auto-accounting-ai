@@ -127,12 +127,21 @@ def process_media_payload(*, intake_module, payload: MediaPayload) -> MediaProce
                 expected_document_count,
                 len(retry_records),
             )
-            return MediaProcessingResult(
-                outcome="multi_document_retry_required",
-                user_message=MSG_MEDIA_MULTI_DOCUMENT_RETRY,
-                stage="extraction",
-            )
-        valid_records = retry_records
+            if category == DocumentCategory.CEK and (retry_records or valid_records):
+                valid_records = retry_records or valid_records
+                intake_module.logger.warning(
+                    "Accepting %d usable cheque record(s) for message id=%s despite estimated count mismatch.",
+                    len(valid_records),
+                    payload.message_id,
+                )
+            else:
+                return MediaProcessingResult(
+                    outcome="multi_document_retry_required",
+                    user_message=MSG_MEDIA_MULTI_DOCUMENT_RETRY,
+                    stage="extraction",
+                )
+        else:
+            valid_records = retry_records
 
     if not valid_records:
         intake_module.logger.warning("Gemini returned no usable documents for message id=%s", payload.message_id)
