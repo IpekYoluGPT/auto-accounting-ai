@@ -50,8 +50,9 @@ def _periskope_image_message(
     sender_phone: str = "905456952965@c.us",
     sender_name: str | None = None,
     from_me: bool = False,
+    timestamp: str | None = None,
 ) -> dict:
-    return {
+    payload = {
         "message_id": message_id,
         "org_id": "org-1",
         "org_phone": "905516419175@c.us",
@@ -69,6 +70,9 @@ def _periskope_image_message(
             "mimetype": "image/jpeg",
         },
     }
+    if timestamp is not None:
+        payload["timestamp"] = timestamp
+    return payload
 
 
 def _periskope_text_message(
@@ -386,6 +390,35 @@ def test_periskope_image_webhook_enqueues_media_without_inline_fetch():
     fetch_mock.assert_not_called()
     enqueue_mock.assert_called_once()
     assert react_mock.call_args.args == ("peri-msg-1", "⌛")
+
+
+def test_periskope_webhook_ignores_stale_image_replays():
+    payload = _periskope_event(
+        _periskope_image_message(
+            message_id="old-peri-msg-1",
+            timestamp="2000-01-01T00:00:00Z",
+        )
+    )
+    signature = _sign_payload(payload, "periskope-secret")
+    client = TestClient(app)
+    with _patch_runtime_settings("/tmp/unused"), patch(
+        "app.routes.periskope.inbound_queue.enqueue_media_job"
+    ) as enqueue_mock, patch(
+        "app.routes.periskope.periskope.fetch_media"
+    ) as fetch_mock, patch(
+        "app.routes.periskope.periskope.react_to_message"
+    ) as react_mock:
+        response = client.post(
+            "/integrations/periskope/webhook",
+            json=payload,
+            headers={"x-periskope-signature": signature},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ignored"}
+    enqueue_mock.assert_not_called()
+    fetch_mock.assert_not_called()
+    react_mock.assert_not_called()
 
 
 def test_periskope_webhook_rejects_invalid_signature():

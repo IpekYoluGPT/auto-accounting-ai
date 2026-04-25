@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     periskope_signing_key: str = ""
     periskope_tool_token: str = ""
     periskope_allowed_chat_ids: str = ""
+    periskope_max_message_age_minutes: int = 60
 
     # Gemini
     gemini_api_key: str = ""
