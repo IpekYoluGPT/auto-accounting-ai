@@ -7,6 +7,8 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+from pydantic import BaseModel
+
 from app.config import settings
 from app.models.schemas import AIMultiExtractionResult, BillRecord, DocumentCategory, InvoiceLineItem
 from app.services import gemini_client
@@ -72,9 +74,11 @@ _CATEGORY_SPECIFIC_INSTRUCTIONS: dict[DocumentCategory, str] = {
     DocumentCategory.CEK: """Belge ailesi: CEK.
 - document_number cek seri / belge numarasidir.
 - recipient_name lehdar / alici / cekin gidecegi kisi veya firmadir; recipient_name yalniz el yazisi ile yazilan "emrine" / payee satirindan alinmalidir.
+- ZORUNLU: cek belgesi icin recipient_name asla null, bos string veya "-" olamaz. Her cek icin mutlaka bir lehdar degeri yaz.
 - Cekte HAMILINE veya HAMİLİNE gorunuyorsa ve ayrica isimli payee yoksa recipient_name degerini "HAMİLİNE" yaz; null veya "-" birakma.
 - El yazisi lehdar matbu kesideciye benziyorsa bile recipient_name'i bos birakma; gorunen el yazisi payee satirini oldugu gibi yaz.
 - Yatay, ters veya yan donmus cek fotografini zihnen cevir; birden fazla cek varsa her cek icin kendi el yazisi payee satirini ayri oku.
+- Lehdar el yazisi okunaksizsa bile en yakin tahmini ver; gerekiyorsa tek tek harfleri/kelimeleri kismen yaz, yine de bos birakma.
 - sender_name veya company_name matbu/basilmis cek sahibi, kesideci veya duzenleyen kisi/firma adidir; el yazisi lehdar ile karistirma.
 - cheque_bank_name cek uzerindeki bankadir; banka adini sender_name/company_name alanina yazma.
 - cheque_issue_place, cheque_issue_date, cheque_due_date, cheque_serial_number, cheque_bank_name, cheque_branch ve cheque_account_ref gorunuyorsa ayri ayri doldur.
@@ -126,6 +130,29 @@ _MULTI_DOCUMENT_RETRY_INSTRUCTIONS = """Bu goruntude birden fazla belge var ve o
 """
 
 _THOUSANDS_STYLE_IDENTIFIER_RE = re.compile(r"^\d{1,3}(?:\.\d{3})+$")
+
+
+_LEHDAR_REFINEMENT_SYSTEM_INSTRUCTION = """You re-read handwritten payee/lehdar lines from Turkish bank cheques.
+
+Rules:
+- Look only at the handwritten "emrine" / payee line on each cheque, never at the printed drawer (kesideci) name or bank name.
+- Return one entry per cheque, in the same left-to-right then top-to-bottom order the documents were already extracted in.
+- If the handwritten line clearly says HAMILINE / HAMİLİNE, return "HAMİLİNE".
+- If the handwriting is partially legible, return the best partial reading; never return null, empty, or "-".
+- Preserve Turkish characters exactly when visible.
+"""
+
+
+class _ChequeLehdarEntry(BaseModel):
+    lehdar: str
+
+    model_config = {"extra": "ignore"}
+
+
+class _ChequeLehdarRefinement(BaseModel):
+    lehdars: list[_ChequeLehdarEntry]
+
+    model_config = {"extra": "ignore"}
 
 
 def _parse_tr_number(value: str) -> Optional[float]:
@@ -410,6 +437,15 @@ def extract_bills(
         record.source_chat_type = source_chat_type
         records.append(record)
 
+    if category_hint == DocumentCategory.CEK:
+        _refine_missing_cheque_lehdars(
+            records=records,
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+            model_name=model_name,
+            ocr_hint=ocr_hint,
+        )
+
     logger.info(
         "Extraction complete: %d document(s) found. [%s]",
         len(records),
@@ -439,6 +475,102 @@ def _build_ocr_hint(
         return None
 
     return hint or None
+
+
+def _is_blank_lehdar(value: object) -> bool:
+    if value is None:
+        return True
+    text = str(value).strip()
+    return not text or text in {"-", "—", "–"}
+
+
+def _refine_missing_cheque_lehdars(
+    *,
+    records: list[BillRecord],
+    image_bytes: bytes,
+    mime_type: str,
+    model_name: str,
+    ocr_hint: str | None,
+) -> None:
+    if not records:
+        return
+
+    missing_indexes = [idx for idx, record in enumerate(records) if _is_blank_lehdar(record.recipient_name)]
+    if not missing_indexes:
+        return
+
+    prompt = _build_lehdar_refinement_prompt(
+        document_count=len(records),
+        missing_indexes=missing_indexes,
+        ocr_hint=ocr_hint,
+    )
+
+    try:
+        result = gemini_client.generate_structured_content(
+            model=model_name,
+            prompt=prompt,
+            system_instruction=_LEHDAR_REFINEMENT_SYSTEM_INSTRUCTION,
+            response_schema=_ChequeLehdarRefinement,
+            thinking_level="low",
+            media_bytes=image_bytes,
+            mime_type=mime_type,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Lehdar refinement call failed for %d cheque(s); leaving recipient_name as-is: %s",
+            len(missing_indexes),
+            exc,
+        )
+        return
+
+    refined_attr = getattr(result, "lehdars", None)
+    if refined_attr is None:
+        logger.warning("Lehdar refinement returned unexpected payload; skipping merge.")
+        return
+    refined = list(refined_attr)
+    filled = 0
+    for idx in range(min(len(records), len(refined))):
+        if not _is_blank_lehdar(records[idx].recipient_name):
+            continue
+        candidate = (refined[idx].lehdar or "").strip()
+        if not candidate or candidate in {"-", "—", "–"}:
+            continue
+        records[idx].recipient_name = candidate
+        filled += 1
+
+    if filled:
+        logger.info("Lehdar refinement filled %d/%d missing cheque payee(s).", filled, len(missing_indexes))
+
+
+def _build_lehdar_refinement_prompt(
+    *,
+    document_count: int,
+    missing_indexes: list[int],
+    ocr_hint: str | None,
+) -> str:
+    parts = [
+        "Bu goruntude ozellikle banka cekleri var. Asagidaki kurallarla yalniz lehdar/payee bilgilerini cikar.",
+        f"Beklenen toplam cek sayisi: {document_count}. Cekleri soldan saga, sonra yukaridan asagiya sirala.",
+        (
+            "Her cek icin tek bir lehdar string'i dondur. Lehdar el yazisi ile yazilan 'emrine' / payee satiridir; "
+            "matbu kesideci/sirket adi DEGILDIR."
+        ),
+        (
+            "Eger el yazisi HAMILINE / HAMİLİNE diyorsa 'HAMİLİNE' yaz. Okunaksiz olsa bile en yakin tahmini ver; "
+            "asla null, bos string veya '-' dondurme."
+        ),
+        f"Eksik lehdar bulunan cek sira numaralari (1-bazli): {', '.join(str(i + 1) for i in missing_indexes)}.",
+        (
+            "Yine de cikistaki 'lehdars' listesi tum cekler icin sirayla "
+            f"{document_count} adet entry icermeli; mevcut lehdarlari da yaz."
+        ),
+    ]
+    if ocr_hint:
+        parts.append(
+            "OCR ipucu (goruntuyle dogrula; lehdar/payee, HAMİLİNE icin kullan):\n"
+            f"{ocr_hint}"
+        )
+    return "\n\n".join(parts)
 
 
 def extract_bill(
