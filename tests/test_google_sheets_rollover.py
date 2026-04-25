@@ -691,6 +691,109 @@ def test_build_visible_projection_snapshot_filters_out_non_current_month_documen
     assert rows_by_tab["Çekler"][0][2] == "CHK-CURRENT"
 
 
+def test_projection_month_scope_uses_created_at_before_document_dates(monkeypatch):
+    received_this_month = google_sheets._canonical_store.StoredDocument(
+        source_doc_id="cek-received-this-month",
+        category=DocumentCategory.CEK,
+        return_source_category=None,
+        source_message_id="wamid-cek-current-received",
+        record=BillRecord(
+            document_date="2025-10-10",
+            cheque_due_date="2026-08-31",
+            cheque_serial_number="CHK-RECEIVED",
+            total_amount=2500.0,
+            sender_name="KANSA",
+            recipient_name="H. KARAKAYA",
+            cheque_bank_name="Ziraat Bankası",
+        ),
+        drive_link=None,
+        feedback_platform=None,
+        feedback_chat_id=None,
+        feedback_recipient_type=None,
+        feedback_message_id=None,
+        created_at="2026-04-12T10:00:00+00:00",
+        updated_at="2026-04-12T10:00:00+00:00",
+    )
+    received_old_month = google_sheets._canonical_store.StoredDocument(
+        source_doc_id="cek-old-received",
+        category=DocumentCategory.CEK,
+        return_source_category=None,
+        source_message_id="wamid-cek-old-received",
+        record=BillRecord(
+            document_date="2026-04-12",
+            cheque_due_date="2026-04-12",
+            cheque_serial_number="CHK-OLD-RECEIVED",
+            total_amount=15000.0,
+            sender_name="OLD SENDER",
+            recipient_name="OLD RECIPIENT",
+            cheque_bank_name="Old Bank",
+        ),
+        drive_link=None,
+        feedback_platform=None,
+        feedback_chat_id=None,
+        feedback_recipient_type=None,
+        feedback_message_id=None,
+        created_at="2026-03-31T10:00:00+00:00",
+        updated_at="2026-03-31T10:00:00+00:00",
+    )
+
+    monkeypatch.setattr(google_sheets._canonical_store, "list_documents", lambda: [received_old_month, received_this_month])
+    monkeypatch.setattr(google_sheets, "_month_key", lambda: "2026-04")
+    monkeypatch.setattr(google_sheets, "_build_projection_debt_state", lambda documents: [])
+
+    rows_by_tab, _ = google_sheets._build_visible_projection_snapshot()
+
+    assert len(rows_by_tab["Çekler"]) == 1
+    assert rows_by_tab["Çekler"][0][2] == "CHK-RECEIVED"
+
+
+def test_reset_current_month_spreadsheet_marks_scoped_documents_dirty(monkeypatch):
+    current_doc = google_sheets._canonical_store.StoredDocument(
+        source_doc_id="cek-current-reset",
+        category=DocumentCategory.CEK,
+        return_source_category=None,
+        source_message_id="wamid-current-reset",
+        record=BillRecord(
+            document_date="2025-10-10",
+            cheque_due_date="2026-08-31",
+            cheque_serial_number="CHK-RESET",
+            total_amount=2500.0,
+        ),
+        drive_link=None,
+        feedback_platform=None,
+        feedback_chat_id=None,
+        feedback_recipient_type=None,
+        feedback_message_id=None,
+        created_at="2026-04-12T10:00:00+00:00",
+        updated_at="2026-04-12T10:00:00+00:00",
+    )
+
+    class FakeSheet:
+        id = "sheet-1"
+
+    monkeypatch.setattr(google_sheets, "_get_client", lambda: object())
+    monkeypatch.setattr(google_sheets, "_open_spreadsheet_by_key", lambda client, spreadsheet_id: FakeSheet())
+    monkeypatch.setattr(google_sheets, "_ensure_tab_exists_for_projection", lambda sh, tab_name: object())
+    monkeypatch.setattr(google_sheets, "_setup_summary_tab", lambda ws, month_label, lightweight=False: None)
+    monkeypatch.setattr(google_sheets, "_clear_projection_tab_rows", lambda ws, tab_name, start_index: None)
+    monkeypatch.setattr(google_sheets, "_ensure_tab_total_row", lambda ws, tab_name: None)
+    monkeypatch.setattr(google_sheets, "_mark_recently_prepared", lambda sh: None)
+    monkeypatch.setattr(google_sheets, "_month_label", lambda: "Nisan 2026")
+    monkeypatch.setattr(google_sheets, "_month_key", lambda: "2026-04")
+    monkeypatch.setattr(google_sheets._canonical_store, "list_documents", lambda: [current_doc])
+
+    dirty_calls = []
+    monkeypatch.setattr(
+        google_sheets._canonical_store,
+        "mark_projection_dirty",
+        lambda doc_ids, reason: dirty_calls.append((list(doc_ids), reason)) or len(list(doc_ids)),
+    )
+
+    google_sheets.reset_current_month_spreadsheet_data(spreadsheet_id="sheet-1")
+
+    assert dirty_calls == [(["cek-current-reset"], "sheet_reset_rebuild")]
+
+
 def test_cheque_projection_accepts_legacy_visible_override_names(monkeypatch):
     cek = google_sheets._canonical_store.StoredDocument(
         source_doc_id="cek-legacy-overrides",

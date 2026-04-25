@@ -1283,8 +1283,8 @@ def _document_month_key(document: object) -> str | None:
     if record is None:
         return None
     for candidate in (
-        getattr(record, "document_date", None),
         getattr(document, "created_at", None),
+        getattr(record, "document_date", None),
         getattr(record, "cheque_due_date", None),
         getattr(record, "cheque_issue_date", None),
     ):
@@ -6508,6 +6508,12 @@ def reset_current_month_spreadsheet_data(*, spreadsheet_id: Optional[str] = None
                 continue
             _clear_projection_tab_rows(ws, tab_name, 0)
             _ensure_tab_total_row(ws, tab_name)
+        scoped_documents = _documents_for_projection_month(_canonical_store.list_documents())
+        if scoped_documents:
+            _canonical_store.mark_projection_dirty(
+                [document.source_doc_id for document in scoped_documents],
+                reason="sheet_reset_rebuild",
+            )
         _mark_recently_prepared(sh)
         return touched_tabs
 
