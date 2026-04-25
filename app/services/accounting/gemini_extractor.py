@@ -438,11 +438,12 @@ def extract_bills(
         records.append(record)
 
     if category_hint == DocumentCategory.CEK:
+        refinement_model = settings.gemini_lehdar_refinement_model or model_name
         _refine_missing_cheque_lehdars(
             records=records,
             image_bytes=image_bytes,
             mime_type=mime_type,
-            model_name=model_name,
+            model_name=refinement_model,
             ocr_hint=ocr_hint,
         )
 
