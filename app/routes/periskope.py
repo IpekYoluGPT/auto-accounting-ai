@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
@@ -60,6 +61,15 @@ async def receive_periskope_webhook(
 
     if message.from_me or message.is_private_note:
         logger.info("Ignoring self-authored/private Periskope message id=%s", message.message_id)
+        return {"status": "ignored"}
+
+    if _is_stale_periskope_message(message):
+        logger.info(
+            "Ignoring stale Periskope message id=%s timestamp=%s max_age_minutes=%s",
+            message.message_id,
+            message.timestamp,
+            settings.periskope_max_message_age_minutes,
+        )
         return {"status": "ignored"}
 
     if message.message_type in {"image", "document"}:
@@ -254,6 +264,61 @@ def _is_allowed_periskope_chat(chat_id: str) -> bool:
     return chat_id in allowed
 
 
+def _is_stale_periskope_message(message: PeriskopeMessage) -> bool:
+    max_age_minutes = max(settings.periskope_max_message_age_minutes, 0)
+    if max_age_minutes <= 0:
+        return False
+
+    message_timestamp = _parse_periskope_timestamp(message.timestamp)
+    if message_timestamp is None:
+        return False
+
+    age = _now_utc() - message_timestamp
+    return age > timedelta(minutes=max_age_minutes)
+
+
+def _parse_periskope_timestamp(raw_timestamp: str | int | float | None) -> datetime | None:
+    if raw_timestamp is None:
+        return None
+
+    if isinstance(raw_timestamp, (int, float)):
+        return _parse_unix_timestamp(float(raw_timestamp))
+
+    normalized = str(raw_timestamp).strip()
+    if not normalized:
+        return None
+
+    try:
+        return _parse_unix_timestamp(float(normalized))
+    except ValueError:
+        pass
+
+    try:
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError:
+        logger.warning("Ignoring unparseable Periskope message timestamp=%s", raw_timestamp)
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_unix_timestamp(value: float) -> datetime | None:
+    if value <= 0:
+        return None
+    if value > 10_000_000_000:
+        value = value / 1000
+    try:
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _verify_periskope_signature(raw_body: bytes, signature: str) -> None:
     secret = settings.periskope_signing_key.strip()
     if not secret:
@@ -297,6 +362,13 @@ def _parse_periskope_webhook(raw_body: bytes) -> tuple[str, dict[str, Any]]:
     )
     if not isinstance(message_payload, dict):
         raise ValueError("Missing message payload under data/current_attributes/attributes.")
+
+    if "timestamp" not in message_payload:
+        for timestamp_key in ("created_at", "createdAt", "message_timestamp", "messageTimestamp"):
+            if timestamp_key in message_payload:
+                message_payload = dict(message_payload)
+                message_payload["timestamp"] = message_payload[timestamp_key]
+                break
 
     return str(event_name), message_payload
 
