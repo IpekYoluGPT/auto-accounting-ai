@@ -4,6 +4,7 @@ from unittest.mock import Mock, call, patch
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.routes import setup_sandbox
 from app.services.accounting.pipeline_context import sandbox_context
 
 
@@ -421,6 +422,29 @@ def test_sandbox_ensure_returns_structured_payload():
         "month_key": "2026-04",
         "created": False,
     }
+
+
+def test_ensure_sandbox_context_repairs_layout_after_prepare():
+    with patch(
+        "app.routes.setup_sandbox._resolve_existing_sandbox_spreadsheet_id",
+        return_value="sandbox-sheet-1",
+    ), patch(
+        "app.routes.setup_sandbox.google_sheets.ensure_current_month_spreadsheet_ready",
+        return_value="sandbox-sheet-1",
+    ), patch(
+        "app.routes.setup_sandbox.google_sheets.audit_current_month_spreadsheet",
+        return_value={"spreadsheet_id": "sandbox-sheet-1", "findings": []},
+    ) as audit_mock:
+        context, spreadsheet_id, created = setup_sandbox._ensure_sandbox_context("alpha")
+
+    assert context.disable_outbound_messages is True
+    assert spreadsheet_id == "sandbox-sheet-1"
+    assert created is False
+    audit_mock.assert_called_once_with(
+        spreadsheet_id="sandbox-sheet-1",
+        repair=True,
+        refresh_formatting=True,
+    )
 
 
 def test_sandbox_intake_rejects_invalid_base64():
