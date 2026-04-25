@@ -559,6 +559,10 @@ class TestExtractBill:
             "app.services.accounting.gemini_extractor.settings.gemini_extractor_model",
             "gemini-test-extractor",
         )
+        monkeypatch.setattr(
+            "app.services.accounting.gemini_extractor.settings.gemini_lehdar_refinement_model",
+            "gemini-test-flash",
+        )
 
         primary = AIMultiExtractionResult(
             documents=[
@@ -607,7 +611,10 @@ class TestExtractBill:
             )
 
         assert mock_generate.call_count == 2
+        primary_call = mock_generate.call_args_list[0]
         refinement_call = mock_generate.call_args_list[1]
+        assert primary_call.kwargs["model"] == "gemini-test-extractor"
+        assert refinement_call.kwargs["model"] == "gemini-test-flash"
         assert refinement_call.kwargs["response_schema"] is _ChequeLehdarRefinement
         prompt = refinement_call.kwargs["prompt"]
         assert "lehdar" in prompt.lower()
