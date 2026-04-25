@@ -1,3 +1,4 @@
+import shutil
 from contextlib import ExitStack
 from unittest.mock import Mock, call, patch
 
@@ -6,6 +7,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.routes import setup_sandbox
 from app.services.accounting.pipeline_context import sandbox_context
+from app.services.providers import google_sheets
 
 
 def _lifespan_patches():
@@ -70,8 +72,17 @@ def test_reset_sheet_allows_request_when_tool_token_is_unset():
         return_value={"pending_sheet_appends": 3, "pending_drive_uploads": 1},
     ), patch(
         "app.routes.setup.google_sheets.clear_current_namespace_storage",
-        return_value={"pending_sheet_appends": 3, "pending_drive_uploads": 1},
-    ) as clear_mock:
+        return_value={
+            "queue_status": {"pending_sheet_appends": 3, "pending_drive_uploads": 1},
+            "deleted_paths": ["/data/storage/state/canonical_store.sqlite3"],
+        },
+    ) as clear_mock, patch(
+        "app.routes.setup.inbound_queue.stop_pending_inbound_job_worker"
+    ) as stop_inbound_mock, patch(
+        "app.routes.setup.inbound_queue.start_pending_inbound_job_worker"
+    ) as start_inbound_mock, patch(
+        "app.routes.setup_admin.google_sheets_scheduler.start_monthly_rollover_scheduler"
+    ) as start_rollover_mock:
         with TestClient(app) as client:
             response = client.post("/setup/reset-sheet", json={"spreadsheet_id": "sheet-123"})
 
@@ -82,9 +93,14 @@ def test_reset_sheet_allows_request_when_tool_token_is_unset():
         "tabs_reset": 8,
         "queue_before": {"pending_sheet_appends": 3, "pending_drive_uploads": 1},
         "queue_cleared": {"pending_sheet_appends": 3, "pending_drive_uploads": 1},
+        "deleted_paths": ["/data/storage/state/canonical_store.sqlite3"],
+        "workers_restarted": True,
     }
     reset_mock.assert_called_once_with(spreadsheet_id="sheet-123")
     clear_mock.assert_called_once_with()
+    stop_inbound_mock.assert_any_call(timeout_seconds=5.0)
+    assert start_inbound_mock.called
+    start_rollover_mock.assert_called_once_with(google_sheets)
 
 
 def test_reset_sheet_calls_google_sheets_with_payload_id():
@@ -111,8 +127,17 @@ def test_reset_sheet_calls_google_sheets_with_payload_id():
         return_value={"pending_sheet_appends": 0, "pending_drive_uploads": 0},
     ), patch(
         "app.routes.setup.google_sheets.clear_current_namespace_storage",
-        return_value={"pending_sheet_appends": 0, "pending_drive_uploads": 0},
-    ) as clear_mock:
+        return_value={
+            "queue_status": {"pending_sheet_appends": 0, "pending_drive_uploads": 0},
+            "deleted_paths": [],
+        },
+    ) as clear_mock, patch(
+        "app.routes.setup.inbound_queue.stop_pending_inbound_job_worker"
+    ) as stop_inbound_mock, patch(
+        "app.routes.setup.inbound_queue.start_pending_inbound_job_worker"
+    ) as start_inbound_mock, patch(
+        "app.routes.setup_admin.google_sheets_scheduler.start_monthly_rollover_scheduler"
+    ) as start_rollover_mock:
         with TestClient(app) as client:
             response = client.post(
                 "/setup/reset-sheet",
@@ -127,13 +152,22 @@ def test_reset_sheet_calls_google_sheets_with_payload_id():
         "tabs_reset": 8,
         "queue_before": {"pending_sheet_appends": 0, "pending_drive_uploads": 0},
         "queue_cleared": {"pending_sheet_appends": 0, "pending_drive_uploads": 0},
+        "deleted_paths": [],
+        "workers_restarted": True,
     }
     reset_mock.assert_called_once_with(spreadsheet_id="sheet-123")
     clear_mock.assert_called_once_with()
+    stop_inbound_mock.assert_any_call(timeout_seconds=5.0)
+    assert start_inbound_mock.called
+    start_rollover_mock.assert_called_once_with(google_sheets)
 
 
 def test_reset_sheet_clears_storage_before_resetting_workbook():
     tracker = Mock()
+
+    def stop_inbound(*, timeout_seconds: float | None = None):
+        if timeout_seconds == 5.0:
+            tracker.stop_inbound(timeout_seconds=timeout_seconds)
 
     def queue_status():
         tracker.queue_status()
@@ -141,11 +175,27 @@ def test_reset_sheet_clears_storage_before_resetting_workbook():
 
     def clear_storage():
         tracker.clear_storage()
-        return {"pending_sheet_appends": 2, "pending_projection_rows": 2}
+        return {
+            "queue_status": {"pending_sheet_appends": 2, "pending_projection_rows": 2},
+            "deleted_paths": [
+                "/data/storage/state/canonical_store.sqlite3",
+                "/data/storage/state/content_fingerprints.txt",
+            ],
+        }
+
+    route_reset_done = {"value": False}
 
     def reset_workbook(*, spreadsheet_id: str | None = None):
         tracker.reset_workbook(spreadsheet_id=spreadsheet_id)
+        route_reset_done["value"] = True
         return 8
+
+    def start_inbound():
+        if route_reset_done["value"]:
+            tracker.start_inbound()
+
+    def start_rollover(sheets):
+        tracker.start_rollover(sheets=sheets)
 
     with _lifespan_patches(), patch(
         "app.routes.setup.settings.periskope_tool_token",
@@ -159,6 +209,15 @@ def test_reset_sheet_clears_storage_before_resetting_workbook():
     ), patch(
         "app.routes.setup.google_sheets.reset_current_month_spreadsheet_data",
         side_effect=reset_workbook,
+    ), patch(
+        "app.routes.setup.inbound_queue.stop_pending_inbound_job_worker",
+        side_effect=stop_inbound,
+    ), patch(
+        "app.routes.setup.inbound_queue.start_pending_inbound_job_worker",
+        side_effect=start_inbound,
+    ), patch(
+        "app.routes.setup_admin.google_sheets_scheduler.start_monthly_rollover_scheduler",
+        side_effect=start_rollover,
     ):
         with TestClient(app) as client:
             response = client.post(
@@ -169,10 +228,80 @@ def test_reset_sheet_clears_storage_before_resetting_workbook():
 
     assert response.status_code == 200
     assert tracker.method_calls == [
+        call.stop_inbound(timeout_seconds=5.0),
         call.queue_status(),
         call.clear_storage(),
         call.reset_workbook(spreadsheet_id="sheet-123"),
+        call.start_inbound(),
+        call.start_rollover(sheets=google_sheets),
     ]
+    assert response.json()["queue_cleared"] == {"pending_sheet_appends": 2, "pending_projection_rows": 2}
+    assert response.json()["deleted_paths"] == [
+        "/data/storage/state/canonical_store.sqlite3",
+        "/data/storage/state/content_fingerprints.txt",
+    ]
+    assert response.json()["workers_restarted"] is True
+
+
+def test_clear_current_namespace_storage_stops_workers_and_returns_deleted_paths(tmp_path):
+    tracker = Mock()
+    storage_root = tmp_path / "storage"
+    state_dir = storage_root / "state"
+    exports_dir = storage_root / "exports"
+    canonical_store = state_dir / "canonical_store.sqlite3"
+    fingerprints = state_dir / "content_fingerprints.txt"
+    export = exports_dir / "records_2026-04-25.csv"
+    state_dir.mkdir(parents=True)
+    exports_dir.mkdir(parents=True)
+    canonical_store.write_text("db", encoding="utf-8")
+    fingerprints.write_text("fp", encoding="utf-8")
+    export.write_text("rows", encoding="utf-8")
+
+    real_rmtree = shutil.rmtree
+
+    def queue_status():
+        tracker.queue_status()
+        return {"pending_projection_rows": 2}
+
+    def rmtree(path):
+        tracker.rmtree(path)
+        real_rmtree(path)
+
+    with patch(
+        "app.services.providers.google_sheets._storage_root",
+        return_value=storage_root,
+    ), patch(
+        "app.services.providers.google_sheets.stop_pending_sheet_append_worker",
+        side_effect=lambda **_: tracker.stop_projection(),
+    ), patch(
+        "app.services.providers.google_sheets.stop_monthly_rollover_scheduler",
+        side_effect=lambda: tracker.stop_rollover(),
+    ), patch(
+        "app.services.providers.google_sheets.queue_status",
+        side_effect=queue_status,
+    ), patch(
+        "app.services.providers.google_sheets.shutil.rmtree",
+        side_effect=rmtree,
+    ):
+        result = google_sheets.clear_current_namespace_storage()
+
+    assert tracker.method_calls == [
+        call.stop_projection(),
+        call.stop_rollover(),
+        call.queue_status(),
+        call.rmtree(storage_root),
+    ]
+    assert result["queue_status"] == {"pending_projection_rows": 2}
+    assert result["deleted_paths"] == sorted(
+        [
+            str(state_dir.absolute()),
+            str(exports_dir.absolute()),
+            str(canonical_store.absolute()),
+            str(fingerprints.absolute()),
+            str(export.absolute()),
+        ]
+    )
+    assert storage_root.exists()
 
 
 def test_reset_sheet_accepts_x_api_key_header():
@@ -187,8 +316,17 @@ def test_reset_sheet_accepts_x_api_key_header():
         return_value={"pending_sheet_appends": 0, "pending_drive_uploads": 0},
     ), patch(
         "app.routes.setup.google_sheets.clear_current_namespace_storage",
-        return_value={"pending_sheet_appends": 0, "pending_drive_uploads": 0},
-    ) as clear_mock:
+        return_value={
+            "queue_status": {"pending_sheet_appends": 0, "pending_drive_uploads": 0},
+            "deleted_paths": [],
+        },
+    ) as clear_mock, patch(
+        "app.routes.setup.inbound_queue.stop_pending_inbound_job_worker"
+    ), patch(
+        "app.routes.setup.inbound_queue.start_pending_inbound_job_worker"
+    ), patch(
+        "app.routes.setup_admin.google_sheets_scheduler.start_monthly_rollover_scheduler"
+    ):
         with TestClient(app) as client:
             response = client.post(
                 "/setup/reset-sheet",
@@ -198,6 +336,8 @@ def test_reset_sheet_accepts_x_api_key_header():
 
     assert response.status_code == 200
     assert response.json()["queue_cleared"] == {"pending_sheet_appends": 0, "pending_drive_uploads": 0}
+    assert response.json()["deleted_paths"] == []
+    assert response.json()["workers_restarted"] is True
     reset_mock.assert_called_once_with(spreadsheet_id="sheet-123")
     clear_mock.assert_called_once_with()
 

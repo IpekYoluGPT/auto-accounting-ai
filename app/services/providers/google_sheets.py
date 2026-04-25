@@ -2879,13 +2879,19 @@ def apply_test_drift(
         raise ValueError(f"Unsupported drift action: {action}")
 
 
-def clear_current_namespace_storage() -> dict[str, int]:
+def clear_current_namespace_storage() -> dict[str, object]:
+    if current_pipeline_context().is_production:
+        stop_pending_sheet_append_worker(timeout_seconds=5.0)
+        stop_monthly_rollover_scheduler()
+
     state_counts = queue_status()
     storage_root = _storage_root()
+    deleted_paths = []
     if storage_root.exists():
+        deleted_paths = sorted(str(path.absolute()) for path in storage_root.rglob("*"))
         shutil.rmtree(storage_root)
     storage_root.mkdir(parents=True, exist_ok=True)
-    return state_counts
+    return {"queue_status": state_counts, "deleted_paths": deleted_paths}
 
 
 def _repair_monthly_spreadsheet_layout(sh) -> None:
@@ -6490,6 +6496,12 @@ def start_pending_sheet_append_worker() -> None:
     from app.services.providers import google_sheets_projection
 
     google_sheets_projection.start_pending_sheet_append_worker(sys.modules[__name__])
+
+
+def stop_pending_sheet_append_worker(*, timeout_seconds: float = 1.0) -> None:
+    from app.services.providers import google_sheets_projection
+
+    google_sheets_projection.stop_pending_sheet_append_worker(timeout_seconds=timeout_seconds)
 
 
 def reset_current_month_spreadsheet_data(*, spreadsheet_id: Optional[str] = None) -> int:

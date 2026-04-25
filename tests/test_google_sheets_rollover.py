@@ -4,6 +4,7 @@ Tests for Google Sheets monthly rollover behavior.
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -12,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.models.schemas import BillRecord, DocumentCategory, InvoiceLineItem
-from app.services.providers import google_sheets
+from app.services.providers import google_sheets, google_sheets_projection, google_sheets_scheduler
 
 
 def test_next_month_rollover_boundary_uses_configured_timezone():
@@ -1478,6 +1479,60 @@ def test_app_startup_prepares_current_month_sheet_and_scheduler():
     start_pending_drive_mock.assert_called_once_with()
     start_mock.assert_called_once_with()
     stop_mock.assert_called_once_with()
+
+
+def test_stop_pending_sheet_append_worker_is_idempotent_and_joins_thread(monkeypatch):
+    stop_event = threading.Event()
+
+    class FakeThread:
+        join_timeout = None
+        alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            self.join_timeout = timeout
+            self.alive = False
+
+    thread = FakeThread()
+    monkeypatch.setattr(google_sheets_projection, "_pending_sheet_worker_thread", thread)
+    monkeypatch.setattr(google_sheets_projection, "_pending_sheet_worker_stop_event", stop_event)
+
+    google_sheets_projection.stop_pending_sheet_append_worker(timeout_seconds=2.5)
+    google_sheets_projection.stop_pending_sheet_append_worker(timeout_seconds=0.1)
+
+    assert stop_event.is_set()
+    assert thread.join_timeout == 2.5
+    assert google_sheets_projection._pending_sheet_worker_thread is None
+    assert google_sheets_projection._pending_sheet_worker_stop_event is None
+
+
+def test_stop_monthly_rollover_scheduler_is_idempotent_and_joins_thread(monkeypatch):
+    stop_event = threading.Event()
+
+    class FakeThread:
+        join_timeout = None
+        alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            self.join_timeout = timeout
+            self.alive = False
+
+    thread = FakeThread()
+    monkeypatch.setattr(google_sheets_scheduler, "_rollover_thread", thread)
+    monkeypatch.setattr(google_sheets_scheduler, "_rollover_stop_event", stop_event)
+
+    google_sheets_scheduler.stop_monthly_rollover_scheduler(google_sheets)
+    google_sheets_scheduler.stop_monthly_rollover_scheduler(google_sheets)
+
+    assert stop_event.is_set()
+    assert thread.join_timeout == 1.0
+    assert google_sheets_scheduler._rollover_thread is None
+    assert google_sheets_scheduler._rollover_stop_event is None
 
 
 def test_ensure_current_month_spreadsheet_ready_runs_lightweight_repair_for_recent_bootstrap():
