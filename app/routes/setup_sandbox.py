@@ -30,6 +30,7 @@ class SandboxSessionRequest(BaseModel):
 
 class SandboxIntakeRequest(BaseModel):
     session_id: str
+    spreadsheet_id: str | None = None
     message_id: str | None = None
     msg_type: Literal["text", "image", "document"]
     sender_id: str | None = None
@@ -81,9 +82,9 @@ def _require_existing_sandbox_context(session_id: str):
     return sandbox_context(session_id=normalized_session_id), spreadsheet_id
 
 
-def _ensure_sandbox_context(session_id: str | None):
+def _ensure_sandbox_context(session_id: str | None, *, spreadsheet_id_override: str | None = None):
     normalized_session_id = _normalize_sandbox_session_id(session_id)
-    context = sandbox_context(session_id=normalized_session_id)
+    context = sandbox_context(session_id=normalized_session_id, spreadsheet_id_override=spreadsheet_id_override)
     existing_spreadsheet_id = _resolve_existing_sandbox_spreadsheet_id(normalized_session_id)
     with pipeline_context_scope(context):
         spreadsheet_id = google_sheets.ensure_current_month_spreadsheet_ready()
@@ -136,7 +137,10 @@ async def sandbox_intake(request: Request, payload: SandboxIntakeRequest) -> dic
     _verify_admin_token(request)
 
     try:
-        context, spreadsheet_id, _ = _ensure_sandbox_context(payload.session_id)
+        context, spreadsheet_id, _ = _ensure_sandbox_context(
+            payload.session_id,
+            spreadsheet_id_override=payload.spreadsheet_id,
+        )
         session_id = context.session_id or _normalize_sandbox_session_id(payload.session_id)
         chat_type = payload.chat_type
         default_chat_id = f"sandbox-{session_id}@g.us" if chat_type == "group" else f"sandbox-{session_id}@c.us"
