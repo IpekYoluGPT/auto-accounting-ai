@@ -88,9 +88,19 @@ def _ensure_sandbox_context(session_id: str | None, *, spreadsheet_id_override: 
     existing_spreadsheet_id = _resolve_existing_sandbox_spreadsheet_id(normalized_session_id)
     with pipeline_context_scope(context):
         spreadsheet_id = google_sheets.ensure_current_month_spreadsheet_ready()
+        if spreadsheet_id:
+            _repair_sandbox_spreadsheet_layout(spreadsheet_id)
     if not spreadsheet_id:
         raise HTTPException(status_code=500, detail="Sandbox spreadsheet could not be prepared.")
     return context, spreadsheet_id, existing_spreadsheet_id is None
+
+
+def _repair_sandbox_spreadsheet_layout(spreadsheet_id: str) -> None:
+    google_sheets.audit_current_month_spreadsheet(
+        spreadsheet_id=spreadsheet_id,
+        repair=True,
+        refresh_formatting=True,
+    )
 
 
 def _drain_sandbox_queues(context) -> dict[str, int]:
@@ -292,6 +302,7 @@ async def sandbox_reset(request: Request, payload: SandboxSessionRequest) -> dic
         reseed_context = sandbox_context(session_id=context.session_id or payload.session_id, spreadsheet_id_override=spreadsheet_id)
         with pipeline_context_scope(reseed_context):
             google_sheets.ensure_current_month_spreadsheet_ready()
+            _repair_sandbox_spreadsheet_layout(spreadsheet_id)
 
         return {
             "status": "ok",
