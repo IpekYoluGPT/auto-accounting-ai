@@ -311,7 +311,8 @@ async def sandbox_reset(request: Request, payload: SandboxSessionRequest) -> dic
             "sheet_url": _sandbox_sheet_url(spreadsheet_id),
             "tabs_reset": tabs_reset,
             "queue_before": queue_before,
-            "queue_cleared": cleared,
+            "queue_cleared": cleared.get("queue_status", cleared),
+            "deleted_paths": list(cleared.get("deleted_paths", [])),
         }
     except HTTPException:
         raise

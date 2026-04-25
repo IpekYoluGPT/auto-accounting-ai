@@ -5,7 +5,7 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.services.accounting import inbound_queue
-from app.services.providers import google_sheets
+from app.services.providers import google_sheets, google_sheets_scheduler
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -59,12 +59,30 @@ async def reset_sheet(request: Request, payload: ResetSheetRequest) -> dict[str,
     """Authenticated helper to clear test rows from the target spreadsheet."""
     _verify_admin_token(request)
 
+    restart_workers = False
     try:
-        queue_before = google_sheets.queue_status() if payload.clear_storage else None
-        queue_cleared = google_sheets.clear_current_namespace_storage() if payload.clear_storage else None
+        queue_before = None
+        queue_cleared = None
+        deleted_paths: list[str] = []
+        workers_restarted = False
+
+        if payload.clear_storage:
+            inbound_queue.stop_pending_inbound_job_worker(timeout_seconds=5.0)
+            restart_workers = True
+            queue_before = google_sheets.queue_status()
+            clear_result = google_sheets.clear_current_namespace_storage()
+            queue_cleared = clear_result.get("queue_status", clear_result)
+            deleted_paths = list(clear_result.get("deleted_paths", []))
+
         reset_count = google_sheets.reset_current_month_spreadsheet_data(
             spreadsheet_id=payload.spreadsheet_id,
         )
+
+        if payload.clear_storage:
+            inbound_queue.start_pending_inbound_job_worker()
+            google_sheets_scheduler.start_monthly_rollover_scheduler(google_sheets)
+            workers_restarted = True
+            restart_workers = False
 
         response = {
             "status": "ok",
@@ -74,10 +92,19 @@ async def reset_sheet(request: Request, payload: ResetSheetRequest) -> dict[str,
         if payload.clear_storage:
             response["queue_before"] = queue_before
             response["queue_cleared"] = queue_cleared
+            response["deleted_paths"] = deleted_paths
+            response["workers_restarted"] = workers_restarted
         return response
     except Exception as exc:
         logger.error("Sheet reset failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        if restart_workers:
+            try:
+                inbound_queue.start_pending_inbound_job_worker()
+                google_sheets_scheduler.start_monthly_rollover_scheduler(google_sheets)
+            except Exception as exc:
+                logger.warning("Could not restart workers after failed sheet reset: %s", exc, exc_info=True)
 
 
 @router.post("/repair-sheet")

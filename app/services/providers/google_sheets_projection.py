@@ -5,10 +5,10 @@ Projection and visible-sheet queue helpers for Google Sheets integration.
 from __future__ import annotations
 
 import threading
-import time
 from uuid import uuid4
 
 _pending_sheet_worker_thread: threading.Thread | None = None
+_pending_sheet_worker_stop_event: threading.Event | None = None
 _pending_sheet_worker_lock = threading.Lock()
 
 
@@ -108,8 +108,8 @@ def process_pending_sheet_appends(sheets, *, max_items: int | None = None) -> in
     return len(pending_doc_ids)
 
 
-def _projection_worker_loop(sheets) -> None:
-    while True:
+def _projection_worker_loop(sheets, stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
         try:
             processed = process_pending_sheet_appends(sheets)
             if processed == 0 and sheets._should_sync_visible_overrides():
@@ -122,26 +122,47 @@ def _projection_worker_loop(sheets) -> None:
         except Exception as exc:
             sheets.logger.warning("Projection worker iteration failed: %s", exc, exc_info=True)
 
-        if _pending_sheet_worker_thread is None:
+        if stop_event.wait(sheets._PROJECTION_WORKER_POLL_SECONDS):
             break
-        time.sleep(sheets._PROJECTION_WORKER_POLL_SECONDS)
 
 
 def start_pending_sheet_append_worker(sheets) -> None:
     if not sheets.current_pipeline_context().is_production:
         return
 
-    global _pending_sheet_worker_thread
+    global _pending_sheet_worker_thread, _pending_sheet_worker_stop_event
     with _pending_sheet_worker_lock:
         if _pending_sheet_worker_thread is not None and _pending_sheet_worker_thread.is_alive():
             return
+        _pending_sheet_worker_stop_event = threading.Event()
         _pending_sheet_worker_thread = threading.Thread(
             target=_projection_worker_loop,
-            args=(sheets,),
+            args=(sheets, _pending_sheet_worker_stop_event),
             name="google-sheets-projection-worker",
             daemon=True,
         )
         _pending_sheet_worker_thread.start()
+
+
+def stop_pending_sheet_append_worker(*, timeout_seconds: float = 1.0) -> None:
+    global _pending_sheet_worker_thread, _pending_sheet_worker_stop_event
+
+    with _pending_sheet_worker_lock:
+        thread = _pending_sheet_worker_thread
+        stop_event = _pending_sheet_worker_stop_event
+        if thread is None:
+            _pending_sheet_worker_stop_event = None
+            return
+        if stop_event is not None:
+            stop_event.set()
+
+    if thread.is_alive():
+        thread.join(timeout=timeout_seconds)
+
+    with _pending_sheet_worker_lock:
+        if _pending_sheet_worker_thread is thread and not thread.is_alive():
+            _pending_sheet_worker_thread = None
+            _pending_sheet_worker_stop_event = None
 
 
 def append_record(
