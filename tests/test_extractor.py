@@ -338,7 +338,14 @@ class TestExtractBill:
     def test_strict_split_retry_prompt_requests_exact_document_count_for_checks(self, monkeypatch):
         monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
         expected = AIMultiExtractionResult(
-            documents=[AIExtractionResult(company_name="Yapı Kredi", currency="TRY", confidence=0.8)]
+            documents=[
+                AIExtractionResult(
+                    company_name="Yapı Kredi",
+                    recipient_name="HAMİLİNE",
+                    currency="TRY",
+                    confidence=0.8,
+                )
+            ]
         )
 
         with patch(
@@ -443,7 +450,14 @@ class TestExtractBill:
     def test_cheque_prompt_requests_bank_and_cheque_metadata(self, monkeypatch):
         monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
         expected = AIMultiExtractionResult(
-            documents=[AIExtractionResult(company_name="Banka", currency="TRY", confidence=0.8)]
+            documents=[
+                AIExtractionResult(
+                    company_name="Banka",
+                    recipient_name="HAMİLİNE",
+                    currency="TRY",
+                    confidence=0.8,
+                )
+            ]
         )
 
         with patch(
@@ -474,7 +488,14 @@ class TestExtractBill:
     def test_cheque_prompt_includes_ocr_hints_when_available(self, monkeypatch):
         monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
         expected = AIMultiExtractionResult(
-            documents=[AIExtractionResult(company_name="Banka", currency="TRY", confidence=0.8)]
+            documents=[
+                AIExtractionResult(
+                    company_name="Banka",
+                    recipient_name="HAMİLİNE",
+                    currency="TRY",
+                    confidence=0.8,
+                )
+            ]
         )
 
         with patch(
@@ -499,6 +520,166 @@ class TestExtractBill:
         prompt = mock_generate.call_args.kwargs["prompt"]
         assert "OCR ipucu" in prompt
         assert "HAMİLİNE" in prompt
+
+    def test_cheque_prompt_marks_recipient_name_as_required(self, monkeypatch):
+        monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
+        expected = AIMultiExtractionResult(
+            documents=[
+                AIExtractionResult(
+                    company_name="Banka",
+                    recipient_name="HAMİLİNE",
+                    currency="TRY",
+                    confidence=0.8,
+                )
+            ]
+        )
+
+        with patch(
+            "app.services.accounting.gemini_extractor.gemini_client.generate_structured_content",
+            return_value=expected,
+        ) as mock_generate:
+            extract_bills(
+                b"fake_image",
+                mime_type="image/jpeg",
+                source_message_id="msg-cheque-required-1",
+                source_filename="cheque.jpg",
+                source_type="image",
+                category_hint=DocumentCategory.CEK,
+            )
+
+        prompt = mock_generate.call_args.kwargs["prompt"]
+        assert "ZORUNLU: cek belgesi icin recipient_name asla null" in prompt
+        assert "Lehdar el yazisi okunaksizsa bile en yakin tahmini ver" in prompt
+
+    def test_cheque_extract_bills_refines_missing_lehdars(self, monkeypatch):
+        from app.services.accounting.gemini_extractor import _ChequeLehdarEntry, _ChequeLehdarRefinement
+
+        monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
+        monkeypatch.setattr(
+            "app.services.accounting.gemini_extractor.settings.gemini_extractor_model",
+            "gemini-test-extractor",
+        )
+
+        primary = AIMultiExtractionResult(
+            documents=[
+                AIExtractionResult(
+                    company_name="H.KARAKAYA INSAAT",
+                    document_number="0205890",
+                    recipient_name=None,
+                    currency="TRY",
+                    confidence=0.8,
+                ),
+                AIExtractionResult(
+                    company_name="H.KARAKAYA INSAAT",
+                    document_number="0205891",
+                    recipient_name="ERIMER MERMER",
+                    currency="TRY",
+                    confidence=0.85,
+                ),
+                AIExtractionResult(
+                    company_name="H.KARAKAYA INSAAT",
+                    document_number="0205892",
+                    recipient_name="-",
+                    currency="TRY",
+                    confidence=0.7,
+                ),
+            ]
+        )
+        refinement = _ChequeLehdarRefinement(
+            lehdars=[
+                _ChequeLehdarEntry(lehdar="HAMİLİNE"),
+                _ChequeLehdarEntry(lehdar="ERIMER MERMER"),
+                _ChequeLehdarEntry(lehdar="Nurteks Halı Tic."),
+            ]
+        )
+
+        with patch(
+            "app.services.accounting.gemini_extractor.gemini_client.generate_structured_content",
+            side_effect=[primary, refinement],
+        ) as mock_generate:
+            records = extract_bills(
+                b"fake_image",
+                mime_type="image/jpeg",
+                source_message_id="msg-cheque-refine-1",
+                source_filename="cheques.jpg",
+                source_type="image",
+                category_hint=DocumentCategory.CEK,
+            )
+
+        assert mock_generate.call_count == 2
+        refinement_call = mock_generate.call_args_list[1]
+        assert refinement_call.kwargs["response_schema"] is _ChequeLehdarRefinement
+        prompt = refinement_call.kwargs["prompt"]
+        assert "lehdar" in prompt.lower()
+        assert "1, 3" in prompt  # missing-index hints (1-based)
+        assert records[0].recipient_name == "HAMİLİNE"
+        assert records[1].recipient_name == "ERIMER MERMER"
+        assert records[2].recipient_name == "Nurteks Halı Tic."
+
+    def test_cheque_extract_bills_skips_refinement_when_all_lehdars_present(self, monkeypatch):
+        monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
+        primary = AIMultiExtractionResult(
+            documents=[
+                AIExtractionResult(
+                    company_name="Banka",
+                    recipient_name="HAMİLİNE",
+                    currency="TRY",
+                    confidence=0.9,
+                ),
+                AIExtractionResult(
+                    company_name="Banka",
+                    recipient_name="Nurteks Halı",
+                    currency="TRY",
+                    confidence=0.9,
+                ),
+            ]
+        )
+
+        with patch(
+            "app.services.accounting.gemini_extractor.gemini_client.generate_structured_content",
+            return_value=primary,
+        ) as mock_generate:
+            records = extract_bills(
+                b"fake_image",
+                mime_type="image/jpeg",
+                source_message_id="msg-cheque-no-refine-1",
+                source_filename="cheques.jpg",
+                source_type="image",
+                category_hint=DocumentCategory.CEK,
+            )
+
+        assert mock_generate.call_count == 1
+        assert records[0].recipient_name == "HAMİLİNE"
+        assert records[1].recipient_name == "Nurteks Halı"
+
+    def test_cheque_extract_bills_keeps_originals_when_refinement_fails(self, monkeypatch):
+        monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
+        primary = AIMultiExtractionResult(
+            documents=[
+                AIExtractionResult(
+                    company_name="Banka",
+                    recipient_name=None,
+                    currency="TRY",
+                    confidence=0.9,
+                )
+            ]
+        )
+
+        with patch(
+            "app.services.accounting.gemini_extractor.gemini_client.generate_structured_content",
+            side_effect=[primary, RuntimeError("upstream down")],
+        ) as mock_generate:
+            records = extract_bills(
+                b"fake_image",
+                mime_type="image/jpeg",
+                source_message_id="msg-cheque-refine-fail-1",
+                source_filename="cheque.jpg",
+                source_type="image",
+                category_hint=DocumentCategory.CEK,
+            )
+
+        assert mock_generate.call_count == 2
+        assert records[0].recipient_name is None
 
     def test_shipment_prompt_requests_route_and_vehicle_details(self, monkeypatch):
         monkeypatch.setattr("app.services.accounting.gemini_extractor.settings.gemini_api_key", "fake_key")
