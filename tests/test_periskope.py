@@ -500,6 +500,30 @@ def test_periskope_group_non_bill_text_is_ignored_without_reply():
     send_mock.assert_not_called()
 
 
+def test_periskope_group_bill_like_text_is_ignored_without_reply():
+    payload = _periskope_event(_periskope_text_message(body="Toplam 150 TL, KDV 27 TL"))
+    signature = _sign_payload(payload, "periskope-secret")
+    client = TestClient(app)
+    with _patch_runtime_settings("/tmp/unused"), patch(
+        "app.routes.periskope.settings.periskope_allowed_chat_ids",
+        "120363410789660631@g.us",
+    ), patch(
+        "app.services.accounting.intake.bill_classifier.classify_text",
+        return_value=ClassificationResult(is_bill=True, reason="bill text", confidence=0.81),
+    ), patch(
+        "app.routes.periskope.periskope.send_text_message"
+    ) as send_mock:
+        response = client.post(
+            "/integrations/periskope/webhook",
+            json=payload,
+            headers={"x-periskope-signature": signature},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    send_mock.assert_not_called()
+
+
 def test_periskope_webhook_accepts_event_type_with_current_attributes():
     payload = _periskope_event_type_payload(_periskope_image_message(message_id="peri-msg-2"))
     signature = _sign_payload(payload, "periskope-secret")

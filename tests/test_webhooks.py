@@ -508,6 +508,23 @@ def test_group_non_bill_text_is_ignored_without_reply():
     send_mock.assert_not_called()
 
 
+def test_group_bill_like_text_is_ignored_without_reply():
+    with TemporaryDirectory() as tmpdir:
+        client = TestClient(app)
+        with _patch_runtime_settings(tmpdir, groups_only=True), patch(
+            "app.services.accounting.intake.bill_classifier.classify_text",
+            return_value=ClassificationResult(is_bill=True, reason="bill text", confidence=0.81),
+        ), patch("app.routes.webhooks.whatsapp.send_text_message") as send_mock:
+            response = client.post(
+                "/webhook",
+                json=_text_payload("Toplam 150 TL, KDV 27 TL", "wamid-text-group-bill-1", sender="905551112233", group_id="group-123"),
+            )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    send_mock.assert_not_called()
+
+
 def test_direct_messages_are_blocked_when_groups_only_mode_is_enabled():
     with TemporaryDirectory() as tmpdir:
         client = TestClient(app)
