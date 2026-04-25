@@ -637,6 +637,60 @@ def test_build_visible_projection_snapshot_splits_cheques_from_banka_odemeleri(m
     assert set(hashes_by_tab) >= {"Banka Ödemeleri", "Çekler"}
 
 
+def test_build_visible_projection_snapshot_filters_out_non_current_month_documents(monkeypatch):
+    current_doc = google_sheets._canonical_store.StoredDocument(
+        source_doc_id="cek-current-month",
+        category=DocumentCategory.CEK,
+        return_source_category=None,
+        source_message_id="wamid-cek-current",
+        record=BillRecord(
+            cheque_due_date="2026-04-12",
+            cheque_serial_number="CHK-CURRENT",
+            total_amount=2500.0,
+            sender_name="KANSA",
+            recipient_name="H. KARAKAYA",
+            cheque_bank_name="Ziraat Bankası",
+        ),
+        drive_link=None,
+        feedback_platform=None,
+        feedback_chat_id=None,
+        feedback_recipient_type=None,
+        feedback_message_id=None,
+        created_at="2026-04-12T10:00:00+00:00",
+        updated_at="2026-04-12T10:00:00+00:00",
+    )
+    old_doc = google_sheets._canonical_store.StoredDocument(
+        source_doc_id="cek-old-month",
+        category=DocumentCategory.CEK,
+        return_source_category=None,
+        source_message_id="wamid-cek-old",
+        record=BillRecord(
+            cheque_due_date="2017-10-15",
+            cheque_serial_number="CHK-OLD",
+            total_amount=15000.0,
+            sender_name="OLD SENDER",
+            recipient_name="OLD RECIPIENT",
+            cheque_bank_name="Old Bank",
+        ),
+        drive_link=None,
+        feedback_platform=None,
+        feedback_chat_id=None,
+        feedback_recipient_type=None,
+        feedback_message_id=None,
+        created_at="2017-10-15T10:00:00+00:00",
+        updated_at="2017-10-15T10:00:00+00:00",
+    )
+
+    monkeypatch.setattr(google_sheets._canonical_store, "list_documents", lambda: [old_doc, current_doc])
+    monkeypatch.setattr(google_sheets, "_month_key", lambda: "2026-04")
+    monkeypatch.setattr(google_sheets, "_build_projection_debt_state", lambda documents: [])
+
+    rows_by_tab, _ = google_sheets._build_visible_projection_snapshot()
+
+    assert len(rows_by_tab["Çekler"]) == 1
+    assert rows_by_tab["Çekler"][0][2] == "CHK-CURRENT"
+
+
 def test_cheque_projection_accepts_legacy_visible_override_names(monkeypatch):
     cek = google_sheets._canonical_store.StoredDocument(
         source_doc_id="cek-legacy-overrides",
@@ -1219,6 +1273,34 @@ def test_get_or_create_spreadsheet_reuses_existing_month_sheet_when_registry_mis
     client.open_by_key.assert_called_once_with("sheet-april-existing")
     create_mock.assert_not_called()
     bootstrap_mock.assert_not_called()
+
+
+def test_get_or_create_spreadsheet_prefers_env_over_stale_registry():
+    """GOOGLE_SHEETS_SPREADSHEET_ID must win over sheets_registry.json for the same month."""
+    client = MagicMock()
+    spreadsheet = MagicMock()
+    client.open_by_key.return_value = spreadsheet
+
+    with patch(
+        "app.services.providers.google_sheets._load_registry",
+        return_value={"2026-04": "sheet-old"},
+    ), patch(
+        "app.services.providers.google_sheets._save_registry",
+    ) as save_registry_mock, patch(
+        "app.services.providers.google_sheets._month_key",
+        return_value="2026-04",
+    ), patch(
+        "app.services.providers.google_sheets.settings.google_sheets_spreadsheet_id",
+        "sheet-from-env",
+    ), patch(
+        "app.services.providers.google_sheets._find_existing_spreadsheet_in_drive",
+    ) as find_mock:
+        result = google_sheets._get_or_create_spreadsheet(client)
+
+    assert result is spreadsheet
+    client.open_by_key.assert_called_once_with("sheet-from-env")
+    find_mock.assert_not_called()
+    save_registry_mock.assert_called_once_with({"2026-04": "sheet-from-env"})
 
 
 def test_find_existing_spreadsheet_in_drive_searches_month_folder_when_cache_is_cold():
