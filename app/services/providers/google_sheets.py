@@ -1252,6 +1252,72 @@ def _month_key() -> str:
     return _now().strftime("%Y-%m")
 
 
+def _coerce_month_key(value: object) -> str | None:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return None
+
+    direct_match = re.match(r"^(\d{4})[-/.](\d{1,2})(?:[-/.]\d{1,2})?", normalized)
+    if direct_match:
+        year = int(direct_match.group(1))
+        month = int(direct_match.group(2))
+        if 1 <= month <= 12:
+            return f"{year:04d}-{month:02d}"
+
+    trailing_year_match = re.match(r"^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})$", normalized)
+    if trailing_year_match:
+        month = int(trailing_year_match.group(2))
+        year = int(trailing_year_match.group(3))
+        if 1 <= month <= 12:
+            return f"{year:04d}-{month:02d}"
+
+    try:
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+        return parsed.strftime("%Y-%m")
+    except ValueError:
+        return None
+
+
+def _document_month_key(document: object) -> str | None:
+    record = getattr(document, "record", None)
+    if record is None:
+        return None
+    for candidate in (
+        getattr(record, "document_date", None),
+        getattr(document, "created_at", None),
+        getattr(record, "cheque_due_date", None),
+        getattr(record, "cheque_issue_date", None),
+    ):
+        month_key = _coerce_month_key(candidate)
+        if month_key:
+            return month_key
+    return None
+
+
+def _documents_for_projection_month(
+    documents: list[_canonical_store.StoredDocument],
+    *,
+    month_key: str | None = None,
+) -> list[_canonical_store.StoredDocument]:
+    target_month_key = (month_key or _month_key()).strip()
+    if not target_month_key:
+        return list(documents)
+
+    filtered = [
+        document
+        for document in documents
+        if not hasattr(document, "record") or _document_month_key(document) == target_month_key
+    ]
+    if len(filtered) != len(documents):
+        logger.info(
+            "Projection month scope applied for %s: %d/%d document(s) included.",
+            target_month_key,
+            len(filtered),
+            len(documents),
+        )
+    return filtered
+
+
 def _month_label() -> str:
     months_tr = {
         1: "Ocak", 2: "Şubat", 3: "Mart", 4: "Nisan",
@@ -3082,9 +3148,10 @@ def _get_or_create_spreadsheet(client):
     Return the gspread Spreadsheet to use.
 
     Priority:
-      1. sheets_registry.json entry for this month.
-      2. GOOGLE_SHEETS_SPREADSHEET_ID env var (configured spreadsheet).
-      3. Auto-create via OAuth/Drive API in the monthly subfolder.
+      1. Request context override (sandbox / explicit spreadsheet_id).
+      2. GOOGLE_SHEETS_SPREADSHEET_ID in production, if set (overrides stale registry on disk).
+      3. sheets_registry.json entry for this month.
+      4. Auto-create / search Drive in the monthly subfolder.
     """
     registry = _load_registry()
     month_key = _month_key()
@@ -3100,6 +3167,30 @@ def _get_or_create_spreadsheet(client):
         except Exception as exc:
             logger.warning("Context spreadsheet override inaccessible (%s); will retry.", exc)
 
+    # Configured ID must run before the persisted registry. Otherwise the volume copy of
+    # sheets_registry.json (e.g. on Railway) keeps a previous month id forever and
+    # ignores a newly set GOOGLE_SHEETS_SPREADSHEET_ID — unlike sandbox tests, which
+    # use an override or a fresh per-session registry.
+    env_spreadsheet_id = (settings.google_sheets_spreadsheet_id or "").strip()
+    if current_pipeline_context().is_production and env_spreadsheet_id:
+        try:
+            sh = client.open_by_key(env_spreadsheet_id)
+            previous = registry.get(month_key)
+            if previous and previous != env_spreadsheet_id:
+                logger.info(
+                    "Using GOOGLE_SHEETS_SPREADSHEET_ID for %s (replacing registered id %s with %s).",
+                    month_key,
+                    previous,
+                    env_spreadsheet_id,
+                )
+            else:
+                logger.info("Using GOOGLE_SHEETS_SPREADSHEET_ID for %s.", month_key)
+            registry[month_key] = env_spreadsheet_id
+            _save_registry(registry)
+            return sh
+        except Exception as exc:
+            logger.error("Cannot open GOOGLE_SHEETS_SPREADSHEET_ID: %s", exc)
+
     # 1. Registry hit for this month
     if month_key in registry:
         try:
@@ -3112,17 +3203,6 @@ def _get_or_create_spreadsheet(client):
 
     # Ignore legacy single-spreadsheet mode so each month gets its own sheet.
     registry.pop("permanent", None)
-
-    # 2. Configured spreadsheet from env
-    if current_pipeline_context().is_production and settings.google_sheets_spreadsheet_id:
-        try:
-            sh = client.open_by_key(settings.google_sheets_spreadsheet_id)
-            registry[month_key] = settings.google_sheets_spreadsheet_id
-            _save_registry(registry)
-            logger.info("Using env spreadsheet for %s.", month_key)
-            return sh
-        except Exception as exc:
-            logger.error("Cannot open GOOGLE_SHEETS_SPREADSHEET_ID: %s", exc)
 
     # 3. Search Drive for an existing spreadsheet with the expected title
     #    (guards against duplicates from previous half-failed creations)
@@ -6057,7 +6137,7 @@ def _build_expense_projection_rows(
 
 
 def _build_visible_projection_snapshot() -> tuple[dict[str, list[list[object]]], dict[str, dict[str, str]]]:
-    documents = _canonical_store.list_documents()
+    documents = _documents_for_projection_month(_canonical_store.list_documents())
     debt_state = _build_projection_debt_state(documents)
     payment_rows, cheque_rows, payment_hashes, cheque_hashes, allocation_rows = _build_payment_projection_rows_from_documents(documents, debt_state)
     expense_rows, expense_hashes = _build_expense_projection_rows(debt_state)
