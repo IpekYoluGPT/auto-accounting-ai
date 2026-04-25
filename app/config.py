@@ -13,7 +13,6 @@ def _default_storage_dir() -> str:
 
 
 DEFAULT_GEMINI_MODEL = "gemini-3.1-pro-preview"
-DEFAULT_GEMINI_FAST_MODEL = "gemini-3.1-flash-preview"
 
 
 class Settings(BaseSettings):
@@ -48,7 +47,7 @@ class Settings(BaseSettings):
     gemini_classifier_model: str = DEFAULT_GEMINI_MODEL
     gemini_extractor_model: str = DEFAULT_GEMINI_MODEL
     gemini_validation_model: str = DEFAULT_GEMINI_MODEL
-    gemini_lehdar_refinement_model: str = DEFAULT_GEMINI_FAST_MODEL
+    gemini_lehdar_refinement_model: str = "gemini-3.1-flash-lite-preview"
 
     # Google Sheets
     # Base64-encoded service account JSON (from Google Cloud Console)
