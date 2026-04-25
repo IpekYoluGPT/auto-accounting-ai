@@ -493,6 +493,46 @@ def test_sandbox_intake_processes_text_in_sandbox_context():
     assert intake_mock.call_args.kwargs["route"].chat_id == "sandbox-alpha@g.us"
 
 
+def test_sandbox_intake_can_target_override_spreadsheet_silently():
+    context = sandbox_context(session_id="alpha", spreadsheet_id_override="live-sheet-1")
+    with _lifespan_patches(), patch(
+        "app.routes.setup.settings.periskope_tool_token",
+        "secret-token",
+    ), patch(
+        "app.routes.setup_sandbox._ensure_sandbox_context",
+        return_value=(context, "live-sheet-1", False),
+    ) as ensure_mock, patch(
+        "app.routes.setup.record_store.find_export_rows",
+        side_effect=[[], [{"source_message_id": "sandbox-alpha-1"}]],
+    ), patch(
+        "app.routes.setup.intake.process_incoming_message",
+        return_value="exported",
+    ) as intake_mock, patch(
+        "app.routes.setup_sandbox._drain_sandbox_queues",
+        return_value={"pending_sheet_appends_processed": 1, "pending_drive_uploads_processed": 0},
+    ), patch(
+        "app.routes.setup.google_sheets.queue_status",
+        return_value={"pending_sheet_appends": 0, "pending_drive_uploads": 0},
+    ):
+        with TestClient(app) as client:
+            response = client.post(
+                "/setup/sandbox/intake",
+                json={
+                    "session_id": "alpha",
+                    "spreadsheet_id": "live-sheet-1",
+                    "msg_type": "text",
+                    "text": "elden odeme 500 tl yakit",
+                },
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+    assert response.status_code == 200
+    assert response.json()["spreadsheet_id"] == "live-sheet-1"
+    ensure_mock.assert_called_once()
+    assert ensure_mock.call_args.kwargs["spreadsheet_id_override"] == "live-sheet-1"
+    assert intake_mock.call_args.kwargs["context"].disable_outbound_messages is True
+
+
 def test_sandbox_intake_reports_rows_by_source_message_id():
     context = sandbox_context(session_id="alpha")
     with _lifespan_patches(), patch(
