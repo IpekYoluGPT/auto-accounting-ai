@@ -272,13 +272,14 @@ def process_incoming_message(
 
 
 def _handle_text(text: str, route: MessageRoute, send_text: SendTextFn) -> str:
+    if route.chat_type == "group":
+        logger.info("Ignoring group text chat_id=%s without warning.", route.chat_id)
+        return "ignored_group_text"
+
     result = bill_classifier.classify_text(text)
     logger.info("Text classification: is_bill=%s confidence=%.2f", result.is_bill, result.confidence)
 
     if not result.is_bill:
-        if route.chat_type == "group":
-            logger.info("Ignoring non-bill text in group chat_id=%s without warning.", route.chat_id)
-            return "ignored_non_bill_group_text"
         if _send_throttled_warning(
             route,
             MSG_UNRELATED_TEXT,
