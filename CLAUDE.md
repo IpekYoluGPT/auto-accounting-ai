@@ -104,6 +104,7 @@ app/
 | Variable | Purpose |
 |----------|---------|
 | `GEMINI_API_KEY` | Gemini AI (classification + extraction) |
+| `GEMINI_LEHDAR_REFINEMENT_MODEL` | Model used for the cheque-only Lehdar second pass (default `gemini-3.1-flash-lite-preview`) |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | Base64-encoded SA credentials (read/write sheets) |
 | `GOOGLE_OAUTH_CLIENT_ID` | OAuth2 for spreadsheet creation |
 | `GOOGLE_OAUTH_CLIENT_SECRET` | OAuth2 for spreadsheet creation |
@@ -135,3 +136,11 @@ Test files mirror the source structure. Mocks are used for Gemini API and Perisk
 - `record_store.claim_message_processing()` prevents duplicate processing of the same message
 - `_safe_send_text_message()` catches send failures so processing continues
 - Tab bootstrap order matters: data tabs first, then Ozet summary formulas
+
+### Cheque Lehdar Two-Pass Extraction
+
+For `category_hint == DocumentCategory.CEK`, `extract_bills()` runs a second focused
+Gemini call (`_refine_missing_cheque_lehdars` in `app/services/accounting/gemini_extractor.py`)
+when the primary pass leaves any record's `recipient_name` blank. The refinement uses the
+faster `GEMINI_LEHDAR_REFINEMENT_MODEL` (Flash) and only fills blank slots — populated
+lehdars are never overwritten. Refinement failures log a warning and leave records as-is.
