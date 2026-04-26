@@ -5,12 +5,12 @@ Gemini-backed extraction with category-aware prompts.
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.models.schemas import AIMultiExtractionResult, BillRecord, DocumentCategory, InvoiceLineItem
+from app.models.schemas import AIExtractionResult, AIMultiExtractionResult, BillRecord, DocumentCategory, InvoiceLineItem
 from app.services import gemini_client
 from app.services.accounting import ocr, unit_dictionary
 from app.utils.logging import get_logger
@@ -130,6 +130,115 @@ _MULTI_DOCUMENT_RETRY_INSTRUCTIONS = """Bu goruntude birden fazla belge var ve o
 """
 
 _THOUSANDS_STYLE_IDENTIFIER_RE = re.compile(r"^\d{1,3}(?:\.\d{3})+$")
+
+
+_COMBINED_SYSTEM_INSTRUCTION = """You classify and extract structured bookkeeping data from Turkish business documents in a single response.
+
+Return classification metadata AND extracted documents together.
+
+Classification rules:
+- Rely only on information clearly visible in the image or PDF.
+- Handwritten, tilted, creased, or shadowed documents are common — still classify as readable unless severely damaged.
+- Set needs_retry only when the image is genuinely illegible (severely blurry, dark, or cropped).
+- For return documents prefer the base document family with is_return=true rather than category=iade.
+
+Extraction rules:
+- Use only information visible in the provided media.
+- Preserve Turkish characters exactly when visible.
+- Do not invent tax IDs, document IDs, totals, company names, or dates.
+- When values are missing, return null.
+- Normalize dates to YYYY-MM-DD and times to HH:MM when clearly visible.
+- Convert Turkish formatted numbers to JSON numbers.
+- document_number, invoice_number, receipt_number, cheque_serial_number, and cheque_account_ref are identifiers — return as strings exactly as seen, preserve leading zeroes.
+- If multiple documents are present, return one object per distinct document sorted left-to-right, then top-to-bottom.
+- Do not merge separate documents into one record.
+- For return documents, extract values exactly as shown; do not flip signs unless the document itself shows negative amounts.
+- If is_financial_document is false, return documents as an empty list.
+- Examples and category hints are pattern guidance only; never copy values from prior examples.
+"""
+
+_COMBINED_PROMPT = """Bu medya muhasebe surecine girecek bir Turkce is belgesi olabilir.
+
+KISIM 1 — SINIFLANDIRMA (her zaman doldur):
+- is_financial_document: muhasebe acisindan islenecek gercek bir belge mi?
+- category: fatura | odeme_dekontu | harcama_fisi | cek | malzeme | iade | belirsiz
+  - fatura: e-fatura, e-arsiv, toptan satis faturasi, kurumsal KDV'li satis belgesi
+  - odeme_dekontu: banka dekontu, EFT/FAST/havale, IBAN transfer PDF'i veya ekran ciktisi
+  - harcama_fisi: akaryakit fisi, POS fisi, market/yemek/otopark fisi
+  - cek: cek yapragi veya cek goruntusu
+  - malzeme: irsaliye, teslim fisi, hafriyat/kum/cakil formu, veresiye satis senedi, el yazili malzeme teslim belgesi
+  - iade: belge ailesi belli degil ama iade/iptal oldugu net belge
+- is_return: iade / iptal belgesi mi? (iade faturasinda category=fatura, is_return=true)
+- document_count: goruntudeki ayri belge sayisi
+- quality: clear | usable | poor | unusable
+- needs_retry: yalnizca ciddi sekilde okunamaz ise true
+- confidence: 0–1
+- reason: kisa gerekce
+
+KISIM 2 — CIKARMA:
+- is_financial_document=true ise: goruntudeki her belge icin ayri bir document objesi dondur.
+- is_financial_document=false ise: documents=[] (bos liste) olmali.
+- Belirlenen category icin asagidaki talimatlari uy.
+- Default currency TRY. Eksik alan null. Tarih YYYY-MM-DD, saat HH:MM.
+
+Kategori talimatlari:
+
+FATURA:
+- company_name satici / duzenleyen firmadir.
+- invoice_number icin once Fatura No, yoksa Belge No kullan.
+- subtotal, vat_rate, vat_amount, total_amount gorunuyorsa doldur.
+- line_items varsa her satir icin description, line_quantity, line_unit, unit_price, line_amount.
+
+ODEME DEKONTU:
+- company_name alanina gorunur banka, odeme kurumu veya baskin karsi taraf adini yaz.
+- recipient_name aliciyi belirtir. sender_name sadece gonderen kisi/firma adidir.
+- document_number alanina referans / islem / dekont numarasini koy.
+- total_amount transfer edilen nihai tutardir.
+
+HARCAMA FISI:
+- company_name satici isletmedir.
+- receipt_number icin once Fis No, yoksa Belge No kullan.
+- line_items varsa her gorunen urun/hizmet satirini ayri cikar.
+- description alanina gorunen satir detaylarini aynen koruyarak yaz.
+
+CEK:
+- document_number cek seri / belge numarasidir.
+- recipient_name lehdar / alicidir; YALNIZCA el yazisi ile yazilan payee satirindan alinmalidir.
+- ZORUNLU: recipient_name asla null, bos veya "-" olamaz. HAMILINE gorunuyorsa "HAMİLİNE" yaz.
+- sender_name matbu/basilmis cek sahibi/kesideci adidir; el yazisi lehdar ile karistirma.
+- cheque_issue_date, cheque_due_date, cheque_serial_number, cheque_bank_name, cheque_branch, cheque_account_ref gorunuyorsa doldur.
+
+MALZEME / IRSALIYE:
+- company_name tedarikci firmadi.
+- document_number irsaliye / form numarasidir.
+- shipment_origin, shipment_destination, vehicle_plate, product_quantity gorunuyorsa doldur.
+- line_items varsa her satiri cikar.
+- total_amount gorunmuyorsa null birak.
+
+IADE:
+- Mumkunse esas belge ailesi mantigiyla oku ama is_return=true.
+- line_items varsa cikar.
+
+Kisa ornekler:
+- Ayni fotografta 3 cek: 3 ayri document, soldan saga siralama.
+- Iade faturasi: category=fatura, is_return=true, tutarlari goruldugu gibi yaz.
+- El yazili hafriyat formu: financial=true, category=malzeme; tutar yoksa total_amount=null."""
+
+
+class _CombinedDocumentResult(BaseModel):
+    """Gemini response schema for single-pass classification + extraction."""
+
+    is_financial_document: bool = False
+    category: str = "belirsiz"
+    is_return: bool = False
+    document_count: int = Field(default=1, ge=0, le=10)
+    quality: Literal["clear", "usable", "poor", "unusable"] = "usable"
+    needs_retry: bool = False
+    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    reason: Optional[str] = None
+    documents: list[AIExtractionResult] = Field(default_factory=list)
+
+    model_config = {"extra": "ignore"}
 
 
 _LEHDAR_REFINEMENT_SYSTEM_INSTRUCTION = """You re-read handwritten payee/lehdar lines from Turkish bank cheques.
@@ -454,6 +563,117 @@ def extract_bills(
     )
     return records
 
+
+def analyze_and_extract(
+    image_bytes: bytes,
+    mime_type: str = "image/jpeg",
+    source_message_id: Optional[str] = None,
+    source_filename: Optional[str] = None,
+    source_type: Optional[str] = None,
+    source_sender_id: Optional[str] = None,
+    source_sender_name: Optional[str] = None,
+    source_group_id: Optional[str] = None,
+    source_chat_type: Optional[str] = None,
+) -> tuple:
+    """Single Gemini call that classifies AND extracts from the same image.
+
+    Returns (DocumentAnalysis, list[BillRecord]).  Eliminates the separate
+    doc_classifier call so each media message costs one Pro API round-trip
+    instead of two.
+    """
+    from app.services.accounting.doc_classifier import DocumentAnalysis
+
+    if not settings.gemini_api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+    model_name = settings.gemini_extractor_model
+
+    logger.info(
+        "Combined classify+extract: sending %d bytes (%s) to %s",
+        len(image_bytes),
+        mime_type,
+        model_name,
+    )
+
+    combined = gemini_client.generate_structured_content(
+        model=model_name,
+        prompt=_COMBINED_PROMPT,
+        system_instruction=_COMBINED_SYSTEM_INSTRUCTION,
+        response_schema=_CombinedDocumentResult,
+        thinking_level="low",
+        media_bytes=image_bytes,
+        mime_type=mime_type,
+    )
+
+    # --- Build DocumentAnalysis ---
+    category_str = (combined.category or "belirsiz").lower().strip()
+    try:
+        category = DocumentCategory(category_str)
+    except ValueError:
+        logger.warning("Unknown category '%s' from combined call; defaulting to belirsiz.", category_str)
+        category = DocumentCategory.BELIRSIZ
+
+    if combined.is_financial_document:
+        doc_count = max(1, combined.document_count or 1)
+    else:
+        doc_count = max(0, combined.document_count or 0)
+
+    analysis = DocumentAnalysis(
+        is_financial_document=combined.is_financial_document,
+        category=category,
+        is_return=combined.is_return,
+        document_count=doc_count,
+        quality=combined.quality,
+        needs_retry=combined.needs_retry or combined.quality == "unusable",
+        confidence=combined.confidence,
+        reason=combined.reason,
+    )
+
+    logger.info(
+        "Combined result: financial=%s category=%s is_return=%s count=%d quality=%s confidence=%.2f",
+        analysis.is_financial_document,
+        analysis.category.value,
+        analysis.is_return,
+        analysis.document_count,
+        analysis.quality,
+        analysis.confidence,
+    )
+
+    # --- Build BillRecords ---
+    raw_docs = combined.documents or []
+    records: list[BillRecord] = []
+    for idx, doc in enumerate(raw_docs):
+        record = _normalize_record(doc.model_dump())
+        if len(raw_docs) > 1 and source_message_id:
+            record.source_message_id = f"{source_message_id}__doc{idx + 1}"
+        else:
+            record.source_message_id = source_message_id
+        record.source_filename = source_filename
+        record.source_type = source_type
+        record.source_sender_id = source_sender_id
+        record.source_sender_name = source_sender_name
+        record.source_group_id = source_group_id
+        record.source_chat_type = source_chat_type
+        records.append(record)
+
+    # --- Cheque lehdar refinement (second pass on Flash Lite) ---
+    if category == DocumentCategory.CEK and records:
+        ocr_hint = _build_ocr_hint(image_bytes=image_bytes, mime_type=mime_type, category_hint=category)
+        refinement_model = settings.gemini_lehdar_refinement_model or model_name
+        _refine_missing_cheque_lehdars(
+            records=records,
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+            model_name=refinement_model,
+            ocr_hint=ocr_hint,
+        )
+
+    logger.info(
+        "Combined extraction complete: %d document(s). [%s]",
+        len(records),
+        ", ".join(f"{r.company_name or '?'}={r.total_amount}" for r in records),
+    )
+    return analysis, records
 
 
 def _build_ocr_hint(

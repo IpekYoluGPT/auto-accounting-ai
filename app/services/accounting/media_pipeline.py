@@ -32,27 +32,25 @@ def process_media_payload(*, intake_module, payload: MediaPayload) -> MediaProce
         )
 
     try:
-        analysis = intake_module.doc_classifier.analyze_document(working_bytes, mime_type=working_mime_type)
+        analysis, initial_records = intake_module.gemini_extractor.analyze_and_extract(
+            working_bytes,
+            working_mime_type,
+            source_message_id=payload.message_id,
+            source_filename=payload.filename,
+            source_type=payload.source_type,
+            source_sender_id=payload.route.sender_id,
+            source_sender_name=payload.route.sender_name,
+            source_group_id=payload.route.group_id,
+            source_chat_type=payload.route.chat_type,
+        )
     except Exception as exc:
-        intake_module.logger.warning("Failed to analyze media for message id=%s: %s", payload.message_id, exc)
+        intake_module.logger.warning("Failed to analyze/extract media for message id=%s: %s", payload.message_id, exc)
         return MediaProcessingResult(
             outcome="classification_failed",
             retryable=is_temporary_media_exception(exc),
             user_message=message_for_media_exception(exc, MSG_MEDIA_CLASSIFICATION_ERROR),
             stage="classification",
         )
-
-    intake_module.logger.info(
-        "Document analysis: financial=%s category=%s is_return=%s count=%d quality=%s retry=%s confidence=%.2f reason=%s",
-        analysis.is_financial_document,
-        analysis.category.value,
-        analysis.is_return,
-        analysis.document_count,
-        analysis.quality,
-        analysis.needs_retry,
-        analysis.confidence,
-        (analysis.reason or "")[:120],
-    )
 
     if not analysis.is_financial_document:
         return MediaProcessingResult(
@@ -72,7 +70,9 @@ def process_media_payload(*, intake_module, payload: MediaPayload) -> MediaProce
     is_return = analysis.is_return
     expected_document_count = analysis.document_count if analysis.document_count > 1 else None
 
-    def _extract_valid_records(*, split_retry: bool) -> list[BillRecord]:
+    valid_records = [r for r in initial_records if record_meets_minimum_fields(r, category)]
+
+    def _extract_valid_records_retry(*, split_retry: bool) -> list[BillRecord]:
         extracted_records = intake_module.gemini_extractor.extract_bills(
             image_bytes=working_bytes,
             mime_type=working_mime_type,
@@ -91,17 +91,6 @@ def process_media_payload(*, intake_module, payload: MediaPayload) -> MediaProce
         )
         return [record for record in extracted_records if record_meets_minimum_fields(record, category)]
 
-    try:
-        valid_records = _extract_valid_records(split_retry=False)
-    except Exception as exc:
-        intake_module.logger.warning("Failed to extract bills for message id=%s: %s", payload.message_id, exc)
-        return MediaProcessingResult(
-            outcome="extraction_failed",
-            retryable=is_temporary_media_exception(exc),
-            user_message=message_for_media_exception(exc, MSG_MEDIA_EXTRACTION_ERROR),
-            stage="extraction",
-        )
-
     if expected_document_count and len(valid_records) != expected_document_count:
         intake_module.logger.warning(
             "Multi-document extraction count mismatch for message id=%s: expected=%d got=%d; retrying with strict split prompt.",
@@ -110,7 +99,7 @@ def process_media_payload(*, intake_module, payload: MediaPayload) -> MediaProce
             len(valid_records),
         )
         try:
-            retry_records = _extract_valid_records(split_retry=True)
+            retry_records = _extract_valid_records_retry(split_retry=True)
         except Exception as exc:
             intake_module.logger.warning("Failed strict multi-document extraction for message id=%s: %s", payload.message_id, exc)
             return MediaProcessingResult(
