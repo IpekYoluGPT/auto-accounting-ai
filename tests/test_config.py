@@ -9,7 +9,7 @@ def test_gemini_model_defaults(monkeypatch):
     monkeypatch.delenv("STORAGE_DIR", raising=False)
     monkeypatch.delenv("RAILWAY_VOLUME_MOUNT_PATH", raising=False)
     settings = Settings(_env_file=None)
-    assert settings.gemini_classifier_model == "gemini-3.1-pro-preview"
+    assert settings.gemini_classifier_model == "gemini-3.1-flash-lite-preview"
     assert settings.gemini_extractor_model == "gemini-3.1-pro-preview"
     assert settings.gemini_validation_model == "gemini-3.1-pro-preview"
     assert settings.whatsapp_groups_only is True
@@ -27,7 +27,7 @@ def test_gemini_model_defaults(monkeypatch):
     assert settings.inbound_retry_max_age_hours == 24
     assert settings.inbound_worker_poll_seconds == 5
     assert settings.inbound_max_active_jobs == 2
-    assert settings.gemini_max_concurrency == 1
+    assert settings.gemini_max_concurrency == 2
     assert settings.storage_soft_pressure_bytes == 3221225472
     assert settings.storage_hard_reject_bytes == 4026531840
     assert settings.storage_emergency_stop_bytes == 4563402752
