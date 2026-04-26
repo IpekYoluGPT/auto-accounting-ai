@@ -26,9 +26,12 @@ SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
 
 @lru_cache(maxsize=4)
-def _build_client(api_key: str) -> genai.Client:
+def _build_client(api_key: str, timeout_ms: int) -> genai.Client:
     """Create and memoize Gemini clients by API key."""
-    return genai.Client(api_key=api_key)
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=max(int(timeout_ms), 1000)),
+    )
 
 
 
@@ -36,7 +39,7 @@ def get_client() -> genai.Client:
     """Return a configured Gemini API client."""
     if not settings.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured.")
-    return _build_client(settings.gemini_api_key)
+    return _build_client(settings.gemini_api_key, int(settings.gemini_request_timeout_ms))
 
 
 

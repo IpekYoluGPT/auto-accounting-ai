@@ -20,6 +20,13 @@ from app.services.accounting.intake_types import MediaPayload, MediaProcessingRe
 
 def process_media_payload(*, intake_module, payload: MediaPayload) -> MediaProcessingResult:
     media_sha256 = hashlib.sha256(payload.raw_bytes).hexdigest()
+    if intake_module.record_store.is_media_processed(media_sha256):
+        intake_module.logger.info(
+            "Skipping duplicate media for message id=%s via sha256=%s",
+            payload.message_id,
+            media_sha256,
+        )
+        return MediaProcessingResult(outcome="already_exported", stage="media_dedupe")
 
     prepared = intake_module.media_prep.prepare_media(payload.raw_bytes, mime_type=payload.mime_type)
     working_bytes = prepared.media_bytes
@@ -177,6 +184,9 @@ def process_media_payload(*, intake_module, payload: MediaPayload) -> MediaProce
         raise
 
     persisted_count = len(persisted_records)
+    if valid_records:
+        intake_module.record_store.mark_media_processed(media_sha256)
+
     if persisted_count == 0:
         return MediaProcessingResult(outcome="already_exported", stage="persistence")
 

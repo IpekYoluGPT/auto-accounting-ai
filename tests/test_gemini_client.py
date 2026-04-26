@@ -94,3 +94,28 @@ def test_generate_structured_content_uses_configured_fallback_model(monkeypatch)
 
     assert result == SampleSchema(value="gemini-3.1-pro-preview")
     assert calls == ["gemini-primary", "gemini-3.1-pro-preview"]
+
+
+def test_get_client_configures_request_timeout(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeHttpOptions:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            captured["http_options"] = self
+
+    def fake_client(**kwargs):
+        captured["client_kwargs"] = kwargs
+        return object()
+
+    gemini_client._build_client.cache_clear()
+    monkeypatch.setattr(gemini_client.settings, "gemini_api_key", "fake-key")
+    monkeypatch.setattr(gemini_client.settings, "gemini_request_timeout_ms", 45000)
+    monkeypatch.setattr(gemini_client.types, "HttpOptions", FakeHttpOptions)
+    monkeypatch.setattr(gemini_client.genai, "Client", fake_client)
+
+    gemini_client.get_client()
+
+    assert captured["http_options"].kwargs == {"timeout": 45000}
+    assert captured["client_kwargs"]["api_key"] == "fake-key"
+    assert captured["client_kwargs"]["http_options"] is captured["http_options"]

@@ -68,6 +68,10 @@ def _content_fingerprint_registry_path() -> Path:
     return _state_dir() / "content_fingerprints.txt"
 
 
+def _processed_media_registry_path() -> Path:
+    return _state_dir() / "processed_media_sha256.txt"
+
+
 def _lock_path() -> Path:
     return _state_dir() / ".record_store.lock"
 
@@ -173,6 +177,18 @@ def _load_content_fingerprints_unlocked() -> set[str]:
     }
 
 
+def _load_processed_media_unlocked() -> set[str]:
+    filepath = _processed_media_registry_path()
+    if not filepath.exists():
+        return set()
+
+    return {
+        line.strip()
+        for line in filepath.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+
+
 def _append_content_fingerprints_unlocked(fingerprints: set[str]) -> None:
     if not fingerprints:
         return
@@ -180,6 +196,14 @@ def _append_content_fingerprints_unlocked(fingerprints: set[str]) -> None:
     with _content_fingerprint_registry_path().open("a", encoding="utf-8") as handle:
         for fingerprint in sorted(fingerprints):
             handle.write(f"{fingerprint}\n")
+
+
+def _append_processed_media_unlocked(media_sha256: str) -> None:
+    if not media_sha256:
+        return
+
+    with _processed_media_registry_path().open("a", encoding="utf-8") as handle:
+        handle.write(f"{media_sha256}\n")
 
 
 def _write_warning_state_unlocked(warning_state: dict[str, str]) -> None:
@@ -376,6 +400,35 @@ def is_message_processed(message_id: str | None) -> bool:
     with _PERSIST_LOCK:
         with _interprocess_lock():
             return message_id in _load_processed_ids_unlocked()
+
+
+def is_media_processed(media_sha256: str | None, *, context: PipelineContext | None = None) -> bool:
+    """Return whether an exact media payload has already completed processing."""
+    with pipeline_context_scope(context):
+        normalized = str(media_sha256 or "").strip()
+        if not normalized:
+            return False
+
+        with _PERSIST_LOCK:
+            with _interprocess_lock():
+                if normalized in _load_processed_media_unlocked():
+                    return True
+                return f"media:{normalized}" in _load_content_fingerprints_unlocked()
+
+
+def mark_media_processed(media_sha256: str | None, *, context: PipelineContext | None = None) -> None:
+    """Mark an exact media payload as processed so resends can skip Gemini."""
+    with pipeline_context_scope(context):
+        normalized = str(media_sha256 or "").strip()
+        if not normalized:
+            return
+
+        with _PERSIST_LOCK:
+            with _interprocess_lock():
+                processed_media = _load_processed_media_unlocked()
+                if normalized in processed_media:
+                    return
+                _append_processed_media_unlocked(normalized)
 
 
 def claim_message_processing(message_id: str | None, *, context: PipelineContext | None = None) -> bool:

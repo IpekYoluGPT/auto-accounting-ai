@@ -32,6 +32,7 @@ The checked-in `.env.example` covers the core runtime knobs, but it does not cur
 | `GEMINI_CLASSIFIER_MODEL` | No | Defaults to `gemini-3.1-pro-preview`. |
 | `GEMINI_EXTRACTOR_MODEL` | No | Defaults to `gemini-3.1-pro-preview`. |
 | `GEMINI_VALIDATION_MODEL` | No | Shared Gemini config; monitored at startup even though it is not the main media hot path today. |
+| `GEMINI_REQUEST_TIMEOUT_MS` | No | Defaults to `90000`; bounds each Gemini HTTP request so queued media can retry instead of staying in processing indefinitely. |
 | `BUSINESS_TIMEZONE` | No | Used for monthly workbook rollover. Defaults to `Europe/Istanbul`. |
 | `STORAGE_DIR` | Yes in production | Must point to persistent storage. Queue state, CSV exports, canonical SQLite state, and delayed Drive uploads all live here. |
 | `LOG_LEVEL` | No | Defaults to `INFO`. |

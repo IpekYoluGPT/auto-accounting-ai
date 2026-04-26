@@ -131,11 +131,13 @@ def test_process_pending_inbound_jobs_retryable_failure_sends_delay_once():
         assert inbound_queue.queue_status()["retry_waiting_inbound_jobs"] == 1
         assert send_mock.call_count == 1
         assert send_mock.call_args.args[1] == inbound_queue.MSG_DELAY_NOTICE
-        reaction_mock.assert_not_called()
+        assert reaction_mock.call_count == 1
+        assert reaction_mock.call_args.args == ("120363410789660631@g.us", "wamid-1", "📝")
 
         inbound_queue.retry_pending_inbound_jobs()
         assert inbound_queue.process_pending_inbound_jobs(max_jobs=1) == 1
         assert send_mock.call_count == 1
+        assert reaction_mock.call_count == 1
 
 
 def test_process_pending_inbound_jobs_retry_exhaustion_marks_failure_and_cleans_payload():

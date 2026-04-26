@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     gemini_extractor_model: str = DEFAULT_GEMINI_MODEL
     gemini_validation_model: str = DEFAULT_GEMINI_MODEL
     gemini_lehdar_refinement_model: str = "gemini-3.1-flash-lite-preview"
+    gemini_request_timeout_ms: int = 90000
 
     # Google Sheets
     # Base64-encoded service account JSON (from Google Cloud Console)

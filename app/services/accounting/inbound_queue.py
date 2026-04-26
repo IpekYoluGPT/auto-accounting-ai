@@ -524,6 +524,12 @@ def _schedule_retry_or_fail(job: dict, *, route: intake.MessageRoute, error: str
         return
 
     if not bool(job.get("delay_notice_sent")):
+        intake._safe_send_reaction(
+            route,
+            intake.REACTION_SHEET_PENDING,
+            reason="queue delay reaction",
+            send_reaction=_resolve_send_reaction,
+        )
         intake._safe_send_text_message(route, MSG_DELAY_NOTICE, reason="queue delay notice", send_text=_resolve_send_text)
         _mark_delay_notice_sent(job)
 
