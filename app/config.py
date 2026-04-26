@@ -13,6 +13,7 @@ def _default_storage_dir() -> str:
 
 
 DEFAULT_GEMINI_MODEL = "gemini-3.1-pro-preview"
+DEFAULT_GEMINI_CLASSIFIER_MODEL = "gemini-3.1-flash-lite-preview"
 
 
 class Settings(BaseSettings):
@@ -44,7 +45,7 @@ class Settings(BaseSettings):
 
     # Gemini
     gemini_api_key: str = ""
-    gemini_classifier_model: str = DEFAULT_GEMINI_MODEL
+    gemini_classifier_model: str = DEFAULT_GEMINI_CLASSIFIER_MODEL
     gemini_extractor_model: str = DEFAULT_GEMINI_MODEL
     gemini_validation_model: str = DEFAULT_GEMINI_MODEL
     gemini_lehdar_refinement_model: str = "gemini-3.1-flash-lite-preview"
@@ -103,7 +104,7 @@ class Settings(BaseSettings):
     inbound_retry_max_age_hours: int = 24
     inbound_worker_poll_seconds: int = 5
     inbound_max_active_jobs: int = 2
-    gemini_max_concurrency: int = 1
+    gemini_max_concurrency: int = 2
     storage_soft_pressure_bytes: int = 3221225472
     storage_hard_reject_bytes: int = 4026531840
     storage_emergency_stop_bytes: int = 4563402752
