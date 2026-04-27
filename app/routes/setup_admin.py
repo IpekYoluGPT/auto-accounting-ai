@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel
 
 from app.config import settings
-from app.services.accounting import inbound_queue
+from app.services.accounting import inbound_queue, record_store
 from app.services.providers import google_sheets, google_sheets_scheduler
 from app.utils.logging import get_logger
 
@@ -35,6 +35,16 @@ class HideHiddenTabsRequest(BaseModel):
 
 class DrainQueuesRequest(BaseModel):
     max_rounds: int = 10
+
+
+class UpdateSheetRegistryRequest(BaseModel):
+    month: str
+    spreadsheet_id: str
+
+
+class ReprocessMessageRequest(BaseModel):
+    message_id: str
+    media_sha256: str | None = None
 
 
 def _verify_admin_token(request: Request) -> None:
@@ -261,4 +271,51 @@ async def storage_status(request: Request) -> dict[str, object]:
         }
     except Exception as exc:
         logger.error("Storage status failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/update-sheet-registry")
+async def update_sheet_registry(request: Request, payload: UpdateSheetRegistryRequest) -> dict[str, object]:
+    """Update the sheets registry so a month points to the correct spreadsheet ID."""
+    _verify_admin_token(request)
+
+    month = payload.month.strip()
+    spreadsheet_id = payload.spreadsheet_id.strip()
+
+    import re as _re
+    if not _re.match(r"^\d{4}-\d{2}$", month):
+        raise HTTPException(status_code=400, detail="month must be in YYYY-MM format (e.g. '2026-04')")
+    if not spreadsheet_id:
+        raise HTTPException(status_code=400, detail="spreadsheet_id must not be empty")
+
+    try:
+        google_sheets.update_registry_entry(month, spreadsheet_id)
+        return {
+            "status": "ok",
+            "month": month,
+            "spreadsheet_id": spreadsheet_id,
+            "sheet_url": _sandbox_sheet_url(spreadsheet_id),
+        }
+    except Exception as exc:
+        logger.error("Registry update failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/reprocess-message")
+async def reprocess_message(request: Request, payload: ReprocessMessageRequest) -> dict[str, object]:
+    """Clear dedup entries for a message ID so the customer can resend and have it reprocessed."""
+    _verify_admin_token(request)
+
+    message_id = payload.message_id.strip()
+    if not message_id:
+        raise HTTPException(status_code=400, detail="message_id must not be empty")
+
+    try:
+        result = record_store.clear_message_dedup(
+            message_id,
+            media_sha256=payload.media_sha256,
+        )
+        return {"status": "ok", **result}
+    except Exception as exc:
+        logger.error("Reprocess message failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
