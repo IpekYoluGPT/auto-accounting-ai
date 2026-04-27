@@ -493,6 +493,60 @@ def release_message_processing(message_id: str | None, *, context: PipelineConte
                     logger.info("Released in-flight claim for message id=%s", message_id)
 
 
+def clear_message_dedup(
+    message_id: str,
+    *,
+    media_sha256: str | None = None,
+    context: PipelineContext | None = None,
+) -> dict[str, object]:
+    """Remove all dedup entries for a message so it can be reprocessed.
+
+    Clears the processed-ID registry, the in-flight registry, and optionally
+    the media-SHA registry if media_sha256 is supplied.
+    """
+    with pipeline_context_scope(context):
+        result: dict[str, object] = {
+            "message_id": message_id,
+            "message_id_cleared": False,
+            "inflight_cleared": False,
+            "media_sha256_cleared": False,
+        }
+
+        with _PERSIST_LOCK:
+            with _interprocess_lock():
+                # Remove from processed IDs (rewrite file without this ID)
+                processed_ids = _load_processed_ids_unlocked()
+                if message_id in processed_ids:
+                    new_ids = processed_ids - {message_id}
+                    lines = "".join(f"{mid}\n" for mid in sorted(new_ids))
+                    _registry_path().write_text(lines, encoding="utf-8")
+                    result["message_id_cleared"] = True
+                    logger.info("Cleared message id=%s from processed registry", message_id)
+
+                # Remove from in-flight
+                inflight = _load_inflight_unlocked()
+                if message_id in inflight:
+                    inflight.pop(message_id)
+                    _write_inflight_unlocked(inflight)
+                    result["inflight_cleared"] = True
+
+                # Optionally remove media SHA
+                if media_sha256:
+                    normalized = str(media_sha256).strip()
+                    processed_media = _load_processed_media_unlocked()
+                    if normalized in processed_media:
+                        new_media = processed_media - {normalized}
+                        lines = "".join(f"{sha}\n" for sha in sorted(new_media))
+                        _processed_media_registry_path().write_text(lines, encoding="utf-8")
+                        result["media_sha256_cleared"] = True
+                        logger.info(
+                            "Cleared media sha256=%s... from processed registry",
+                            normalized[:16],
+                        )
+
+        return result
+
+
 def should_send_warning(
     recipient: str | None,
     warning_key: str,

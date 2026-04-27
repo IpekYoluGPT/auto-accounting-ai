@@ -1248,6 +1248,20 @@ def _save_registry(registry: dict[str, str]) -> None:
     )
 
 
+def update_registry_entry(month_key: str, spreadsheet_id: str) -> None:
+    """Point a specific month's registry entry at the given spreadsheet ID."""
+    registry = _load_registry()
+    previous = registry.get(month_key)
+    registry[month_key] = spreadsheet_id
+    _save_registry(registry)
+    logger.info(
+        "Registry updated: %s → %s (was: %s)",
+        month_key,
+        spreadsheet_id,
+        previous or "(none)",
+    )
+
+
 def _month_key() -> str:
     return _now().strftime("%Y-%m")
 

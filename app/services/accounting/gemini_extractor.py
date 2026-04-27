@@ -5,6 +5,7 @@ Gemini-backed extraction with category-aware prompts.
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -262,6 +263,123 @@ class _ChequeLehdarRefinement(BaseModel):
     lehdars: list[_ChequeLehdarEntry]
 
     model_config = {"extra": "ignore"}
+
+
+_DATE_REFINEMENT_SYSTEM_INSTRUCTION = """Bu Türkçe belgelerdeki tarihleri yeniden oku.
+
+Kurallar:
+- Her belge için yalnızca belgede açıkça görünen tarihi çıkar.
+- Tarihi YYYY-MM-DD formatında döndür (örnek: 2026-04-22).
+- Tarih görünmüyorsa null döndür.
+- Tarih tahmin etme veya uydurma; yalnızca belgede yazılı olanı oku.
+- El yazısı, eğik veya buruşuk belgeler yaygındır — yine de tarihi oku.
+- Belgeler sırasıyla soldan sağa, yukarıdan aşağıya sıralıdır.
+"""
+
+
+class _DateEntry(BaseModel):
+    document_date: str | None = None
+
+    model_config = {"extra": "ignore"}
+
+
+class _DateRefinement(BaseModel):
+    dates: list[_DateEntry]
+
+    model_config = {"extra": "ignore"}
+
+
+def _is_suspicious_date(date_str: str | None, valid_years: set[int]) -> bool:
+    if not date_str:
+        return False
+    s = str(date_str).strip()
+    for segment in (s[:4], s[-4:]):
+        try:
+            year = int(segment)
+            if 1900 < year < 3000:
+                return year not in valid_years
+        except ValueError:
+            continue
+    return False
+
+
+def _refine_suspicious_dates(
+    *,
+    records: list[BillRecord],
+    image_bytes: bytes,
+    mime_type: str,
+    model_name: str,
+) -> None:
+    if not records:
+        return
+
+    current_year = date.today().year
+    valid_years = {current_year - 1, current_year, current_year + 1}
+
+    suspicious_indexes = [
+        idx for idx, r in enumerate(records)
+        if _is_suspicious_date(r.document_date, valid_years)
+    ]
+    if not suspicious_indexes:
+        return
+
+    today_str = date.today().strftime("%d.%m.%Y")
+    suspicious_list = ", ".join(str(i + 1) for i in suspicious_indexes)
+    doc_count = len(records)
+
+    prompt = (
+        f"Bu görüntüde {doc_count} belge var. "
+        f"Bugünün tarihi: {today_str}. Belgeler {current_year - 1}–{current_year + 1} dönemine aittir.\n\n"
+        f"Şüpheli tarih içeren belge sıra numaraları (1 bazlı): {suspicious_list}.\n\n"
+        f"Tüm {doc_count} belge için sırasıyla tarihleri döndür (soldan sağa, yukarıdan aşağıya). "
+        "Her belge için YYYY-MM-DD formatında tarihi yaz; yoksa null bırak."
+    )
+
+    try:
+        result = gemini_client.generate_structured_content(
+            model=model_name,
+            prompt=prompt,
+            system_instruction=_DATE_REFINEMENT_SYSTEM_INSTRUCTION,
+            response_schema=_DateRefinement,
+            thinking_level="low",
+            media_bytes=image_bytes,
+            mime_type=mime_type,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Date refinement call failed for %d record(s); leaving document_date as-is: %s",
+            len(suspicious_indexes),
+            exc,
+        )
+        return
+
+    dates_attr = getattr(result, "dates", None)
+    if dates_attr is None:
+        logger.warning("Date refinement returned unexpected payload; skipping merge.")
+        return
+
+    refined = list(dates_attr)
+    filled = 0
+    for idx in suspicious_indexes:
+        if idx >= len(refined):
+            break
+        candidate_raw = (refined[idx].document_date or "").strip()
+        if not candidate_raw:
+            continue
+        candidate = ocr.normalize_date(candidate_raw) or candidate_raw
+        if not _is_suspicious_date(candidate, valid_years):
+            records[idx].document_date = candidate
+            filled += 1
+        else:
+            logger.warning(
+                "Date refinement still returned suspicious date '%s' for record %d; keeping original '%s'.",
+                candidate,
+                idx + 1,
+                records[idx].document_date,
+            )
+
+    if filled:
+        logger.info("Date refinement corrected %d/%d suspicious date(s).", filled, len(suspicious_indexes))
 
 
 def _parse_tr_number(value: str) -> Optional[float]:
@@ -546,8 +664,8 @@ def extract_bills(
         record.source_chat_type = source_chat_type
         records.append(record)
 
+    refinement_model = settings.gemini_lehdar_refinement_model or model_name
     if category_hint == DocumentCategory.CEK:
-        refinement_model = settings.gemini_lehdar_refinement_model or model_name
         _refine_missing_cheque_lehdars(
             records=records,
             image_bytes=image_bytes,
@@ -555,6 +673,13 @@ def extract_bills(
             model_name=refinement_model,
             ocr_hint=ocr_hint,
         )
+
+    _refine_suspicious_dates(
+        records=records,
+        image_bytes=image_bytes,
+        mime_type=mime_type,
+        model_name=refinement_model,
+    )
 
     logger.info(
         "Extraction complete: %d document(s) found. [%s]",
@@ -595,9 +720,15 @@ def analyze_and_extract(
         model_name,
     )
 
+    _today = date.today()
+    _dated_combined_prompt = (
+        f"Bugünün tarihi: {_today.strftime('%d.%m.%Y')}. "
+        f"Belgeler genellikle {_today.year - 1}–{_today.year + 1} yılları arasındadır.\n\n"
+        + _COMBINED_PROMPT
+    )
     combined = gemini_client.generate_structured_content(
         model=model_name,
-        prompt=_COMBINED_PROMPT,
+        prompt=_dated_combined_prompt,
         system_instruction=_COMBINED_SYSTEM_INSTRUCTION,
         response_schema=_CombinedDocumentResult,
         thinking_level="low",
@@ -656,17 +787,24 @@ def analyze_and_extract(
         record.source_chat_type = source_chat_type
         records.append(record)
 
-    # --- Cheque lehdar refinement (second pass on Flash Lite) ---
+    # --- Second-pass refinements (Flash Lite) ---
+    _refinement_model = settings.gemini_lehdar_refinement_model or model_name
     if category == DocumentCategory.CEK and records:
-        ocr_hint = _build_ocr_hint(image_bytes=image_bytes, mime_type=mime_type, category_hint=category)
-        refinement_model = settings.gemini_lehdar_refinement_model or model_name
+        _ocr_hint = _build_ocr_hint(image_bytes=image_bytes, mime_type=mime_type, category_hint=category)
         _refine_missing_cheque_lehdars(
             records=records,
             image_bytes=image_bytes,
             mime_type=mime_type,
-            model_name=refinement_model,
-            ocr_hint=ocr_hint,
+            model_name=_refinement_model,
+            ocr_hint=_ocr_hint,
         )
+
+    _refine_suspicious_dates(
+        records=records,
+        image_bytes=image_bytes,
+        mime_type=mime_type,
+        model_name=_refinement_model,
+    )
 
     logger.info(
         "Combined extraction complete: %d document(s). [%s]",
@@ -866,8 +1004,10 @@ def _build_extraction_prompt(
                 "CEK icin: her fiziksel cek yapragini ayri belge say. Banka, vergi numarasi veya duzenleyen sirket ayni olsa bile cekleri BIRLESTIRME. Vade tarihi, seri numarasi, lehdar, el yazisi ve konuma gore ayir."
             )
 
+    today = date.today()
     prompt_parts = [
         _EXTRACTION_PROMPT,
+        f"Bugünün tarihi: {today.strftime('%d.%m.%Y')}. Belgeler genellikle {today.year - 1}–{today.year + 1} yılları arasındadır.",
         f"Belge ailesi ipucu: {category.value}",
         return_text,
         count_text,
