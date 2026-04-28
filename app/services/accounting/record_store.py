@@ -553,52 +553,33 @@ def patch_record_date(
     *,
     context: PipelineContext | None = None,
 ) -> dict[str, object]:
-    """Update document_date in all CSV rows matching message_id.
+    """Update document_date in SQLite canonical store for all docs matching message_id.
 
-    Scans every daily CSV file. Rewrites any file that contains a matching row.
-    This is the source-of-truth fix so the sheet projection stops overwriting
-    manually-corrected dates.
+    This patches the source-of-truth so the 30-second projection worker stops
+    overwriting manually-corrected sheet dates.
     """
+    from app.services.accounting import canonical_store
+
     with pipeline_context_scope(context):
-        message_column = COLUMN_MAP["source_message_id"]
-        date_column = COLUMN_MAP["document_date"]
-
-        files_patched: list[str] = []
-        rows_patched = 0
-
-        with _PERSIST_LOCK:
-            with _interprocess_lock():
-                export_files = sorted(_exports_dir().glob("records_*.csv"))
-                for filepath in export_files:
-                    with filepath.open("r", encoding="utf-8-sig", newline="") as handle:
-                        rows = list(csv.DictReader(handle))
-
-                    changed = False
-                    for row in rows:
-                        if row.get(message_column) == message_id:
-                            row[date_column] = new_date
-                            changed = True
-                            rows_patched += 1
-
-                    if changed:
-                        fieldnames = list(rows[0].keys()) if rows else []
-                        with filepath.open("w", encoding="utf-8-sig", newline="") as handle:
-                            writer = csv.DictWriter(handle, fieldnames=fieldnames)
-                            writer.writeheader()
-                            writer.writerows(rows)
-                        files_patched.append(filepath.name)
-                        logger.info(
-                            "Patched date to '%s' in %s for message_id=%s",
-                            new_date,
-                            filepath.name,
-                            message_id,
-                        )
-
+        result = canonical_store.patch_document_date_by_message_id(message_id, new_date)
+        if result["docs_patched"]:
+            logger.info(
+                "Patched date to '%s' in SQLite for message_id=%s (%d docs)",
+                new_date,
+                message_id,
+                result["docs_patched"],
+            )
+        else:
+            logger.warning(
+                "No SQLite document found for message_id=%s when patching date",
+                message_id,
+            )
         return {
             "message_id": message_id,
             "new_date": new_date,
-            "rows_patched": rows_patched,
-            "files_patched": files_patched,
+            "docs_patched": result["docs_patched"],
+            "docs_found": result["docs_found"],
+            "doc_ids": result["doc_ids"],
         }
 
 
