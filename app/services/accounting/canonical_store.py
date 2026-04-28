@@ -580,9 +580,14 @@ def patch_document_date_by_message_id(source_message_id: str, new_date: str) -> 
     with _LOCK:
         conn = _connect()
         try:
+            # Primary lookup: by source_message_id (correct for multi-doc splits).
+            # Fallback: by source_doc_id directly, for records stored before
+            # source_message_id was reliably populated (single-doc messages only).
             rows = conn.execute(
-                "SELECT source_doc_id, record_json FROM documents WHERE source_message_id = ?",
-                (normalized_msg_id,),
+                """SELECT source_doc_id, record_json FROM documents
+                   WHERE source_message_id = ?
+                      OR (source_message_id = '' AND source_doc_id = ?)""",
+                (normalized_msg_id, normalized_msg_id),
             ).fetchall()
 
             if not rows:
