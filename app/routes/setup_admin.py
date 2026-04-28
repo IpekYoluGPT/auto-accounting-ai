@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel
 
 from app.config import settings
-from app.services.accounting import inbound_queue, record_store
+from app.services.accounting import canonical_store, inbound_queue, record_store
 from app.services.providers import google_sheets, google_sheets_scheduler
 from app.utils.logging import get_logger
 
@@ -303,6 +303,54 @@ async def update_sheet_registry(request: Request, payload: UpdateSheetRegistryRe
         }
     except Exception as exc:
         logger.error("Registry update failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/lookup-record")
+async def lookup_record(request: Request, q: str) -> dict[str, object]:
+    """Diagnostic: search SQLite documents table by source_doc_id or source_message_id substring."""
+    _verify_admin_token(request)
+
+    import sqlite3 as _sqlite3
+    from app.services.accounting.canonical_store import _connect, _LOCK
+
+    needle = q.strip()
+    if not needle:
+        raise HTTPException(status_code=400, detail="q must not be empty")
+
+    try:
+        with _LOCK:
+            conn = _connect()
+            try:
+                rows = conn.execute(
+                    """SELECT source_doc_id, source_message_id, category,
+                              json_extract(record_json, '$.document_date') AS document_date
+                       FROM documents
+                       WHERE source_doc_id LIKE ?
+                          OR source_message_id LIKE ?
+                       LIMIT 20""",
+                    (f"%{needle}%", f"%{needle}%"),
+                ).fetchall()
+                total = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+            finally:
+                conn.close()
+
+        return {
+            "status": "ok",
+            "query": needle,
+            "total_documents_in_db": total,
+            "matches": [
+                {
+                    "source_doc_id": str(r["source_doc_id"]),
+                    "source_message_id": str(r["source_message_id"]),
+                    "category": str(r["category"]),
+                    "document_date": r["document_date"],
+                }
+                for r in rows
+            ],
+        }
+    except Exception as exc:
+        logger.error("Lookup record failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
