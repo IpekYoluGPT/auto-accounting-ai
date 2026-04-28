@@ -547,6 +547,61 @@ def clear_message_dedup(
         return result
 
 
+def patch_record_date(
+    message_id: str,
+    new_date: str,
+    *,
+    context: PipelineContext | None = None,
+) -> dict[str, object]:
+    """Update document_date in all CSV rows matching message_id.
+
+    Scans every daily CSV file. Rewrites any file that contains a matching row.
+    This is the source-of-truth fix so the sheet projection stops overwriting
+    manually-corrected dates.
+    """
+    with pipeline_context_scope(context):
+        message_column = COLUMN_MAP["source_message_id"]
+        date_column = COLUMN_MAP["document_date"]
+
+        files_patched: list[str] = []
+        rows_patched = 0
+
+        with _PERSIST_LOCK:
+            with _interprocess_lock():
+                export_files = sorted(_exports_dir().glob("records_*.csv"))
+                for filepath in export_files:
+                    with filepath.open("r", encoding="utf-8-sig", newline="") as handle:
+                        rows = list(csv.DictReader(handle))
+
+                    changed = False
+                    for row in rows:
+                        if row.get(message_column) == message_id:
+                            row[date_column] = new_date
+                            changed = True
+                            rows_patched += 1
+
+                    if changed:
+                        fieldnames = list(rows[0].keys()) if rows else []
+                        with filepath.open("w", encoding="utf-8-sig", newline="") as handle:
+                            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                            writer.writeheader()
+                            writer.writerows(rows)
+                        files_patched.append(filepath.name)
+                        logger.info(
+                            "Patched date to '%s' in %s for message_id=%s",
+                            new_date,
+                            filepath.name,
+                            message_id,
+                        )
+
+        return {
+            "message_id": message_id,
+            "new_date": new_date,
+            "rows_patched": rows_patched,
+            "files_patched": files_patched,
+        }
+
+
 def should_send_warning(
     recipient: str | None,
     warning_key: str,
