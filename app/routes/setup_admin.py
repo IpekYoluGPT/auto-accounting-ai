@@ -47,6 +47,11 @@ class ReprocessMessageRequest(BaseModel):
     media_sha256: str | None = None
 
 
+class PatchRecordDateRequest(BaseModel):
+    message_id: str
+    new_date: str
+
+
 def _verify_admin_token(request: Request) -> None:
     expected = settings.periskope_tool_token.strip()
     if not expected:
@@ -298,6 +303,32 @@ async def update_sheet_registry(request: Request, payload: UpdateSheetRegistryRe
         }
     except Exception as exc:
         logger.error("Registry update failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/patch-record-date")
+async def patch_record_date(request: Request, payload: PatchRecordDateRequest) -> dict[str, object]:
+    """Update document_date in the CSV source-of-truth for a specific message ID.
+
+    Use this when the sheet keeps reverting a manually-corrected date because
+    the periodic projection sync reads from the CSV which still has the wrong date.
+    """
+    _verify_admin_token(request)
+
+    import re as _re
+    message_id = payload.message_id.strip()
+    new_date = payload.new_date.strip()
+
+    if not message_id:
+        raise HTTPException(status_code=400, detail="message_id must not be empty")
+    if not _re.match(r"^\d{4}-\d{2}-\d{2}$", new_date):
+        raise HTTPException(status_code=400, detail="new_date must be in YYYY-MM-DD format (e.g. '2026-04-22')")
+
+    try:
+        result = record_store.patch_record_date(message_id, new_date)
+        return {"status": "ok", **result}
+    except Exception as exc:
+        logger.error("Patch record date failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
