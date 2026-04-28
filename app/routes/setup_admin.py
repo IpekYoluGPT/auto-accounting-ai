@@ -308,10 +308,10 @@ async def update_sheet_registry(request: Request, payload: UpdateSheetRegistryRe
 
 @router.post("/patch-record-date")
 async def patch_record_date(request: Request, payload: PatchRecordDateRequest) -> dict[str, object]:
-    """Update document_date in the CSV source-of-truth for a specific message ID.
+    """Update document_date in the SQLite canonical store for a specific message ID.
 
     Use this when the sheet keeps reverting a manually-corrected date because
-    the periodic projection sync reads from the CSV which still has the wrong date.
+    the projection worker reads from SQLite every 30 seconds.
     """
     _verify_admin_token(request)
 

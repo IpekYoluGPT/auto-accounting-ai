@@ -523,6 +523,110 @@ def set_state(key: str, value: str) -> None:
             conn.close()
 
 
+def patch_document_date(source_doc_id: str, new_date: str) -> bool:
+    """Update document_date inside record_json for a stored document and queue re-projection.
+
+    Returns True if the document was found and patched, False if not found.
+    """
+    normalized_doc_id = str(source_doc_id or "").strip()
+    if not normalized_doc_id:
+        return False
+
+    now = _now_iso()
+    with _LOCK:
+        conn = _connect()
+        try:
+            row = conn.execute(
+                "SELECT record_json FROM documents WHERE source_doc_id = ?",
+                (normalized_doc_id,),
+            ).fetchone()
+            if row is None:
+                return False
+
+            record_data = json.loads(str(row["record_json"]))
+            record_data["document_date"] = new_date
+            new_json = json.dumps(record_data, ensure_ascii=False, sort_keys=True)
+
+            conn.execute(
+                "UPDATE documents SET record_json = ?, updated_at = ? WHERE source_doc_id = ?",
+                (new_json, now, normalized_doc_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO pending_projection_docs (source_doc_id, reason, enqueued_at)
+                VALUES (?, 'date_patch', ?)
+                ON CONFLICT(source_doc_id) DO UPDATE SET
+                    reason = 'date_patch',
+                    enqueued_at = excluded.enqueued_at
+                """,
+                (normalized_doc_id, now),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+
+def patch_document_date_by_message_id(source_message_id: str, new_date: str) -> dict[str, object]:
+    """Update document_date for all documents whose source_message_id matches.
+
+    Returns a summary dict with matched and patched counts.
+    """
+    normalized_msg_id = str(source_message_id or "").strip()
+    if not normalized_msg_id:
+        return {"source_message_id": source_message_id, "docs_found": 0, "docs_patched": 0, "doc_ids": []}
+
+    now = _now_iso()
+    with _LOCK:
+        conn = _connect()
+        try:
+            rows = conn.execute(
+                "SELECT source_doc_id, record_json FROM documents WHERE source_message_id = ?",
+                (normalized_msg_id,),
+            ).fetchall()
+
+            if not rows:
+                return {
+                    "source_message_id": source_message_id,
+                    "docs_found": 0,
+                    "docs_patched": 0,
+                    "doc_ids": [],
+                }
+
+            patched_ids: list[str] = []
+            for row in rows:
+                doc_id = str(row["source_doc_id"])
+                record_data = json.loads(str(row["record_json"]))
+                record_data["document_date"] = new_date
+                new_json = json.dumps(record_data, ensure_ascii=False, sort_keys=True)
+
+                conn.execute(
+                    "UPDATE documents SET record_json = ?, updated_at = ? WHERE source_doc_id = ?",
+                    (new_json, now, doc_id),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO pending_projection_docs (source_doc_id, reason, enqueued_at)
+                    VALUES (?, 'date_patch', ?)
+                    ON CONFLICT(source_doc_id) DO UPDATE SET
+                        reason = 'date_patch',
+                        enqueued_at = excluded.enqueued_at
+                    """,
+                    (doc_id, now),
+                )
+                patched_ids.append(doc_id)
+
+            conn.commit()
+            return {
+                "source_message_id": source_message_id,
+                "docs_found": len(rows),
+                "docs_patched": len(patched_ids),
+                "doc_ids": patched_ids,
+            }
+        finally:
+            conn.close()
+
+
 def record_projection_flush(*, request_count: int, processed_doc_ids: Iterable[str]) -> None:
     processed = [str(source_doc_id or "").strip() for source_doc_id in processed_doc_ids]
     processed = [source_doc_id for source_doc_id in processed if source_doc_id]
