@@ -311,14 +311,14 @@ async def lookup_record(request: Request, q: str) -> dict[str, object]:
     """Diagnostic: search SQLite documents table by source_doc_id or source_message_id substring."""
     _verify_admin_token(request)
 
-    import sqlite3 as _sqlite3
-    from app.services.accounting.canonical_store import _connect, _LOCK
-
     needle = q.strip()
     if not needle:
         raise HTTPException(status_code=400, detail="q must not be empty")
 
     try:
+        from app.services.accounting.canonical_store import _connect, _LOCK, _db_path
+        db_path = str(_db_path())
+
         with _LOCK:
             conn = _connect()
             try:
@@ -338,6 +338,7 @@ async def lookup_record(request: Request, q: str) -> dict[str, object]:
         return {
             "status": "ok",
             "query": needle,
+            "db_path": db_path,
             "total_documents_in_db": total,
             "matches": [
                 {
