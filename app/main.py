@@ -18,6 +18,7 @@ from app.routes.periskope import router as periskope_router
 from app.routes.setup import router as setup_router
 from app.services.accounting import inbound_queue
 from app.services.accounting.exporter import TURKISH_HEADERS, tabular_rows_to_xlsx_bytes
+from app.services.accounting.migrations import run_sevk_date_fix
 from app.services.providers import google_sheets
 from app.routes.webhooks import router as webhook_router
 from app.utils.logging import get_logger
@@ -27,6 +28,7 @@ logger = get_logger(__name__)
 
 def _run_google_sheets_startup_tasks() -> None:
     startup_steps = (
+        ("sevk_date_migration", lambda: run_sevk_date_fix(settings.storage_dir)),
         ("prepare_current_month_sheet", google_sheets.ensure_current_month_spreadsheet_ready),
         ("process_pending_sheet_appends", google_sheets.process_pending_sheet_appends),
         ("process_pending_document_uploads", google_sheets.process_pending_document_uploads),

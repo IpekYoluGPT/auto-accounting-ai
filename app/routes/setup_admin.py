@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.services.accounting import canonical_store, inbound_queue, record_store
+from app.services.accounting.migrations import patch_all_sqlite
 from app.services.providers import google_sheets, google_sheets_scheduler
 from app.utils.logging import get_logger
 
@@ -40,6 +41,10 @@ class DrainQueuesRequest(BaseModel):
 class UpdateSheetRegistryRequest(BaseModel):
     month: str
     spreadsheet_id: str
+
+
+class BulkPatchDatesRequest(BaseModel):
+    fixes: list[dict]  # [{"message_id": str, "new_date": "YYYY-MM-DD"}, ...]
 
 
 class ReprocessMessageRequest(BaseModel):
@@ -487,6 +492,43 @@ async def patch_record_date(request: Request, payload: PatchRecordDateRequest) -
         return {"status": "ok", **result}
     except Exception as exc:
         logger.error("Patch record date failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/bulk-patch-dates")
+async def bulk_patch_dates(request: Request, payload: BulkPatchDatesRequest) -> dict[str, object]:
+    """Patch document dates across ALL SQLite databases found on the volume.
+
+    Scans /data recursively so it also patches the legacy muhasebe service's
+    database — the root cause of nightly date reversions when that service
+    projects its own (wrong-date) records back into the sheet.
+    """
+    _verify_admin_token(request)
+
+    import re as _re
+
+    fixes: list[tuple[str, str]] = []
+    for item in payload.fixes:
+        msg_id = str(item.get("message_id") or "").strip()
+        new_date = str(item.get("new_date") or "").strip()
+        if not msg_id or not _re.match(r"^\d{4}-\d{2}-\d{2}$", new_date):
+            raise HTTPException(status_code=400, detail=f"Invalid fix entry: {item!r}")
+        fixes.append((msg_id, new_date))
+
+    if not fixes:
+        raise HTTPException(status_code=400, detail="fixes list must not be empty")
+
+    try:
+        results = patch_all_sqlite(settings.storage_dir, fixes)
+        total_patched = sum(r.get("patched", 0) for r in results)
+        return {
+            "status": "ok",
+            "databases_scanned": len(results),
+            "total_records_patched": total_patched,
+            "results": results,
+        }
+    except Exception as exc:
+        logger.error("Bulk date patch failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

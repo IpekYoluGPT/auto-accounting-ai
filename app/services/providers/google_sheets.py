@@ -5805,7 +5805,7 @@ _AUTHORITATIVE_FIELDS: dict[str, tuple[str, ...]] = {
     "Banka Ödemeleri": ("Alıcı / Tedarikçi", "Açıklama", "Referans No", "Gönderen", "Gönderen IBAN", "Alıcı IBAN", "Banka"),
     "Çekler": ("Lehdar", "Açıklama", "Çek No", "Çeki Düzenleyen", "Banka"),
     "Faturalar": ("Fatura Tipi", "Alıcı", "Açıklama / Hizmet"),
-    "Sevk Fişleri": ("Satıcı", "Alıcı", "Ürün Cinsi", "Ürün Miktarı", "Sevk Yeri", "Açıklama"),
+    "Sevk Fişleri": ("Tarih", "Satıcı", "Alıcı", "Ürün Cinsi", "Ürün Miktarı", "Sevk Yeri", "Açıklama"),
 }
 _AUTHORITATIVE_FIELD_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
     "Çekler": {
