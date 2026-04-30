@@ -402,6 +402,68 @@ async def lookup_record(request: Request, q: str) -> dict[str, object]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@router.post("/patch-sheet-date-direct")
+async def patch_sheet_date_direct(request: Request, payload: PatchRecordDateRequest) -> dict[str, object]:
+    """Directly patch the Tarih column for a row in the Google Sheet by source_doc_id.
+
+    Bypasses SQLite entirely - opens the spreadsheet, finds the row matching
+    payload.message_id in the __source_doc_id hidden column, writes the new date
+    to the Tarih column. Use this when the SQLite-based patch endpoint can't help
+    (e.g. records aren't in SQLite but exist in the sheet as orphans).
+    """
+    _verify_admin_token(request)
+
+    import re as _re
+    from app.services.providers.google_sheets import (
+        _get_client, _get_or_create_spreadsheet, _projection_target_tabs,
+        _ensure_tab_exists, _iter_visible_row_maps, _header_letter,
+        _HIDDEN_SOURCE_DOC_ID_HEADER, _retry_on_rate_limit, _lock,
+    )
+
+    message_id = payload.message_id.strip()
+    new_date = payload.new_date.strip()
+    if not message_id:
+        raise HTTPException(status_code=400, detail="message_id must not be empty")
+    if not _re.match(r"^\d{4}-\d{2}-\d{2}$", new_date):
+        raise HTTPException(status_code=400, detail="new_date must be YYYY-MM-DD")
+
+    # Convert YYYY-MM-DD → DD-MM-YYYY (the format used in the sheet)
+    y, m, d = new_date.split("-")
+    sheet_date = f"{d}-{m}-{y}"
+
+    try:
+        client = _get_client()
+        if client is None:
+            raise RuntimeError("Google Sheets client unavailable")
+
+        with _lock:
+            sh = _get_or_create_spreadsheet(client)
+            updates: list[dict[str, object]] = []
+
+            for tab_name in _projection_target_tabs():
+                ws = _ensure_tab_exists(sh, tab_name, lightweight=True)
+                date_col_letter = _header_letter(tab_name, "Tarih")
+                if not date_col_letter:
+                    continue
+
+                for row_number, row_map in _iter_visible_row_maps(ws, tab_name, value_render_option="UNFORMATTED_VALUE"):
+                    src = str(row_map.get(_HIDDEN_SOURCE_DOC_ID_HEADER) or "").strip()
+                    if src != message_id:
+                        continue
+                    cell_ref = f"{date_col_letter}{row_number}"
+                    _retry_on_rate_limit(
+                        lambda ws=ws, ref=cell_ref, val=sheet_date: ws.update(
+                            [[val]], ref, value_input_option="USER_ENTERED"
+                        )
+                    )
+                    updates.append({"tab": tab_name, "row": row_number, "cell": cell_ref, "new_date": sheet_date})
+
+        return {"status": "ok", "message_id": message_id, "updates": updates}
+    except Exception as exc:
+        logger.error("Direct sheet date patch failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @router.post("/patch-record-date")
 async def patch_record_date(request: Request, payload: PatchRecordDateRequest) -> dict[str, object]:
     """Update document_date in the SQLite canonical store for a specific message ID.
