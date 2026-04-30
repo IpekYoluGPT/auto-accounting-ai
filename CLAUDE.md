@@ -13,7 +13,7 @@
 Automated Turkish accounting pipeline:
 1. WhatsApp documents (fatura, fiş, çek, dekont) arrive via **Periskope webhook**
 2. **Gemini AI** classifies → categorizes → extracts structured fields
-3. Records are persisted to daily CSV + written to **Google Sheets** (monthly spreadsheets)
+3. Records are persisted to SQLite (`canonical_store.sqlite3`) + written to **Google Sheets** (monthly spreadsheets)
 4. Confirmation messages sent back to WhatsApp
 
 ## Current Architecture
@@ -29,11 +29,92 @@ WhatsApp → Periskope webhook → FastAPI
                     ▼             ▼
               gemini_extractor (multi-document aware)
                     │
+                    ├── canonical_store (SQLite — source of truth)
                     ├── record_store (CSV + dedup)
                     └── google_sheets (monthly spreadsheets via OAuth)
 ```
 
 ## Key Design Decisions
+
+### SQLite is the Source of Truth — NOT Google Sheets
+
+`canonical_store.sqlite3` at `$STORAGE_DIR/state/canonical_store.sqlite3` is the authoritative store.
+Google Sheets is a **projection/view** rebuilt from SQLite. Any manual edit to the sheet
+**will be overwritten** the next time the projection worker runs (every 30 seconds, or on
+any new incoming message). The only exception is fields listed in `_AUTHORITATIVE_FIELDS`
+(see below) which are captured as overrides.
+
+### Projection Worker Rewrites Everything
+
+`_write_visible_projection_rows()` in `google_sheets.py` **clears the entire tab** (rows 3–1000)
+and rewrites all rows from SQLite on every flush. This means:
+
+- **Manual row reordering is lost** — rows are always sorted by `(document_date, created_at, source_doc_id)`
+- **Manual cell edits are lost** unless the column is in `_AUTHORITATIVE_FIELDS` for that tab
+- **Each new WhatsApp message triggers a full rewrite** of all visible tabs (~12 Sheets API requests)
+
+### _AUTHORITATIVE_FIELDS — What Survives Manual Edits
+
+Only columns listed here survive projection overwrites (captured by 5-min override sync):
+
+```python
+# google_sheets.py
+_AUTHORITATIVE_FIELDS = {
+    "Masraf Kayıtları": ("Kategori", "Alıcı / Tedarikçi", "Açıklama", "Belge No / Referans"),
+    "Banka Ödemeleri":  ("Alıcı / Tedarikçi", "Açıklama", "Referans No", "Gönderen", "Gönderen IBAN", "Alıcı IBAN", "Banka"),
+    "Çekler":           ("Lehdar", "Açıklama", "Çek No", "Çeki Düzenleyen", "Banka"),
+    "Faturalar":        ("Fatura Tipi", "Alıcı", "Açıklama / Hizmet"),
+    "Sevk Fişleri":     ("Tarih", "Satıcı", "Alıcı", "Ürün Cinsi", "Ürün Miktarı", "Sevk Yeri", "Açıklama"),
+}
+```
+
+**Tarih (date) is authoritative only for Sevk Fişleri.** For all other tabs, manually editing
+a date cell will be overwritten on the next projection. To permanently fix a date on any tab,
+patch SQLite using `/setup/patch-record-date` or `/setup/bulk-patch-dates`.
+
+### _document_month_key() — Checked BEFORE document_date
+
+```python
+# google_sheets.py:1295
+for candidate in (
+    getattr(document, "created_at", None),      # ← checked FIRST
+    getattr(record, "document_date", None),
+    ...
+):
+```
+
+`created_at` (the WhatsApp message arrival time) is used before `document_date`. This means
+a document with a wrong extracted year (e.g. 2020 instead of 2026) still lands in the current
+month's projection scope because `created_at` is always correct. After patching `document_date`
+in SQLite, the record continues to appear in the correct month's sheet.
+
+### Two Railway Services Share /data Volume
+
+There are **two Railway services** for this project:
+
+| Service | Status | SQLite path |
+|---------|--------|-------------|
+| `muhasebe-api` | Online (current) | `/data/storage/state/canonical_store.sqlite3` |
+| `muhasebe` | Offline (legacy) | Somewhere under `/data/` |
+
+Both mount the same `/data` persistent volume. The legacy `muhasebe` service periodically
+wakes up and re-projects from its own SQLite to the same Google Sheet (every ~3 hours, visible
+in Sheet version history as SA writes). **This causes manual sheet corrections to revert.**
+
+The startup migration in `app/services/accounting/migrations.py` patches ALL SQLite files found
+under `/data` on every boot, which fixes the legacy service's database too.
+
+### Startup Migration (migrations.py)
+
+`run_sevk_date_fix()` runs as the **first step** in `_run_google_sheets_startup_tasks()`.
+It is idempotent — records already at the correct date are skipped. Add future one-time
+data fixes here as new functions called from `_run_google_sheets_startup_tasks()`.
+
+### sheets_registry.json
+
+Maps `YYYY-MM` → spreadsheet ID. If this gets corrupted or points to the wrong sheet,
+the projection worker writes to the wrong spreadsheet. Fix with `/setup/update-sheet-registry`.
+File is stored at `$STORAGE_DIR/state/sheets_registry.json`.
 
 ### Multi-Document Extraction
 - A single photo may contain multiple documents (e.g. 3 cheques side by side)
@@ -67,7 +148,8 @@ app/
 │   ├── webhooks.py                    # Meta Cloud API webhook (legacy, not primary)
 │   ├── periskope.py                   # Periskope webhook + tool endpoints (PRIMARY)
 │   ├── groups.py                      # Official Meta group management (dormant)
-│   └── setup.py                       # One-time OAuth2 setup flow
+│   ├── setup.py                       # One-time OAuth2 setup flow
+│   └── setup_admin.py                 # Admin/ops endpoints (token-protected)
 ├── services/
 │   ├── gemini_client.py               # Shared Gemini API wrapper with retry + fallback
 │   ├── accounting/
@@ -75,10 +157,13 @@ app/
 │   │   ├── bill_classifier.py         # Is this a financial document? (text keywords + Gemini vision)
 │   │   ├── doc_classifier.py          # Which category? (fatura/dekont/fiş/çek/malzeme/iade)
 │   │   ├── gemini_extractor.py        # Multi-doc extraction → list[BillRecord]
+│   │   ├── migrations.py              # Startup data migrations (idempotent, run every boot)
 │   │   ├── record_store.py            # CSV persistence + dedup + message claim tracking
+│   │   ├── canonical_store.py         # SQLite source of truth for all documents
 │   │   └── exporter.py                # CSV/XLSX export formatting
 │   └── providers/
 │       ├── google_sheets.py           # Monthly sheet management, OAuth, retry, tab bootstrap
+│       ├── google_sheets_projection.py # Projection worker, pending append queue
 │       ├── periskope.py               # Periskope API client (send/fetch/media)
 │       └── whatsapp.py                # Meta Cloud API client
 └── utils/
@@ -95,9 +180,12 @@ app/
 | harcama_fisi | ⛽ Harcama Fişleri | POS receipts, fuel, market |
 | cek | 📝 Çekler | Bank cheques |
 | elden_odeme | 💵 Elden Ödemeler | Cash payments (manager text) |
-| malzeme | 🏗️ Malzeme | Delivery notes, materials |
+| malzeme | 🏗️ Malzeme → "Sevk Fişleri" tab | Delivery notes, materials |
 | iade | ↩️ İadeler | Returns and cancellations |
 | belirsiz | 🧾 Faturalar | Fallback |
+
+**Note:** The category is `malzeme` in code but the tab is named **Sevk Fişleri** in the sheet.
+Do not call it "Malzeme" when talking to the user.
 
 ## Important Env Vars
 
@@ -113,12 +201,30 @@ app/
 | `PERISKOPE_API_KEY` | Periskope outbound messaging |
 | `PERISKOPE_ALLOWED_CHAT_IDS` | Comma-separated allowed WhatsApp chat IDs |
 | `MANAGER_PHONE_NUMBER` | Phone number for elden odeme text entries |
+| `STORAGE_DIR` | Persistent storage root (production: `/data/storage`, mount: `/data`) |
 
 ## Service Account Info
 
-- **SA email:** `whatsappsheet@whatsapp-account-manager-ai.iam.gserviceaccount.com`
+- **SA email (new):** `auto-accounting-ai@muhasebe-494114.iam.gserviceaccount.com`
+- **SA email (old):** `whatsappsheet@whatsapp-account-manager-ai.iam.gserviceaccount.com`
 - **Owner email:** `yilmazatakan4423@gmail.com`
-- **GCP Project:** whatsapp-account-manager-ai
+- **GCP Project:** muhasebe-494114
+
+## Admin Endpoints (all require `x-api-key: $PERISKOPE_TOOL_TOKEN`)
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/setup/storage-status` | GET | Queue depths, flush counts, disk usage |
+| `/setup/debug-storage` | GET | Find all SQLite files on volume, show document counts |
+| `/setup/lookup-record` | GET `?q=` | Search SQLite by message_id or source_doc_id |
+| `/setup/patch-record-date` | POST | Fix a date in SQLite (triggers re-projection) |
+| `/setup/patch-sheet-date-direct` | POST | Fix a date cell directly in the Sheet (bypasses SQLite — temporary) |
+| `/setup/bulk-patch-dates` | POST | Fix dates across ALL SQLite files on volume (use for legacy-service revertion issues) |
+| `/setup/update-sheet-registry` | POST | Point a month to a different spreadsheet ID |
+| `/setup/reprocess-message` | POST | Clear dedup so a message can be reprocessed |
+| `/setup/drain-queues` | POST | Manually flush pending projection + inbound queues |
+| `/setup/repair-sheet` | POST | Fix tab layout and formulas |
+| `/setup/rewrite-belge-links` | POST | Force-rewrite Drive hyperlinks in the sheet |
 
 ## Testing
 
@@ -144,3 +250,10 @@ Gemini call (`_refine_missing_cheque_lehdars` in `app/services/accounting/gemini
 when the primary pass leaves any record's `recipient_name` blank. The refinement uses the
 faster `GEMINI_LEHDAR_REFINEMENT_MODEL` (Flash) and only fills blank slots — populated
 lehdars are never overwritten. Refinement failures log a warning and leave records as-is.
+
+### Date Two-Pass Extraction
+
+For Sevk Fişleri and other handwritten documents, `extract_bills()` runs a second Gemini
+call (`_refine_suspicious_dates` in `gemini_extractor.py`) when any extracted year falls
+outside `{current_year-1, current_year, current_year+1}`. The today's date is also injected
+into the primary extraction prompt to reduce year misreads. See PR #18.
