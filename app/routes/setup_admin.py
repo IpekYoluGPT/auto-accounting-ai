@@ -306,6 +306,53 @@ async def update_sheet_registry(request: Request, payload: UpdateSheetRegistryRe
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@router.get("/debug-storage")
+async def debug_storage(request: Request) -> dict[str, object]:
+    """Diagnostic: find all SQLite databases and CSV exports under the volume mount."""
+    _verify_admin_token(request)
+
+    import sqlite3 as _sq
+    from pathlib import Path as _Path
+
+    search_roots = [_Path("/data"), _Path("./storage"), _Path(settings.storage_dir)]
+    found_dbs: list[dict[str, object]] = []
+    seen: set[str] = set()
+
+    for root in search_roots:
+        try:
+            for db_file in root.rglob("*.sqlite3"):
+                key = str(db_file.resolve())
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    size = db_file.stat().st_size
+                    conn = _sq.connect(str(db_file), timeout=5.0)
+                    conn.row_factory = _sq.Row
+                    try:
+                        count_row = conn.execute(
+                            "SELECT COUNT(*) FROM documents"
+                        ).fetchone()
+                        count = int(count_row[0])
+                        sample = conn.execute(
+                            "SELECT source_doc_id, json_extract(record_json,'$.document_date') AS d "
+                            "FROM documents ORDER BY created_at DESC LIMIT 3"
+                        ).fetchall()
+                        samples = [{"source_doc_id": str(r[0]), "document_date": r[1]} for r in sample]
+                    except Exception as e:
+                        count = -1
+                        samples = [{"error": str(e)}]
+                    finally:
+                        conn.close()
+                    found_dbs.append({"path": key, "size_bytes": size, "document_count": count, "recent_samples": samples})
+                except Exception as e:
+                    found_dbs.append({"path": key, "error": str(e)})
+        except Exception:
+            continue
+
+    return {"status": "ok", "storage_dir": settings.storage_dir, "databases_found": found_dbs}
+
+
 @router.get("/lookup-record")
 async def lookup_record(request: Request, q: str) -> dict[str, object]:
     """Diagnostic: search SQLite documents table by source_doc_id or source_message_id substring."""
